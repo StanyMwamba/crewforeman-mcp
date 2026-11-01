@@ -1,0 +1,36 @@
+# Source-distribution inventory for crewforeman-mcp.
+# The in-tree build_backend.py produces the canonical sdist; this file keeps
+# legacy `python setup.py sdist` output consistent with it.
+include README.md
+include LICENSE
+include CHANGELOG.md
+include pyproject.toml
+include build_backend.py
+include setup.py
+include setup.cfg
+include MANIFEST.in
+include config.example.json
+
+recursive-include deepseek_mcp *.py
+recursive-include skills *.md
+include docs/skills.md
+recursive-include docs *
+recursive-include tests *.py
+recursive-include scripts *.py *.sh
+recursive-include bench *.py
+recursive-include .github *
+
+# Never ship caches, local runs, build output, wave scratch dirs or logs.
+global-exclude __pycache__ *.py[cod] *.egg-info .DS_Store *.log wave*
+prune build
+prune dist
+prune runs
+prune state
+prune .worklogs
+prune .git
+prune wave1
+prune wave1-v340
+prune wave1-v350
+prune wave1-v360
+prune wave2
+prune wave3

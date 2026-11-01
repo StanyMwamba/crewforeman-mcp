@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+.pycache/
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data and agent workspaces
+runs/
+jobs/
+state/
+harness-workspace/
+.work/
+
+# Generated skill registry state (the five seed .md files are tracked)
+skills/index.json
+skills/index.json.bak
+skills/index.corrupt-*.json
+skills/.versions/
+skills/.capture/
+skills/.locks/
+skills/.conflicts/
+skills/.candidates/
+skills/.skill-write-probe
+
+# Local configuration (never commit real settings or keys)
+config.json
+
+# Generated reports and dry-run benchmark output
+REVIEW.md
+REVIEW_*.md
+QUALITY_REPORT*.md
+ROOT_CAUSE*.md
+IMPROVEMENT_PLAN*.md
+test-results*
+wave*/
+wave-*.md
+bench/results.dry-run.md
+
+# Tests and coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+test-results/
+
+# Backups and archives
+*.bak
+*.bak-*
+*.tgz
+*.tar.gz
+*.zip
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

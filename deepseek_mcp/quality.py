@@ -1,0 +1,1690 @@
+"""Adaptive subagent sizing, Harness task construction and the quality loop.
+
+The actual loop is executed by the Harness lead agent; this module decides how
+many subagents to use, writes unambiguous instructions into the task text and
+extracts the final quality score from the workspace afterwards.
+"""
+
+import os
+import re
+from pathlib import Path
+
+
+DEFAULT_QUALITY_TARGET = 8.5
+DEFAULT_QUALITY_ROUNDS = 3
+DEFAULT_SUBAGENTS = 16
+DEFAULT_SOFT_CAP = 32
+DEFAULT_CONCURRENCY = 8
+
+# Automatic starting counts per task type.  The size estimate only raises the
+# code count; creative/research work starts at one full default wave.
+AUTO_START = {
+    "code": {"small": 4, "medium": 4, "large": 8},
+    "creative": {"small": 6, "medium": 8, "large": 12},
+    "research": {"small": 6, "medium": 8, "large": 12},
+}
+TASK_TYPE_LABELS = {
+    "simple": "simple question",
+    "code": "code",
+    "creative": "creative/design",
+    "research": "research/data",
+}
+CODE_TERMS = (
+    "code", "script", "cli", "api", "server", "function", "library", "package",
+    "bug", "refactor", "python", "javascript", "typescript", "program",
+    "database", "backend", "frontend", "unit test", "test suite", "compile",
+    "deploy", "algorithm", "sdk", "module",
+)
+CREATIVE_TERMS = (
+    "poster", "flyer", "logo", "banner", "brochure", "cover", "design",
+    "typography", "layout", "illustration", "brand", "website", "web page",
+    "webpage", "html", "css", "landing page", "deck", "slides", "presentation",
+    "letter", "document", "report", "essay", "resume", "story", "poem",
+)
+RESEARCH_TERMS = (
+    "research", "analyze", "analyse", "analysis", "study", "survey", "compare",
+    "comparison", "sources", "citation", "data", "dataset", "csv", "chart",
+    "graph", "statistics", "metrics", "regression", "experiment", "benchmark",
+    "audit", "dashboard", "evidence",
+)
+
+# Signals that a task produces a real deliverable.
+ARTIFACT_WORDS = (
+    "poster", "flyer", "brochure", "logo", "banner", "thumbnail", "cover",
+    "letter", "document", "report", "essay", "article", "proposal", "resume",
+    "cv", "deck", "slides", "presentation", "website", "web page", "webpage",
+    "landing page", "html", "css", "app", "application", "script", "cli",
+    "program", "code", "api", "server", "database", "dashboard", "chart",
+    "spreadsheet", "dataset", "analysis", "model", "book", "chapter", "manual",
+    "spec", "specification", "readme", "invoice", "menu", "certificate",
+)
+DELIVERABLE_WORDS = (
+    "deliverable", "deliverables", "section", "sections", "page", "pages",
+    "file", "files", "output", "outputs", "requirement", "requirements",
+    "acceptance", "checklist", "component", "components", "chapter", "step",
+    "steps", "part", "parts", "item", "items",
+)
+ACTION_WORDS = (
+    "build", "create", "make", "write", "design", "redesign", "fix", "debug",
+    "implement", "develop", "refactor", "test", "analyze", "analyse", "audit",
+    "review", "research", "compare", "generate", "produce", "draft", "improve",
+    "optimize", "optimise", "convert", "migrate", "deploy", "plan", "rewrite",
+    "summarize", "summarise", "transcribe", "translate", "calculate", "render",
+)
+SIMPLE_STARTS = (
+    "what ", "why ", "who ", "when ", "where ", "which ", "is ", "are ",
+    "can ", "could ", "should ", "does ", "do ", "define ", "explain ",
+)
+
+
+def _words(text):
+    return re.findall(r"\b[\w'-]+\b", text or "")
+
+
+def _contains(text, phrase):
+    """Word-boundary match for single words, substring match for phrases."""
+    if " " in phrase:
+        return phrase in text
+    return re.search(r"\b%s\b" % re.escape(phrase), text) is not None
+
+
+_DELIVERABLE_SECTION_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*{0,2})(?:deliverables?|outputs?|requirements?|"
+    r"files?\s+to\s+(?:create|produce|deliver))(?:\*{0,2})\s*:?\s*$", re.IGNORECASE)
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
+_OUTPUT_FILE_RE = re.compile(
+    r"\b[\w./~-]+\.(?:html?|xhtml|css|js|mjs|ts|tsx|jsx|py|png|jpe?g|webp|gif|"
+    r"svg|pdf|md|txt|csv|tsv|xlsx?|docx?|pptx?|mp4|mov|zip|json|ya?ml)\b",
+    re.IGNORECASE)
+_BULLET_STARTS_DELIVERABLE_RE = re.compile(
+    r"^(?:deliverable|output|file|section|page|component|chapter|slide|card)s?\b",
+    re.IGNORECASE)
+
+
+def _declared_deliverable_count(text, numbered):
+    """Count only *declared* deliverables, not every fact bullet.
+
+    A live sizing case counted the ten fact/role/benefit
+    bullets in a recruitment-ad brief as "10 deliverables" and started twelve
+    agents.  A deliverable is an item under a Deliverables/Outputs/Requirements
+    section, an explicit output file name, or a bullet that literally starts
+    with deliverable/output/file/section.  Other bullet lists are requirements
+    or facts and must not inflate the size estimate.
+    """
+    text = text or ""
+    lines = text.splitlines()
+    section_count = 0
+    counted = set()
+    in_section = False
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        if _DELIVERABLE_SECTION_RE.match(line):
+            in_section = True
+            continue
+        bullet = _BULLET_LINE_RE.match(line)
+        if in_section and bullet:
+            section_count += 1
+            counted.add(index)
+            continue
+        if in_section and not bullet:
+            # A new heading or a non-bullet sentence closes the section.
+            if section_count or re.match(r"^#{1,6}\s", line):
+                in_section = False
+
+    inline = 0
+    for match in re.finditer(r"(?i)(?:deliverables?|outputs?)\s*:\s*", text):
+        # The list may wrap over several lines.  Read up to the next blank line
+        # or heading, capped at 8 lines, so a long HTML/PNG declaration counts
+        # completely without swallowing unrelated fact bullets.
+        chunk = []
+        for raw in text[match.end():].splitlines():
+            if not raw.strip() or re.match(r"^\s*#{1,6}\s", raw):
+                break
+            chunk.append(raw)
+            if len(chunk) >= 8:
+                break
+        inline += len(set(_OUTPUT_FILE_RE.findall("\n".join(chunk))))
+
+    global_bullets = 0
+    for index, raw in enumerate(lines):
+        if index in counted:
+            continue
+        bullet = _BULLET_LINE_RE.match(raw.strip())
+        if not bullet:
+            continue
+        body = re.sub(r"^[\s*_`#>]+", "", bullet.group(1))
+        if _BULLET_STARTS_DELIVERABLE_RE.match(body):
+            global_bullets += 1
+    return max(1, int(numbered or 0), section_count, inline, global_bullets)
+
+
+def _task_signals(text, files=None):
+    """Extract the cheap, deterministic signals used for sizing."""
+    files = files or []
+    text = text or ""
+    words = _words(text)
+    lines = [line for line in text.splitlines() if line.strip()]
+    bullet_count = sum(1 for line in lines
+                       if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line))
+    lower = text.lower()
+    artifact_hits = sorted({word for word in ARTIFACT_WORDS if _contains(lower, word)})
+    deliverable_hits = sorted({word for word in DELIVERABLE_WORDS if _contains(lower, word)})
+    action_hits = sorted({word for word in ACTION_WORDS
+                          if re.search(r"\b%s\b" % re.escape(word), lower)})
+    question_like = (text.strip().endswith("?")
+                     or lower.lstrip().startswith(SIMPLE_STARTS))
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+        "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    }
+    number_hits = re.findall(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"\d{1,2})[\s-]*(?:pages?|sections?|files?|deliverables?|items?|"
+        r"parts?|slides?|cards?|chapters?|components?)\b", lower)
+    numbered = 0
+    for item in number_hits:
+        value = int(item) if item.isdigit() else number_words.get(item, 0)
+        numbered += min(20, value)
+    deliverable_count = _declared_deliverable_count(text, numbered)
+    return {
+        "words": len(words), "lines": len(lines), "bullets": bullet_count,
+        "artifacts": artifact_hits, "deliverables": deliverable_hits,
+        "actions": action_hits, "files": len(files),
+        "deliverable_count": deliverable_count,
+        "declared_deliverables": deliverable_count,
+        "question_like": question_like,
+    }
+
+
+def _is_simple(signals):
+    """True for a short question with no action, file or numbered deliverable.
+
+    Keyword hits such as ``api``, ``html`` or ``csv`` must not turn a
+    definitional question into a build task: "What is an API?" still has a
+    one-answer shape.  An action verb, a file, a numbered requirement or more
+    than a few lines keeps the task in the real-work path.
+    """
+    if (signals["words"] > 50 or signals["lines"] > 3 or signals["files"]
+            or signals["actions"] or signals["bullets"]):
+        return False
+    # "What is an API? 3 pages" is a question word plus real work.  A declared
+    # multi-item deliverable must never fall through the question shortcut.
+    if int(signals.get("deliverable_count") or 0) > 1:
+        return False
+    if signals["question_like"]:
+        return True
+    return (signals["words"] <= 12 and not signals["artifacts"]
+            and not signals["deliverables"])
+
+
+def _term_score(lower, terms):
+    return sum(1 for term in terms if _contains(lower, term))
+
+
+def _size_estimate(signals):
+    """Small/medium/large from prompt length and the number of deliverables."""
+    deliverables = max(1, int(signals.get("deliverable_count") or 1))
+    if signals["words"] <= 80 and deliverables <= 2:
+        size = "small"
+    elif signals["words"] >= 220 or deliverables >= 6:
+        size = "large"
+    else:
+        size = "medium"
+    return {
+        "size": size,
+        "words": signals["words"],
+        "deliverables": deliverables,
+        "files": signals["files"],
+        "bullets": signals["bullets"],
+    }
+
+
+def classify_task(prompt, files=None):
+    """Classify a task as simple/code/creative/research plus a size estimate.
+
+    Deterministic keyword scoring, with the existing skill detector used only
+    as a small bonus.  Ties prefer code, then research, then creative.  A
+    real-work prompt with no signal defaults to creative/design.
+    """
+    text = prompt or ""
+    signals = _task_signals(text, files)
+    if _is_simple(signals):
+        return {
+            "task_type": "simple",
+            "label": TASK_TYPE_LABELS["simple"],
+            "size": _size_estimate(signals),
+            "signals": signals,
+            "scores": {"code": 0, "creative": 0, "research": 0},
+            "reason": ("Simple single-step question (%d words, no action or numbered "
+                       "deliverable)." % signals["words"]),
+        }
+
+    lower = text.lower()
+    scores = {
+        "code": _term_score(lower, CODE_TERMS),
+        "creative": _term_score(lower, CREATIVE_TERMS),
+        "research": _term_score(lower, RESEARCH_TERMS),
+    }
+    skill = None
+    try:
+        from .skills import detect_skill
+        skill = detect_skill(text)
+    except Exception:
+        skill = None
+    if skill == "code":
+        scores["code"] += 3
+    elif skill == "data":
+        scores["research"] += 3
+    elif skill in ("poster", "web"):
+        scores["creative"] += 2
+    elif skill == "document":
+        scores["creative"] += 1
+
+    task_type = "creative"
+    best = -1
+    for key in ("code", "research", "creative"):
+        if scores[key] > best:
+            task_type, best = key, scores[key]
+    if best <= 0:
+        # Real work with no keyword signal: treat it as a design/document task.
+        task_type = "creative"
+        scores["creative"] = 1
+    size = _size_estimate(signals)
+    return {
+        "task_type": task_type,
+        "label": TASK_TYPE_LABELS[task_type],
+        "size": size,
+        "signals": signals,
+        "scores": scores,
+        "skill": skill,
+        "reason": ("Classified as %s from %d code, %d creative and %d research "
+                   "signal(s)." % (TASK_TYPE_LABELS[task_type], scores["code"],
+                                   scores["creative"], scores["research"])),
+    }
+
+
+def _is_explicit_run(run):
+    """True for a run whose count the caller fixed; history ignores those."""
+    choice = run.get("agent_choice") or {}
+    if choice.get("explicit") is True or run.get("subagent_source") == "explicit":
+        return True
+    return "explicitly requested" in str(run.get("subagent_reason") or "").lower()
+
+
+_SEED_TASK_TYPES = {
+    "code": "code",
+    "data": "research",
+    "poster": "creative",
+    "web": "creative",
+    "document": "creative",
+}
+_REGISTRY = None
+_REGISTRY_FAILED = False
+
+
+def _seed_skill_key(name):
+    """Return the canonical seed key for *name*, or None when it is not a seed."""
+    if not name:
+        return None
+    try:
+        from .skills import normalise_skill_name
+        key = normalise_skill_name(name)
+        if key in _SEED_TASK_TYPES:
+            return key
+    except Exception:
+        pass
+    raw = str(name).strip().lower()
+    if raw.endswith(".md"):
+        raw = raw[:-3]
+    return raw if raw in _SEED_TASK_TYPES else None
+
+
+def _registry_entry(name):
+    """Read a generated skill through the registry, or return None.
+
+    This is deliberately lazy and read-only: a missing registry, a missing
+    index or any registry error falls back to the legacy seed mapping.  It never
+    creates or saves the registry just to classify history.
+    """
+    global _REGISTRY, _REGISTRY_FAILED
+    if not name:
+        return None
+    if _REGISTRY is None:
+        try:
+            from .config import load_config
+            from .skill_registry import SkillRegistry
+            cfg = load_config()
+            registry = SkillRegistry(cfg)
+            # Resolve the same directory the registry uses (a writable checkout
+            # or the state-dir fallback), then probe for an existing index
+            # without calling load()/migrate(): history classification must not
+            # create a registry as a side effect.
+            if not (Path(str(registry.directory)) / "index.json").is_file():
+                _REGISTRY_FAILED = True
+                return None
+            _REGISTRY = registry
+        except Exception:
+            _REGISTRY_FAILED = True
+            return None
+    if _REGISTRY_FAILED:
+        return None
+    try:
+        entry = _REGISTRY.get(name)
+    except Exception:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def _run_task_type(run):
+    """Task type stored on a run, or derived from its prompt/skill (history)."""
+    value = run.get("task_type") or run.get("complexity")
+    if value == "simple":
+        return "simple"
+    # An explicit canonical task_type on the record is authoritative. It is how
+    # history written by older versions distinguishes a code run that reused a
+    # creative skill; only a missing/legacy value falls through to the registry.
+    if value in ("code", "creative", "research", "document"):
+        return value
+    skill = run.get("skill")
+    entry = _registry_entry(skill)
+    if entry:
+        canonical = entry.get("task_type")
+        if canonical in ("code", "research", "creative", "document"):
+            return canonical
+    seed = _seed_skill_key(skill)
+    if seed:
+        return _SEED_TASK_TYPES[seed]
+    if value == "creative-design":
+        return "creative"
+    if value == "research-data":
+        return "research"
+    if skill == "code":
+        return "code"
+    if skill == "data":
+        return "research"
+    if skill in ("poster", "web", "document"):
+        return "creative"
+    return classify_task(run.get("prompt") or "")["task_type"]
+
+
+def _run_utility(run):
+    """Quality score minus explicit penalties for stalls, rescues and errors."""
+    try:
+        score = run.get("quality_score")
+        if score is None:
+            score = run.get("self_score")
+        score = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        score = None
+    status = run.get("status") or "unknown"
+    if status in ("ok", "ok_rescued"):
+        base = score if score is not None else 8.0
+    elif status == "ok_unreviewed":
+        base = min(score, 7.5) if score is not None else 7.0
+    else:
+        base = 3.0
+    penalty = 0.0
+    if run.get("stalled"):
+        penalty += 3.0
+    if (run.get("stop_reason") in ("stalled", "time_limit")
+            or run.get("timed_out")):
+        penalty += 0.5
+    if status == "ok_rescued":
+        penalty += 0.5
+    if status in ("error", "no_balance"):
+        penalty += 1.0
+    return round(base - penalty, 4), score
+
+
+def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
+                  target=DEFAULT_QUALITY_TARGET):
+    """Summarise comparable past runs per starting count.
+
+    A run counts at its exact ``subagents`` value, so its bucket is directly
+    comparable with the automatic starting counts.  The utility penalises
+    stalled, timed-out, rescued and failed runs; ties prefer the lower mean
+    cost, then the shorter mean duration, then the smaller count.
+    """
+    try:
+        concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
+    except (TypeError, ValueError):
+        concurrency = DEFAULT_CONCURRENCY
+    groups = {}
+    total = 0
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        if run.get("kind") and run.get("kind") != "harness":
+            continue
+        if _is_explicit_run(run):
+            continue
+        if _run_task_type(run) != task_type:
+            continue
+        try:
+            count = int(run.get("subagents") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0:
+            continue
+        bucket = count
+        utility, score = _run_utility(run)
+        try:
+            cost = float(run.get("estimated_cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        try:
+            seconds = float(run.get("seconds") or 0.0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        group = groups.setdefault(bucket, {
+            "count": bucket, "runs": 0, "utilities": [], "scores": [],
+            "costs": [], "seconds": [], "stalled": 0, "rescued": 0, "errors": 0,
+        })
+        group["runs"] += 1
+        group["utilities"].append(utility)
+        if score is not None:
+            group["scores"].append(score)
+        group["costs"].append(cost)
+        group["seconds"].append(seconds)
+        if run.get("stalled") or run.get("stop_reason") == "stalled":
+            group["stalled"] += 1
+        if run.get("status") == "ok_rescued" or run.get("rescued"):
+            group["rescued"] += 1
+        if run.get("status") in ("error", "no_balance"):
+            group["errors"] += 1
+        total += 1
+
+    rows = []
+    for bucket in sorted(groups):
+        group = groups[bucket]
+        runs_n = group["runs"]
+        mean_score = (round(sum(group["scores"]) / len(group["scores"]), 2)
+                      if group["scores"] else None)
+        rows.append({
+            "count": bucket,
+            "runs": runs_n,
+            "mean_utility": round(sum(group["utilities"]) / runs_n, 2),
+            "mean_score": mean_score,
+            "mean_cost": round(sum(group["costs"]) / runs_n, 4),
+            "mean_seconds": round(sum(group["seconds"]) / runs_n, 1),
+            "stalled": group["stalled"],
+            "stall_rate": round(group["stalled"] / float(runs_n), 2),
+            "rescued": group["rescued"],
+            "errors": group["errors"],
+        })
+    if not rows:
+        return {"runs": 0, "best_count": None, "best": None,
+                "groups": [], "target": float(target)}
+    best = min(rows, key=lambda row: (-row["mean_utility"], row["mean_cost"],
+                                      row["mean_seconds"], row["count"]))
+    return {"runs": total, "best_count": best["count"], "best": best,
+            "groups": rows, "target": float(target)}
+
+
+def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
+                  default_subagents=DEFAULT_SUBAGENTS,
+                  concurrency=DEFAULT_CONCURRENCY, runs=None):
+    """Choose the starting subagent count for one builder run.
+
+    Explicit ``subagents`` wins exactly (including 0 and values above the
+    concurrency; the wave plan still caps each wave).  Otherwise the task is
+    classified as simple/code/creative/research, sized, and started at the
+    per-type baseline.  Past runs of the same type may nudge that baseline by
+    at most one small step (2 agents), based on a stall-penalised utility.
+    The result never exceeds the detected concurrency in one wave.
+    """
+    files = files or []
+    classification = classify_task(prompt, files)
+    task_type = classification["task_type"]
+    size = classification["size"]
+    signals = classification["signals"]
+    try:
+        concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
+    except (TypeError, ValueError):
+        concurrency = DEFAULT_CONCURRENCY
+
+    if explicit is not None:
+        count = max(0, int(explicit))
+        if count == 0:
+            reason = ("Caller explicitly requested a single agent (subagents=0). "
+                      "Exact count kept; task type %s." % classification["label"])
+            complexity = "single"
+        else:
+            waves = _wave_sizes(count, concurrency)
+            reason = (
+                "Caller explicitly requested %d subagent(s); exact count kept. "
+                "Task type %s (%s size: %d words, %d deliverable(s)). Waves at "
+                "concurrency %d: %s." % (
+                    count, classification["label"], size["size"], size["words"],
+                    size["deliverables"], concurrency,
+                    " + ".join(str(item) for item in waves))
+            )
+            complexity = "explicit"
+        return {
+            "subagents": count, "reason": reason, "complexity": complexity,
+            "task_type": task_type, "size": size, "start_subagents": count,
+            "concurrency": concurrency, "signals": signals,
+            "waves": _wave_sizes(count, concurrency),
+            "history": {"runs": 0, "best_count": None, "best": None,
+                        "groups": [], "target": DEFAULT_QUALITY_TARGET},
+            "agent_choice_reason": reason,
+        }
+
+    try:
+        soft = max(0, int(soft_cap if soft_cap is not None else DEFAULT_SOFT_CAP))
+    except (TypeError, ValueError):
+        soft = DEFAULT_SOFT_CAP
+    try:
+        default = max(0, int(default_subagents
+                             if default_subagents is not None else DEFAULT_SUBAGENTS))
+    except (TypeError, ValueError):
+        default = DEFAULT_SUBAGENTS
+
+    if task_type == "simple":
+        reason = ("Simple single-step question (%d words, no deliverable or file): "
+                  "use one agent, no subagents. Task type simple." % signals["words"])
+        return {
+            "subagents": 0, "reason": reason, "complexity": "simple",
+            "task_type": "simple", "size": size, "start_subagents": 0,
+            "concurrency": concurrency, "signals": signals, "waves": [],
+            "history": {"runs": 0, "best_count": None, "best": None,
+                        "groups": [], "target": DEFAULT_QUALITY_TARGET},
+            "agent_choice_reason": reason,
+        }
+
+    if soft == 0 or default == 0:
+        reason = ("Automatic subagents are disabled (soft cap %d, "
+                  "default_subagents %d); this run uses one agent. Task type %s."
+                  % (soft, default, classification["label"]))
+        return {
+            "subagents": 0, "reason": reason, "complexity": "real_work",
+            "task_type": task_type, "size": size, "start_subagents": 0,
+            "concurrency": concurrency, "signals": signals, "waves": [],
+            "history": {"runs": 0, "best_count": None, "best": None,
+                        "groups": [], "target": DEFAULT_QUALITY_TARGET},
+            "agent_choice_reason": reason,
+        }
+
+    cap = max(1, min(default, soft))
+    start = AUTO_START[task_type][size["size"]]
+    start = max(1, min(start, cap))
+
+    floor = 2 if task_type == "code" else 4
+    floor = min(floor, cap)
+    history = history_stats(runs or [], task_type, concurrency=concurrency)
+    adjusted = start
+    history_note = None
+    matched_smaller = False
+    if history["runs"] and history["best_count"] is not None:
+        best = int(history["best_count"])
+        best_row = history.get("best") or {}
+        target = float(history.get("target") or DEFAULT_QUALITY_TARGET)
+        bucket_runs = int(best_row.get("runs") or 0)
+        try:
+            mean_utility = float(best_row.get("mean_utility") or 0.0)
+        except (TypeError, ValueError):
+            mean_utility = 0.0
+        try:
+            mean_score = (float(best_row["mean_score"])
+                          if best_row.get("mean_score") is not None else None)
+        except (TypeError, ValueError):
+            mean_score = None
+        strong = (bucket_runs >= 1 and mean_utility >= target
+                  and (mean_score is None or mean_score >= target)
+                  and not best_row.get("stalled")
+                  and not best_row.get("errors")
+                  and not best_row.get("rescued"))
+        if best < start and strong:
+            # A smaller bucket with a target-clearing score is strong evidence
+            # of over-provisioning; one comparable run is enough to match it.
+            # This is the live VIP-ad case: 12 agents chosen while a 6-agent run
+            # scored 9.00/10 with zero stalls.
+            adjusted = max(floor, min(cap, best))
+            matched_smaller = True
+            history_note = (
+                "History matched the smaller best count %d (%.2f utility, "
+                "%s score, %d%% stalled)." % (
+                    best, mean_utility,
+                    "n/a" if mean_score is None else "%.2f" % mean_score,
+                    int(round(float(best_row.get("stall_rate") or 0.0) * 100))))
+        elif best > start:
+            # Raising the count is riskier: require two comparable runs in the
+            # larger bucket and a target-clearing utility.
+            if bucket_runs >= 2 and mean_utility >= target:
+                adjusted = max(floor, min(cap, start + min(2, best - start)))
+                history_note = "History nudged the start %+d to %d." % (
+                    adjusted - start, adjusted)
+            elif mean_utility < target:
+                history_note = (
+                    "History's best count %d has a mean utility below the %.1f "
+                    "target (%.2f), so the start was not raised." % (
+                        best, target, mean_utility))
+            else:
+                history_note = (
+                    "History did not change the start (the larger best count "
+                    "has only %d run)." % bucket_runs)
+        elif best < start and bucket_runs >= 2:
+            # Not strong enough to match, but two runs still justify a small
+            # downward nudge rather than ignoring the signal entirely.
+            adjusted = max(floor, min(cap, start - min(2, start - best)))
+            history_note = "History nudged the start %+d to %d." % (
+                adjusted - start, adjusted)
+
+    waves = _wave_sizes(adjusted, concurrency)
+    pieces = [
+        "Task type %s (%s size: %d words, %d deliverable(s), %d file(s)). "
+        "Baseline start %d." % (
+            classification["label"], size["size"], size["words"],
+            size["deliverables"], size["files"], start),
+    ]
+    if history["runs"]:
+        best_row = history["best"]
+        mean_score = ("%.2f" % best_row["mean_score"]
+                      if best_row["mean_score"] is not None else "n/a")
+        pieces.append(
+            "History: %d comparable run(s); best count %d (mean utility %.2f, "
+            "mean score %s, mean cost $%.4f, mean %.0f s, %d%% stalled)." % (
+                history["runs"], history["best_count"], best_row["mean_utility"],
+                mean_score, best_row["mean_cost"], best_row["mean_seconds"],
+                int(round(best_row["stall_rate"] * 100))))
+        if matched_smaller:
+            pieces.append(history_note)
+        elif adjusted != start:
+            pieces.append("History nudged the start %+d to %d." % (
+                adjusted - start, adjusted))
+        elif history_note:
+            pieces.append(history_note)
+        else:
+            pieces.append("History did not change the start.")
+    else:
+        pieces.append("No comparable history yet.")
+    pieces.append("Waves at concurrency %d: %s." % (
+        concurrency, " + ".join(str(item) for item in waves)))
+    reason = " ".join(pieces)
+    return {
+        "subagents": adjusted, "reason": reason, "complexity": task_type,
+        "task_type": task_type, "size": size, "start_subagents": start,
+        "concurrency": concurrency, "signals": signals, "waves": waves,
+        "history": history, "agent_choice_reason": reason,
+    }
+
+
+def choose_subagents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
+                     default_subagents=DEFAULT_SUBAGENTS,
+                     concurrency=DEFAULT_CONCURRENCY):
+    """Backward-compatible wrapper around :func:`choose_agents`."""
+    return choose_agents(prompt, files=files, explicit=explicit, soft_cap=soft_cap,
+                         default_subagents=default_subagents,
+                         concurrency=concurrency)
+
+
+def quality_default(subagents, cfg):
+    """Quality loop defaults on for real work (subagents > 0)."""
+    return bool(subagents) and bool(cfg.quality)
+
+
+def _wave_sizes(count, concurrency):
+    waves = []
+    remaining = max(0, int(count))
+    while remaining > 0:
+        size = min(max(1, int(concurrency)), remaining)
+        waves.append(size)
+        remaining -= size
+    return waves
+
+
+def plan_escalation(task_type, current_subagents, score, blocking_defects=0,
+                    round_no=1, concurrency=DEFAULT_CONCURRENCY,
+                    target=DEFAULT_QUALITY_TARGET, explicit=False,
+                    soft_cap=None, default_subagents=None):
+    """Decide whether the next revision round should add agents/change approach.
+
+    Returns ``None`` when the review already meets the target with no blocking
+    defects, otherwise a small JSON-serialisable record with the reason.  An
+    explicit caller count is never increased (it is kept exactly); in that case
+    the escalation is a different approach at the same count.  Automatic
+    escalation is bounded by the smallest of the detected concurrency, the
+    operator's ``subagent_soft_cap`` and the ``default_subagents`` ceiling.
+    """
+    try:
+        blocking = int(blocking_defects or 0)
+    except (TypeError, ValueError):
+        blocking = 0
+    try:
+        score_value = float(score) if score is not None else None
+    except (TypeError, ValueError):
+        score_value = None
+    if score_value is not None and score_value >= float(target) and blocking == 0:
+        return None
+
+    try:
+        current = max(0, int(current_subagents or 0))
+    except (TypeError, ValueError):
+        current = 0
+    try:
+        cap = max(1, int(concurrency or DEFAULT_CONCURRENCY))
+    except (TypeError, ValueError):
+        cap = DEFAULT_CONCURRENCY
+    ceilings = [cap]
+    for raw in (soft_cap, default_subagents):
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            ceilings.append(value)
+    limit = min(ceilings)
+
+    limit_label = "concurrency cap" if limit == cap else "effective agent ceiling"
+    if explicit:
+        proposed = current
+        approach = "different_approach"
+        change = ("the caller fixed the count at %d, so keep it and use a "
+                  "different approach" % current)
+    elif current >= limit:
+        proposed = current
+        approach = "different_approach"
+        change = ("already at the %s of %d, so use a different approach "
+                  "rather than more agents" % (limit_label, limit))
+    else:
+        floor = 4 if task_type in ("creative", "research") else 2
+        proposed = min(limit, max(current + 2, floor))
+        approach = "more_agents" if proposed > current else "different_approach"
+        if proposed > current:
+            change = ("escalate from %d to at most %d agents (%s %d)"
+                      % (current, proposed, limit_label, limit))
+        else:
+            change = ("keep %d agents (%s %d) and change the approach"
+                      % (current, limit_label, limit))
+
+    score_text = ("%.2f/10" % score_value) if score_value is not None else "no score"
+    reason = ("Review round %d scored %s with %d blocking defect(s); %s."
+              % (int(round_no), score_text, blocking, change))
+    return {
+        "round": int(round_no),
+        "from": current,
+        "to": proposed,
+        "score": score_value,
+        "blocking_defects": blocking,
+        "approach": approach,
+        "reason": reason,
+        "explicit": bool(explicit),
+        "concurrency": cap,
+        "soft_cap": soft_cap,
+        "default_subagents": default_subagents,
+        "agent_ceiling": limit,
+    }
+
+
+_DEFECT_BUCKETS = (
+    (("overlap", "collision", "superimpos"), "overlap"),
+    (("missing", "absent", "omitted", "not present"), "missing required fact"),
+    (("qr", "qrcode", "barcode"), "qr code"),
+    (("overflow", "clipp", "cut off", "cut-off"), "overflow or clipping"),
+    (("font size", "too small", "illegible", "contrast", "minimum"), "type size or contrast"),
+    (("crash", "exception", "traceback", "unhandled"), "crash"),
+    (("empty", "zero-byte", "zero byte", "blank"), "empty deliverable"),
+    (("failing test", "test failure", "test fails", "test failed", "unit test",
+      "build failed", "build fails", "lint"), "failing test or build"),
+    (("broken", "unreadable", "corrupt", "cannot open", "does not open"), "broken artifact"),
+)
+
+_DEFECT_ADVICE = {
+    "overlap": "reserve separate vertical bands and inspect a rendered screenshot for collisions",
+    "missing required fact": "copy every required fact verbatim from the brief and grep the final deliverable",
+    "qr code": "decode the QR from the final rendered file, not just visually",
+    "overflow or clipping": "check scrollWidth/scrollHeight and render at the exact target size",
+    "type size or contrast": "keep body text at least 10 pt and legal text at least 7 pt at final print size",
+    "empty deliverable": "verify every deliverable exists and is non-empty before returning",
+    "failing test or build": "run the documented build/test command and paste the result in the final answer",
+    "crash": "reproduce the failing input and handle the error path explicitly",
+    "broken artifact": "open the final artifact with the target tool, not only the source file",
+}
+
+
+def defect_kind(text):
+    """Return a stable short kind for a reviewer defect sentence."""
+    lower = str(text or "").lower()
+    for terms, label in _DEFECT_BUCKETS:
+        for term in terms:
+            if term in lower:
+                return label
+    tokens = re.findall(r"[a-z0-9][a-z0-9_-]{2,}", lower)
+    return " ".join(tokens[:6]) or "unspecified"
+
+
+def _run_blocking_kinds(run):
+    kinds = set()
+    for entry in run.get("review_rounds") or []:
+        if entry.get("kind") != "review":
+            continue
+        try:
+            blocking = int(entry.get("blocking_defects") or 0)
+        except (TypeError, ValueError):
+            blocking = 0
+        if blocking <= 0:
+            continue
+        for defect in entry.get("defects") or []:
+            if str(defect).strip():
+                kinds.add(defect_kind(defect))
+    return kinds
+
+
+def _skill_for_run(run, task_type):
+    skill = run.get("skill")
+    entry = _registry_entry(skill)
+    if entry:
+        key = entry.get("key")
+        if key:
+            return key
+    seed = _seed_skill_key(skill)
+    if seed:
+        return seed
+    if skill in ("poster", "web", "document", "code", "data"):
+        return skill
+    return {"code": "code", "research": "data",
+            "creative": "poster"}.get(task_type, "document")
+
+
+def recurring_lessons(run, past_runs=None, target=DEFAULT_QUALITY_TARGET):
+    """Append one lesson per defect kind seen in >= 2 runs of this task type.
+
+    ``run`` is the current (unsaved) run; ``past_runs`` are earlier records
+    from the run log.  The caller writes the returned lessons through
+    ``skills.append_lesson``, which sanitises and de-duplicates them.
+    """
+    task_type = _run_task_type(run)
+    current = _run_blocking_kinds(run)
+    if not current:
+        return []
+    counts = dict((kind, 1) for kind in current)
+    for past in past_runs or []:
+        if not isinstance(past, dict):
+            continue
+        if past is run:
+            continue
+        if run.get("id") and past.get("id") == run.get("id"):
+            continue
+        if _run_task_type(past) != task_type:
+            continue
+        for kind in _run_blocking_kinds(past):
+            counts[kind] = counts.get(kind, 0) + 1
+    skill = _skill_for_run(run, task_type)
+    lessons = []
+    for kind in sorted(counts):
+        if counts[kind] < 2:
+            continue
+        advice = _DEFECT_ADVICE.get(
+            kind, "add a pre-flight check for this defect kind and verify the rendered result")
+        lessons.append({
+            "task_type": task_type,
+            "kind": kind,
+            "runs": counts[kind],
+            "skill": skill,
+            "lesson": ("Recurring %s defect (%s): %s." % (task_type, kind, advice)),
+        })
+    return lessons
+
+
+def _creative_builder_contract():
+    return (
+        "\n\n## Visual-impact contract (creative/design)\n"
+        "Accuracy and readability are the floor, not the finish line. A previous ad "
+        "scored 8.8/10 for accuracy/readability and was still rejected by the user as "
+        "visually plain. Design for impact before polishing details.\n"
+        "- Before building, choose 2-3 genuinely distinct directions (for example "
+        "editorial, Swiss grid, art nouveau, bold print). Do not spend the wave on "
+        "eight variants of one layout.\n"
+        "- In one line per direction state: focal point, 2-3 colour system, type "
+        "pairing, and the single image/graphic device.\n"
+        "- Build the direction with the strongest visual idea first. Use a deliberate "
+        "focal point, layered composition (type/image/negative space), generous "
+        "whitespace, and display type with character. Avoid the default-template look: "
+        "centered headline over a stock hero, one flat colour block, generic sans.\n"
+        "- If the result could be mistaken for a default template, change composition, "
+        "type or colour before rendering.\n"
+        "- Render the chosen visual at the exact target size and inspect it with "
+        "read_image at phone scale. Ask: would this stop a scroll? Does it look "
+        "designed for this brand, not generated?\n"
+        "- Add `Visual impact: X/10` and one sentence naming the strongest and weakest "
+        "visual element to QUALITY_REPORT.md.\n"
+    )
+
+
+def _creative_review_contract():
+    return (
+        "\n\n## Creative review: visual impact is scored\n"
+        "If the deliverable is visual/creative, score visual impact separately and "
+        "weight it about 30% of the overall score. Accuracy and readability are "
+        "necessary, not sufficient. A correct, readable but plain or generic result - "
+        "a default-template layout, weak focal point, flat hierarchy, or no distinctive "
+        "type/image treatment - must receive overall 7.5/10 or lower and a defect "
+        "`visually plain`. Ask: would this stop a scroll? Does it look designed for "
+        "this brand? Name the strongest and weakest visual element with a file or crop "
+        "path. In REVIEW.md include `Visual impact: X/10`, `Overall: X/10` and "
+        "`Final quality score: X/10`; the final-score line is the one the connector "
+        "reads.\n"
+    )
+
+
+def _creative_revision_contract():
+    return (
+        "\n\n## Creative revision\n"
+        "If a blocking or non-blocking defect is visual impact, change composition, "
+        "type or colour treatment. Do not only rewrite copy or nudge spacing; a plain "
+        "layout needs a different visual idea, and the revision must say which one it "
+        "chose.\n"
+    )
+
+
+def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
+                       quality_rounds=DEFAULT_QUALITY_ROUNDS,
+                       quality_target=DEFAULT_QUALITY_TARGET,
+                       concurrency=DEFAULT_CONCURRENCY,
+                       independent_review=True, render_hint=None,
+                       task_type=None):
+    """Return the full task text sent to ``dsh --profile headless``."""
+    parts = [prompt.strip()]
+    try:
+        concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
+    except (TypeError, ValueError):
+        concurrency = DEFAULT_CONCURRENCY
+
+    count = int(subagents) if subagents else 0
+    if count > 0:
+        waves = _wave_sizes(count, concurrency)
+        wave_text = " + ".join(str(size) for size in waves)
+        noun = "subagent" if count == 1 else "subagents"
+        parts.append(
+            "\n\nWork method (concurrency limit first): use %d %s in total, split into "
+            "waves of AT MOST %d (%s). Harness allows at most %d children alive at once: never "
+            "put more than %d agents in a single parallel() block and never start a new child "
+            "while %d are still running, or Harness rejects it (ACTIVATION_LIMIT_REACHED) or "
+            "hangs. Each subagent takes a different approach or part of the task; compare and "
+            "combine their results into the single best final answer. Chosen automatically: %s. "
+            "Save final deliverables as files in the working folder and list their names in "
+            "your final answer. Run each wave in its own `workflow` tool call; never put two "
+            "waves in one call."
+            % (count, noun, concurrency, wave_text, concurrency, concurrency, concurrency, reason)
+        )
+        if count > 1:
+            first_wave = waves[0] if waves else count
+            section = (
+                "\n\n## Pipelined, learning waves\n"
+                "Run the waves strictly one after another: each wave gets its own `workflow` "
+                "tool call with exactly one `parallel()` block, and a wave is finished only "
+                "when its result file is on disk. Do not run the same wave again; never put "
+                "two waves in one `workflow` script. Every wave after the first must improve "
+                "on the previous one; a later wave is a new `workflow` call, not another async "
+                "task in the same script.\n"
+                "Time budget: each builder gets 6 minutes of wall-clock time and at most 12 "
+                "tool calls; the whole wave must return within 7 minutes (under the default "
+                "480 s stall watchdog). The first write "
+                "must be the candidate file (a rough draft is fine); then write the result and "
+                "return. A `parallel()` barrier waits for every child, so one slow child stalls "
+                "the whole wave: never let a single browser/render command or retry loop run "
+                "unbounded, and do not wait for a perfect candidate before saving it.\n"
+                "1. Wave 1: make ONE `workflow` call containing exactly one `parallel()` block "
+                "of %d builder `agent()` calls (never more than %d children alive at once, or "
+                "Harness rejects it with ACTIVATION_LIMIT_REACHED or hangs). Each builder writes "
+                "a distinct candidate file (or part) FIRST and returns a one-paragraph result "
+                "with its file path. Every builder must return within its 6-minute budget even "
+                "if QA is incomplete; a builder that cannot finish must still write its "
+                "candidate file and report the limitation. Save every builder's result and "
+                "path to `wave-1-results.md` as soon as the wave returns, before starting the "
+                "next wave.\n"
+                % (first_wave, concurrency)
+            )
+            section += (
+                "2. When wave 1 returns and `wave-1-results.md` exists, spawn a SUB-LEADER "
+                "subagent in its own call. Give it the wave-1 file paths (not contents) and ask "
+                "for a compact structured summary in `wave-1-summary.md`: `{wave, "
+                "best_candidate_path, strengths, defects, discarded_approaches, next_seed}`. "
+                "The lead reads only summaries, never all drafts.\n"
+            )
+            if len(waves) > 1:
+                section += (
+                    "3. Wave 2: after `wave-1-summary.md` is saved, make a NEW `workflow` call "
+                    "for wave 2 only, seeded with the summary's `best_candidate_path` plus its "
+                    "defect list. Tell every wave-2 builder to improve that candidate and fix "
+                    "those defects, not start over. Use one `parallel()` block of at most %d "
+                    "builders and never more than %d children alive at once; save each wave's "
+                    "results to `wave-2-results.md` before starting the next wave.\n"
+                    % (waves[1], concurrency)
+                ) + (
+                    "4. Repeat for each later wave: one new `workflow` call; seed it with the "
+                    "best candidate and defect list; keep the best candidate forward; save "
+                    "`wave-<n>-results.md` before the next call.\n"
+                    "5. If a wave hangs or errors, do not restart it and do not re-run an "
+                    "earlier wave. Record it as hung, keep the files it already wrote, and "
+                    "continue with the waves already finished. If a wave hangs, continue with "
+                    "the waves already finished and build the final deliverables from their "
+                    "best candidate; a hung wave must never block the run.\n"
+                )
+            else:
+                section += (
+                    "3. This run has a single wave: use the ONE `workflow` call above, then the "
+                    "SUB-LEADER summary. If that call hangs, do not restart it; keep any "
+                    "candidate files it wrote, and use the summary to consolidate the best "
+                    "candidate and fix every listed defect before writing the final deliverables. "
+                    "Save the wave's results to `wave-1-results.md`.\n"
+                )
+            section += (
+                "Finally, keep each summary to roughly 200 words. The final answer must name "
+                "the best candidate path and list every deliverable file."
+            )
+            parts.append(section)
+    else:
+        parts.append(
+            "\n\nWork method: this is a simple task. Do it directly with a single agent; do not "
+            "start subagents."
+        )
+
+    if task_type == "creative":
+        parts.append(_creative_builder_contract())
+
+    if render_hint:
+        parts.append("\n\n## Render environment (connector probe)\n%s\n" % render_hint)
+
+    # Every builder task, including 0- and 1-agent runs, gets the same hard
+    # execution-safety contract: the live-run hang came from unwrapped Chrome
+    # processes, not from the number of agents.
+    parts.append(
+        "\n\n## Execution safety (hard requirement)\n"
+        "- Every headless Chrome, browser, server, network or other potentially blocking "
+        "command MUST run under a hard shell timeout, e.g. `timeout 60 chrome "
+        "--headless=new ... --screenshot=...` (on macOS without coreutils, use "
+        "`gtimeout 60 ...` or `perl -e 'alarm 60; exec @ARGV' -- ...`). A tool-level "
+        "timeout (`timeoutMs`) is not enough: it does not reliably end the process "
+        "group, so the command can keep the child alive after the tool reports a "
+        "timeout.\n"
+        "- Use a FRESH `--user-data-dir` inside the workspace and set `HOME` and `TMPDIR` "
+        "inside the workspace. Chrome cannot create its profile or process-singleton "
+        "socket under the sandbox's Application Support/default temp directory, so it can "
+        "hang instead of exiting. Kill leftover Chrome processes for that profile and "
+        "delete the profile when done.\n"
+        "- Make at most 2 Chrome attempts in total. If both fail, stop trying, keep the "
+        "HTML candidate and record `render unavailable: <reason>` in the result file. A "
+        "failed render is a reported limitation, not a reason to loop.\n"
+        "- Do not render every exploratory candidate. Write source/HTML candidates first; "
+        "render only the chosen candidate once, after the wave returns, "
+        "under the timeout above.\n"
+        "- Write the candidate file FIRST, then do optional QA. No unbounded retry loops.\n"
+    )
+    if count <= 1:
+        parts.append(
+            "\n\n## Time budget (hard requirement)\n"
+            "Finish within 6 minutes of wall-clock time and at most 12 tool calls. Write the "
+            "deliverable file FIRST (a rough draft is fine), then run "
+            "only the checks needed to make it correct, and return. Do not wait for a "
+            "perfect result and do not retry a failed command more than twice: if a render "
+            "fails, keep the source file and record `render unavailable: <reason>`.\n"
+        )
+
+    if skill and skill.get("content"):
+        parts.append(
+            "\n\n## Skill checklist: %s\n"
+            "Apply this checklist explicitly. Check every item and report anything that cannot "
+            "be met.\n\n%s" % (skill.get("title") or skill.get("key"), skill["content"].strip())
+        )
+
+    try:
+        rounds = max(1, int(quality_rounds))
+    except Exception:
+        rounds = DEFAULT_QUALITY_ROUNDS
+
+    if quality:
+        parts.append(
+            "\n\n## Mandatory quality loop (builder self-check)\n"
+            "Do not stop at the first plausible draft. Run this loop:\n"
+            "(a) Restate the brief as a numbered checklist of requirements and acceptance "
+            "criteria before doing the work.\n"
+            "(b) Have subagents produce independent candidates (different approaches or parts).\n"
+            "(c) Run automatic checks appropriate to the deliverable. For HTML/visuals: render "
+            "with headless Chrome under a hard timeout (e.g. `timeout 60 chrome --headless=new "
+            "... --screenshot=...`, or `gtimeout`/`perl -e 'alarm 60; exec @ARGV' -- ...` "
+            "when `timeout` is absent) with a fresh `--user-data-dir` under the workspace, kill "
+            "leftovers, and try at most twice; if the render fails, record the limitation and "
+            "keep the HTML instead of retrying variants. Then check overflow and clipping, "
+            "overlapping text, minimum font size for print (>= 10 pt body, >= 7 pt legal), "
+            "large empty areas, every fact from the brief present, and decode any QR codes. "
+            "For code: build, tests and lint. For documents: completeness against the brief, "
+            "length and tone. For data: reproduce the pipeline, validate schema and row counts, "
+            "and check chart axes, units and uncertainty.\n"
+            "(d) Use a separate REVIEWER subagent that did not create the candidate. It must "
+            "inspect the rendered output with read_image and score it 0-10 against the "
+            "checklist, listing concrete defects with evidence file paths. A blocking defect "
+            "is any missing required fact, broken artifact, incorrect result or safety "
+            "violation; it cannot be averaged away by a high score.\n"
+            "(e) Revise and repeat until the score is >= %.1f/10 and there are zero blocking "
+            "defects, or until %d revision %s have been used. Do not let the reviewer "
+            "review its own work.\n"
+            "(f) Write QUALITY_REPORT.md in the working folder with: the checklist, scores per "
+            "round, defects found and fixed, evidence file paths, and the final score. Return "
+            "the final score in your answer as 'Final quality score: X/10'. This is your "
+            "self-score only; the connector will run an independent reviewer afterwards.\n"
+            % (quality_target, rounds, "round" if rounds == 1 else "rounds")
+        )
+
+    if independent_review and subagents and int(subagents) > 0:
+        parts.append(
+            "\n\n## Independent verification by the connector\n"
+            "After you finish, a separate fresh Harness agent (new session, same workspace, "
+            "read-only intent) will review the deliverable files against the original brief "
+            "and this skill checklist. It will not trust your QUALITY_REPORT.md conclusions. "
+            "It may run tests and `read_image`, then return its own 0-10 score, blocking "
+            "defects with evidence, and a fix list; the connector persists that report as "
+            "REVIEW.md. If its score is below "
+            "%.1f or it finds a blocking defect, a revision run will address only that fix "
+            "list and the connector will review again (up to %d review round(s)). Therefore: "
+            "make the deliverables self-contained, put evidence paths in QUALITY_REPORT.md, "
+            "and list every output file in your final answer.\n"
+            % (quality_target, rounds)
+        )
+
+    if quality:
+        parts.append(
+            "\n\nSave all deliverables (including QUALITY_REPORT.md) in the working folder. "
+            "In the final answer list every file written and include the final quality score."
+        )
+    else:
+        parts.append(
+            "\n\nSave all deliverables in the working folder. In the final answer list every "
+            "file written."
+        )
+    return "".join(parts)
+
+
+def build_finisher_task(prompt, candidate_files, stop_reason="stalled",
+                        stopped_after=None, skill=None, quality=True,
+                        quality_target=DEFAULT_QUALITY_TARGET, limit_seconds=None):
+    """Task text for the short rescue run after a stalled/timed-out builder.
+
+    The finisher is deliberately a single agent with a hard call budget: the
+    previous attempt already spent its subagent budget and its time, and the
+    workspace already holds the candidates.  The task must pick one existing
+    candidate, make only minimal fixes, produce and verify the deliverables,
+    and stop -- not re-design, re-audit or create new browser profiles.
+    """
+    files = [str(name) for name in (candidate_files or [])][:40]
+    if stop_reason == "stalled":
+        reason = "stalled with no progress events"
+    elif stop_reason == "time_limit":
+        reason = "hit its time limit"
+    else:
+        reason = "stopped early"
+    if stopped_after is not None:
+        reason += " after %s s" % stopped_after
+    limit_note = ""
+    try:
+        if limit_seconds is not None and float(limit_seconds) > 0:
+            limit_note = (" (the connector may stop you at %d s; write the final "
+                          "answer before then)" % int(float(limit_seconds)))
+    except (TypeError, ValueError):
+        limit_note = ""
+    parts = [
+        "You are the FINISHER. This is a rescue, not a normal run. The previous builder "
+        "attempt stopped early: it %s. Its process is no longer running, but its files "
+        "are still in this workspace.\n\n"
+        "## Hard budget: finish, do not perfect\n"
+        "- Work as one agent: 0 subagents, no `workflow`, no `parallel()` and no "
+        "delegation. This is a rescue, not a rebuild.\n"
+        "- Hard cap: at most 12 tool calls in total. Every read, bash, write, edit and "
+        "read_image call counts.\n"
+        "- Hard cap: at most 8 minutes of wall-clock time%s. Stop at 12 calls or minute "
+        "8, even if the result is imperfect, and write the final answer.\n"
+        "- No network: do not download browsers, fonts, packages or assets. Use only what "
+        "is already installed.\n"
+        "- **No redesign.** Do not redesign anything. Do not change the chosen concept, "
+        "layout, palette or type system, and do not start over.\n"
+        "- **No new browser profiles.** Do not create, inspect or repair persistent "
+        "browser profile directories. If Chrome is unavoidable, use one fresh throwaway "
+        "`--user-data-dir` for a single command, kill the process you started, and delete "
+        "the directory in that same command. Never leave a browser process running.\n"
+        "- **No new audits.** Do not write or run audit scripts, DOM-metric scripts, "
+        "contrast checkers, screenshot matrices or new evidence files. One `read_image` of "
+        "the final visual is the only inspection allowed.\n"
+        "- Do not write `REVIEW.md`; the independent reviewer owns that file.\n\n"
+        "## Original brief\n\n%s\n" % (reason, limit_note, (prompt or "").strip())
+    ]
+    if files:
+        parts.append(
+            "\n\n## Existing candidate files (relative to this workspace)\n\n%s\n"
+            "\nUse the existing files. Read at most the 2 most promising candidates, not all "
+            "of them; skip `BRIEF.md`, helper scripts, logs and reports. They may be partial, "
+            "duplicated or contradictory. Pick the single best existing candidate, or the "
+            "most complete one if none is clearly best. Do not merge candidates and leave "
+            "unused candidates untouched.\n"
+            % "\n".join("- `%s`" % name for name in files)
+        )
+    else:
+        parts.append(
+            "\n\n## Existing candidate files\n\nNone were listed. Do not search the whole "
+            "disk: inspect this workspace once. If no candidate exists, write the simplest "
+            "correct deliverable directly from the brief with the fewest tool calls, then "
+            "verify it as in step 4.\n"
+        )
+    if skill and skill.get("content"):
+        parts.append(
+            "\n\n## Skill checklist: %s\n\n"
+            "Use this only as a final sanity list for the deliverable you picked. It is "
+            "not a licence to audit or rebuild.\n\n%s\n"
+            % (skill.get("title") or skill.get("key"), skill["content"].strip())
+        )
+    parts.append(
+        "\n\n## Method (time-boxed, minimal)\n"
+        "1. Read the brief and note the exact deliverable paths it names in one short "
+        "list. Do not add deliverables it does not name. If no candidate exists, skip "
+        "steps 2 and 3 and build the simplest correct deliverable directly.\n"
+        "2. Pick the single best existing candidate (or the most complete one) and keep "
+        "its file name where it is already correct. Do not spend calls looking for a "
+        "better starting point.\n"
+        "3. Make at most three minimal fixes: a missing required fact, a wrong path or "
+        "name, or an obvious break that stops the deliverable working. Do not add a new "
+        "section, style, illustration, font or feature that the brief did not ask for.\n"
+        "4. Produce every final deliverable the brief asks for, in this workspace, using "
+        "its exact file names and formats. Put every potentially blocking command under "
+        "a hard shell timeout, e.g. `timeout 60 chrome --headless=new ... "
+        "--screenshot=...` (or a `gtimeout`/Perl alarm wrapper when `timeout` is absent); "
+        "use a fresh `--user-data-dir` under the workspace, kill leftovers, and try at "
+        "most twice. If the render still fails, keep the existing image/PDF or ship the "
+        "HTML and state the exact error in the final answer; do not loop on browser "
+        "variants.\n"
+        "5. Verify every deliverable exists and is non-empty with `test -s <file>` (or "
+        "`wc -c <file>`). A deliverable must exist and have size > 0; do not finish with "
+        "a zero-byte or missing file. Fix a missing or empty file with at most two calls; "
+        "if it is still missing, say so plainly.\n"
+        "6. Stop. Do not run a second audit and do not create another profile; the "
+        "connector's independent reviewer owns the review file.\n"
+    )
+    if quality:
+        parts.append(
+            "7. Write or refresh `QUALITY_REPORT.md` once, in one write, as your final "
+            "file write. Keep it short: what you changed, which files you checked, and "
+            "one line `Final quality score: X/10` (target %.1f/10). This is the builder "
+            "self-score only; do not revise it or walk the checklist.\n"
+            % float(quality_target)
+        )
+        final_step = 8
+    else:
+        final_step = 7
+    parts.append(
+        "%d. End your final answer with exactly this shape: `This is a rescue of an "
+        "earlier interrupted attempt.` then `Deliverables:` and list the file names as "
+        "relative paths, one per line with its byte size, then `Tool calls used: N of "
+        "12.` Do not claim checks you did not run, and do not omit a deliverable that "
+        "exists.\n" % final_step
+    )
+    return "".join(parts)
+
+
+def build_review_task(prompt, deliverable_files, skill=None,
+                      quality_target=DEFAULT_QUALITY_TARGET, round_no=1,
+                      task_type=None, browser_evidence=None):
+    """Task text for the connector-owned, independent REVIEWER run."""
+    files = list(deliverable_files or [])
+    parts = [
+        "You are the INDEPENDENT REVIEWER. You did not build these deliverables. A separate "
+        "builder agent produced them in this workspace. Do not trust the builder's "
+        "QUALITY_REPORT.md, self-score, final answer, or any claim of success; judge only the "
+        "files and the original brief below.\n\n"
+        "## Original brief\n\n%s\n" % (prompt or "").strip(),
+    ]
+    if skill and skill.get("content"):
+        parts.append(
+            "\n\n## Skill checklist to review against: %s\n\n%s\n"
+            % (skill.get("title") or skill.get("key"), skill["content"].strip())
+        )
+    if files:
+        parts.append(
+            "\n\n## Deliverable files to inspect (relative to this workspace)\n\n%s\n"
+            % "\n".join("- `%s`" % name for name in files)
+        )
+    else:
+        parts.append(
+            "\n\n## Deliverable files to inspect\n\nNone were reported. Treat a missing "
+            "deliverable as a blocking defect unless the brief explicitly asked for a chat-only "
+            "answer.\n"
+        )
+    if browser_evidence:
+        parts.append("\n\n## Browser evidence captured by the connector\n\n%s\n"
+                     % str(browser_evidence).strip())
+    if task_type == "creative":
+        parts.append(_creative_review_contract())
+    parts.append(
+        "\n\n## Review method\n"
+        "1. Open every listed file. For images, PDFs and visual output, render or convert as "
+        "needed and inspect with `read_image` at the target size; check overflow, clipping, "
+        "overlap, minimum type size, empty areas, required facts and QR codes. For code, run "
+        "the build/tests and inspect the entry point. For documents, check completeness, facts, "
+        "length and tone. For data, reproduce or validate the pipeline, schema, row counts, "
+        "units and charts. When browser evidence is provided, check its console errors, failed "
+        "network requests and DOM summary as part of the review.\n"
+        "2. Score 0-10 against the brief and checklist. A high score cannot average away a "
+        "blocking defect. A blocking defect is a missing required fact, a broken or unreadable "
+        "artifact, an incorrect result, a failed test that the brief required, or a safety/"
+        "privacy violation.\n"
+        "3. Do not modify any deliverable and do not write any files with tools. This run is "
+        "read-only, so file mutations are rejected by the sandbox. Return the complete "
+        "`REVIEW.md` document as your final answer; the connector writes that one file for "
+        "you. Do not edit QUALITY_REPORT.md or any builder output. Do not start subagents or a "
+        "workflow; you are a single reviewer agent.\n"
+        "4. The complete `REVIEW.md` document in your final answer must use exactly these "
+        "headings:\n"
+        "   `# Independent review`\n"
+        "   `## Score` with `Final quality score: X/10`\n"
+        "   `## Blocking defects` (bullets, each with a file path and concrete evidence; write "
+        "`None` if there are none)\n"
+        "   `## Non-blocking defects` (bullets or `None`)\n"
+        "   `## Fix list` (ordered, concrete, smallest changes that would pass)\n"
+        "5. End your final answer with `Final quality score: X/10` and `Blocking defects: N`.\n"
+        "This is review round %d. The target is %.1f/10 with zero blocking defects.\n"
+        % (int(round_no), float(quality_target))
+    )
+    return "".join(parts)
+
+
+def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
+                        skill=None, quality_target=DEFAULT_QUALITY_TARGET,
+                        round_no=1, escalation=None, task_type=None):
+    """Task text for a connector-owned REVISION run after a failed review."""
+    files = list(deliverable_files or [])
+    parts = [
+        "You are the REVISION agent. An independent reviewer (not you) inspected the "
+        "deliverables and found blocking defects. Fix exactly those defects and re-run the "
+        "relevant checks. Do not rewrite from scratch unless a fix requires it. Do not write "
+        "REVIEW.md; the reviewer owns that file.\n\n"
+        "## Original brief\n\n%s\n" % (prompt or "").strip(),
+    ]
+    if skill and skill.get("content"):
+        parts.append(
+            "\n\n## Skill checklist\n\n%s\n" % skill["content"].strip()
+        )
+    if task_type == "creative":
+        parts.append(_creative_revision_contract())
+    if blocking_defects:
+        parts.append(
+            "\n\n## Blocking defects (with reviewer evidence)\n\n%s\n"
+            % ("\n".join("- %s" % item for item in blocking_defects))
+        )
+    if fix_list:
+        parts.append(
+            "\n\n## Fix list (address in order)\n\n%s\n"
+            % ("\n".join("%d. %s" % (index, item)
+                         for index, item in enumerate(fix_list, 1)))
+        )
+    if files:
+        parts.append(
+            "\n\n## Deliverable files to update\n\n%s\n"
+            % "\n".join("- `%s`" % name for name in files)
+        )
+    if escalation:
+        count = int(escalation.get("to") or 0)
+        from_count = int(escalation.get("from") or 0)
+        limit = int(escalation.get("concurrency") or count)
+        if count > from_count:
+            choice = ("Escalate from %d to at most %d subagents, in waves of at most "
+                      "%d children alive at once (never more than %d in one "
+                      "`parallel()` block), and/or use a different approach."
+                      % (from_count, count, limit, limit))
+        else:
+            choice = ("Do not add more agents; use a different approach (new layout, "
+                      "concept or verification path) at the same count of %d." % count)
+        parts.append(
+            "\n\n## Escalation for this round\n"
+            "%s %s If you use subagents, each must write its file first and finish "
+            "within 5 minutes; never exceed the detected concurrency. Record in your "
+            "final answer whether you used more agents or a different approach, and why.\n"
+            % (escalation.get("reason") or "", choice)
+        )
+    parts.append(
+        "\n\n## Revision method\n"
+        "1. Reproduce each blocking defect from the evidence.\n"
+        "2. Make the smallest correct change. Keep everything that already passed.\n"
+        "3. Re-run the checks the brief and skill checklist require (tests, render, read_image, "
+        "data validation).\n"
+        "4. Update QUALITY_REPORT.md with what changed and evidence paths; keep it factual.\n"
+        "5. Save all deliverables in this workspace and list every changed file in your final "
+        "answer. The connector will run another independent review (target %.1f/10, zero "
+        "blocking defects) after this revision (round %d).\n"
+        % (float(quality_target), int(round_no))
+    )
+    return "".join(parts)
+
+
+def _read_report(workspace):
+    if not workspace:
+        return ""
+    path = os.path.join(str(workspace), "QUALITY_REPORT.md")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except Exception:
+        return ""
+
+
+_TARGET_LINE_RE = re.compile(
+    r"target|threshold|minimum|at least|required|goal|>=\s*\d|\u2265", re.IGNORECASE)
+
+
+def _line_at(text, position):
+    start = text.rfind("\n", 0, position) + 1
+    end = text.find("\n", position)
+    if end < 0:
+        end = len(text)
+    return text[start:end]
+
+
+def _last_score(pattern, text, skip_targets=False, first_on_final_line=False):
+    matches = []
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        try:
+            value = float(match.group(1))
+        except Exception:
+            continue
+        if not (0.0 <= value <= 10.0):
+            continue
+        line = _line_at(text, match.start())
+        if skip_targets and _TARGET_LINE_RE.search(line):
+            continue
+        matches.append((match.start(), value, line))
+    if not matches:
+        return None
+    if first_on_final_line:
+        final_lines = [item for item in matches if re.search(r"\bfinal\b", item[2], re.IGNORECASE)]
+        if final_lines:
+            return final_lines[0][1]
+    matches.sort()
+    return matches[-1][1]
+
+
+def extract_quality_score(workspace=None, final_text=None):
+    """Read the final quality score from QUALITY_REPORT.md, then the final text.
+
+    Explicit "Final quality score" statements are trusted first, so a later
+    target/threshold note or a table's target column cannot override them.
+    """
+    texts = [text for text in (_read_report(workspace), final_text or "") if text]
+    priority = (
+        r"final\s+quality\s+score\s*\|?\s*[:=\-]?\s*\|?\s*(\d+(?:\.\d+)?)",
+        r"(?:overall|final)\s+score\s*[:\-]?\s*(\d+(?:\.\d+)?)",
+        r"score\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*/\s*10",
+    )
+    for pattern in priority:
+        for text in texts:
+            score = _last_score(pattern, text, skip_targets=False)
+            if score is not None:
+                return round(score, 2)
+    for text in texts:
+        score = _last_score(r"(\d+(?:\.\d+)?)\s*/\s*10", text,
+                            skip_targets=True, first_on_final_line=True)
+        if score is not None:
+            return round(score, 2)
+    return None
+
+
+def _section_bullets(text, names):
+    """Return bullet lines under the first heading containing one of ``names``."""
+    lines = (text or "").splitlines()
+    collecting = False
+    bullets = []
+    for raw in lines:
+        line = raw.strip()
+        if re.match(r"^#{1,6}\s", line):
+            heading = line.lstrip("#").strip().lower()
+            is_non_blocking = "non-blocking" in heading or "non blocking" in heading
+            if any(name in heading for name in names):
+                if is_non_blocking and any("blocking" in name for name in names):
+                    if collecting:
+                        break
+                    continue
+                collecting = True
+                continue
+            if collecting:
+                break
+            continue
+        if not collecting:
+            continue
+        if re.match(r"^(?:[-*+]|\d+[.)])\s+", line):
+            item = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line).strip()
+            if item and not re.match(r"^(?:none|no blocking|n/?a|0)\b", item, re.IGNORECASE):
+                bullets.append(item)
+        elif line and not line.startswith("```"):
+            # A plain "None" or "Blocking defects: 0" line closes the section.
+            if re.match(r"^(?:none|no blocking|n/?a|0)\b", line, re.IGNORECASE):
+                continue
+    return bullets
+
+
+CREATIVE_PLAIN_CAP = 7.5
+CREATIVE_VISUAL_FLOOR = 6.0
+_PLAIN_NEGATION_RE = re.compile(
+    r"(?:\bnot|\bnever|\bno|\bwithout|\bisn['’]?t|\baren['’]?t|"
+    r"\bdoesn['’]?t|\bdon['’]?t|\bwasn['’]?t|\bavoid(?:s|ed)?|"
+    r"\bnot\s+(?:at\s+all|particularly|especially))\s+(?:\w+\s+){0,3}$",
+    re.IGNORECASE)
+_PLAIN_ASSERTION_RE = re.compile(
+    r"\b(?:is|are|was|were|looks?|appears?|feels?|remains?|seems?|too|"
+    r"quite|rather|very|still|scored?|gets?|got|renders?|reads?)\b"
+    r"[^.;\n]{0,80}$",
+    re.IGNORECASE)
+
+
+def _plain_occurrences(text):
+    """Yield unnegated ``visually plain`` occurrences from ``text``."""
+    for match in re.finditer(r"visually\s+plain", text or "", re.IGNORECASE):
+        prefix = (text or "")[max(0, match.start() - 50):match.start()]
+        if _PLAIN_NEGATION_RE.search(prefix):
+            continue
+        yield match
+
+
+def _defect_asserts_plain(defects):
+    """A defect bullet that names plainness is already a positive assertion."""
+    for item in defects or []:
+        if any(True for _ in _plain_occurrences(str(item))):
+            return True
+    return False
+
+
+def _review_asserts_plain(text, defects=()):
+    """True only for a positive plainness assertion, never for a denial.
+
+    A bullet under a defects heading is positive by placement.  Free prose must
+    put a verb near the phrase ("the ad is visually plain"); otherwise a
+    sentence such as "the result is not visually plain" would trigger a cap.
+    """
+    if _defect_asserts_plain(defects):
+        return True
+    for match in _plain_occurrences(text):
+        clause = (text or "")[max(0, match.start() - 90):match.start()]
+        if _PLAIN_ASSERTION_RE.search(clause):
+            return True
+    return False
+
+
+def visual_impact_score(text):
+    """Return the review's separate Visual impact score, if reported."""
+    return _last_score(
+        r"visual\s+impact\s*(?:score)?\s*[:=\-|]?\s*(\d+(?:\.\d+)?)\s*/\s*10",
+        text or "", skip_targets=True)
+
+
+def parse_review(report_text="", final_text="", task_type=None):
+    """Parse an independent REVIEW.md/final answer.
+
+    Returns ``{"score", "blocking_defects", "defects", "fixes"}`` plus the
+    visual-impact sub-score and whether the creative cap was applied.  The
+    count is explicit when reported, otherwise the number of bullets under the
+    "Blocking defects" heading.
+
+    The prompt asks a creative reviewer to cap an accurate-but-plain result at
+    7.5, but a model can ignore that instruction.  The connector therefore
+    enforces the cap here: for a creative task, a Visual impact score of 6.0 or
+    lower, or a positive "visually plain" assertion/defect, clamps the parsed
+    official score to 7.5 so the normal 8.5 acceptance gate starts a revision.
+    A denial such as "not visually plain" does not trigger the cap.
+    """
+    combined = "\n".join(part for part in (report_text or "", final_text or "") if part)
+    score = extract_quality_score(None, report_text) if report_text else None
+    if score is None:
+        score = extract_quality_score(None, final_text)
+    if score is None:
+        score = extract_quality_score(None, combined)
+
+    blocking = None
+    for pattern in (
+            r"blocking\s+defects?\s*(?:count)?\s*[:=\-|]\s*(\d+)",
+            r"(\d+)\s+blocking\s+defect"):
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            try:
+                blocking = int(match.group(1))
+                break
+            except ValueError:
+                pass
+    blocking_lines = _section_bullets(combined, ("blocking defect", "blocking"))
+    if blocking is None:
+        blocking = len(blocking_lines)
+    defects = blocking_lines or _section_bullets(combined, ("defect", "issues"))
+    fixes = _section_bullets(combined, ("fix list", "fixes", "required changes"))
+    if not fixes:
+        fixes = defects
+    visual = visual_impact_score(combined)
+    plain = _review_asserts_plain(combined, defects)
+    capped = False
+    if (task_type == "creative" and score is not None
+            and (plain or (visual is not None and visual <= CREATIVE_VISUAL_FLOOR))):
+        capped_score = min(float(score), CREATIVE_PLAIN_CAP)
+        capped = capped_score < float(score)
+        score = capped_score
+        if capped and not any("visually plain" in str(item).lower() for item in defects):
+            defects = list(defects) + [
+                "Creative score capped at 7.5: accurate but visually plain/generic result."]
+            if not fixes or fixes == defects[:-1]:
+                fixes = list(fixes) + [defects[-1]]
+    return {
+        "score": round(float(score), 2) if score is not None else None,
+        "blocking_defects": int(blocking or 0),
+        "defects": defects,
+        "fixes": fixes,
+        "visual_impact": round(float(visual), 2) if visual is not None else None,
+        "creative_cap": bool(capped),
+    }
+
+
+def quality_verdict(score, blocking_defects=0, round_no=1, max_rounds=DEFAULT_QUALITY_ROUNDS,
+                    target=DEFAULT_QUALITY_TARGET):
+    """Pure control-flow helper used by tests and by the review loop."""
+    try:
+        score = float(score)
+    except Exception:
+        score = 0.0
+    blocking = int(blocking_defects or 0)
+    if score >= float(target) and blocking == 0:
+        return "accept"
+    if int(round_no) >= int(max_rounds):
+        return "stop"
+    return "revise"
