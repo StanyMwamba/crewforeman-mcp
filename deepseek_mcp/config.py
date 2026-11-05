@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.7.0"
+SERVER_VERSION = "3.8.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -148,12 +148,20 @@ DEFAULTS = {
     "dsh_model": "deepseek-flash",
     # Durable phase checkpoints and resume (state_dir/checkpoints).
     "checkpoint": True,
+    # P1-1: return an existing active run for an identical request fingerprint
+    # instead of paying for a duplicate pipeline. Operators can disable it;
+    # an explicit idempotency_key always selects its own work item.
+    "dedupe_active": True,
     # Optional OpenAI-compatible fallbacks. Config holds env-var NAMES only;
     # API keys are never stored here. Empty list keeps DeepSeek-only behaviour.
     "providers": [],
     "consult_models": [],
     "provider_fallback": False,
     "task_ttl": 3600,
+    # P1-3: "job" keeps an MCP task working until the detached job reaches a
+    # terminal journal state; "request" restores the old complete-on-return
+    # behaviour for a client migration window.
+    "task_completion": "job",
     # Structured per-run trace + timeline. Export is opt-in and best-effort.
     "trace": True,
     "otlp_endpoint": "",
@@ -300,11 +308,15 @@ ENV_MAP = {
     "DSH_MODEL": "dsh_model",
     "DSH_CHECKPOINT": "checkpoint",
     "DEEPSEEK_CHECKPOINT": "checkpoint",
+    "DSH_DEDUPE_ACTIVE": "dedupe_active",
+    "DEEPSEEK_DEDUPE_ACTIVE": "dedupe_active",
     "DEEPSEEK_PROVIDERS": "providers",
     "DEEPSEEK_CONSULT_MODELS": "consult_models",
     "DEEPSEEK_PROVIDER_FALLBACK": "provider_fallback",
     "DSH_TASK_TTL": "task_ttl",
     "DEEPSEEK_TASK_TTL": "task_ttl",
+    "DSH_TASK_COMPLETION": "task_completion",
+    "DEEPSEEK_TASK_COMPLETION": "task_completion",
     "DSH_TRACE": "trace",
     "DEEPSEEK_TRACE": "trace",
     "DSH_OTLP_ENDPOINT": "otlp_endpoint",
@@ -338,7 +350,7 @@ ENV_MAP = {
 }
 
 BOOL_KEYS = {"quality", "independent_review", "child_progress",
-             "render_probe", "transient_retry", "checkpoint",
+             "render_probe", "transient_retry", "checkpoint", "dedupe_active",
              "provider_fallback", "trace", "browser_evidence",
              "workspace_progress", "live_scaling",
              "auto_skills_allow_single_severe", "auto_skills_refresh",
@@ -359,7 +371,8 @@ INT_KEYS = {"max_parallel", "default_subagents", "subagent_soft_cap",
             "auto_skills_max_skills", "auto_skills_max_candidates",
             "auto_skills_max_skill_chars", "auto_skills_max_versions",
             "auto_skills_refresh_after"}
-ENUM_KEYS = {"auto_skills": ("auto", "propose", "off")}
+ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
+             "task_completion": ("job", "request")}
 LIST_KEYS = {"providers", "consult_models", "add_dirs"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "daily_alert_usd", "daily_limit_usd", "render_probe_timeout",

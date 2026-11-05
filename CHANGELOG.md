@@ -5,6 +5,21 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.8.0 — durable work identity and run journal
+
+### Added
+
+- Durable work identity for `harness_deepseek`: canonical request fingerprints produce filesystem-backed work ids, an optional stable `idempotency_key`, and append-only attempt history under `<state_dir>/work/<work_id>/`.
+- A durable run journal for each work item, per-attempt events, and an atomic current `result.json`: cursor-based `deepseek_job_status` replies when `events_since` is supplied include `next_seq`, `stage`, `attention`, one pending question and options, `next_action`, `terminal` and the durable result.
+- Structured attention from one validated fenced `attention` JSON block; a pending question holds the work open for `needs_input`/`input_required` instead of recording a false terminal state.
+
+### Changed
+
+- `dedupe_active` (default `true`, `DSH_DEDUPE_ACTIVE`) now suppresses a duplicate spawn only while identical work is active. Terminal work is not collapsed into a prior result, and an explicit `idempotency_key` gives retries a stable work item with a new attempt after the prior attempt ends.
+- MCP tasks with `task_completion="job"` now follow the detached job and journal and complete only at a terminal state for the current attempt; `task_completion="request"` restores completion when the handler returns.
+- `deepseek_job_status` keeps its existing text response when `events_since` is omitted, and older job files without work ids remain readable. The P1 changes are filesystem-backed and local, with no new service or database.
+- Test coverage: 679 tests pass, including P1 work-identity, journal, task-bridge and integration suites.
+
 ## 3.7.0 — automatic skill building and the CrewForeman rename
 
 - Distribution name, console command and MCP server name are now `crewforeman-mcp` (brand: CrewForeman). The import module stays `deepseek_mcp` and the old `deepseek-harness-mcp`/`deepseek-mcp` console scripts remain aliases.

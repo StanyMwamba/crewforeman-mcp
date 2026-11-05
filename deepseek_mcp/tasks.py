@@ -436,6 +436,9 @@ class TaskStore:
         status_message = task.get("statusMessage")
         if status_message:
             payload["statusMessage"] = status_message
+        if task.get("question"):
+            payload["question"] = str(task["question"])
+            payload["options"] = list(task.get("options") or [])
         return payload
 
     @staticmethod
@@ -469,6 +472,9 @@ class TaskStore:
         status_message = task.get("statusMessage")
         if status_message:
             payload["statusMessage"] = status_message
+        if task.get("question"):
+            payload["question"] = str(task["question"])
+            payload["options"] = list(task.get("options") or [])
         return payload
 
 

@@ -13,11 +13,11 @@ import threading
 import time
 from pathlib import Path
 
-from . import (api, checkpoints, clients, harness, jobs, mac, providers, render,
-               retention, safety, skills, spend, tasks)
+from . import (api, checkpoints, clients, events, harness, jobs, mac, providers,
+               render, retention, safety, skills, spend, tasks)
 from .config import (PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
                      SUPPORTED_PROTOCOL_VERSIONS, load_config)
-from .store import (load_runs, new_run, read_run_md, save_run)
+from .store import (find_run, load_runs, new_run, read_run_md, save_run)
 
 MAX_FILE_CHARS_DEFAULT = 400000
 
@@ -198,6 +198,11 @@ TOOLS = [
             "live_scaling_max_extra_waves": {"type": "integer", "minimum": 0,
                                              "description": "Maximum extra waves (default 2)."},
             "wait_seconds": {"type": "number", "description": "How long this call waits before returning the job id (default 45)."},
+            "idempotency_key": {"type": "string", "description": (
+                "Optional stable client key for this logical request. A retry with the same key "
+                "(even after the first run finished) reuses the work item and increments its "
+                "attempt; without a key, an identical request is deduplicated only while an "
+                "attempt is active.")},
             "resume_run_id": {"type": "string", "description": (
                 "Resume a checkpointed run from its last finished phase instead of starting over. "
                 "The saved prompt, workspace, skill and policies are reused.")},
@@ -213,6 +218,11 @@ TOOLS = [
         "execution": {"taskSupport": "optional"},
         "inputSchema": {"type": "object", "properties": {
             "run_id": {"type": "string", "description": "Saved Harness run id."},
+            "answer": {"type": "string", "description": (
+                "Optional answer to the one validated question reported by "
+                "deepseek_job_status.")},
+            "option": {"type": "string", "description": (
+                "Optional option chosen from that question's options list.")},
             "wait_seconds": {"type": "number", "description": "How long this call waits (default 45)."},
         }, "required": ["run_id"]},
     },
@@ -229,7 +239,14 @@ TOOLS = [
         "name": "deepseek_job_status",
         "description": ("Check a DeepSeek job that was still running when its call returned, and get its "
                         "result once finished. Without run_id, lists recent background jobs."),
-        "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}},
+        "inputSchema": {"type": "object", "properties": {
+            "run_id": {"type": "string"},
+            "events_since": {"type": "integer", "minimum": 0,
+                             "description": ("Optional journal cursor. When present, returns "
+                                             "structured events, stage, attention, the one pending "
+                                             "question and the next action; omit it for the "
+                                             "unchanged text result.")},
+        }},
     },
     {
         "name": "deepseek_job_cancel",
@@ -1341,8 +1358,12 @@ def tool_resume(args, cfg=None):
     run_id = (args.get("run_id") or "").strip()
     if not run_id:
         raise RuntimeError("run_id is required")
-    return tool_harness({"resume_run_id": run_id,
-                         "wait_seconds": args.get("wait_seconds")}, cfg)
+    forwarded = {"resume_run_id": run_id,
+                 "wait_seconds": args.get("wait_seconds")}
+    for name in ("answer", "option"):
+        if args.get(name) is not None:
+            forwarded[name] = args.get(name)
+    return tool_harness(forwarded, cfg)
 
 
 def tool_cancel(args, cfg=None):
@@ -1543,6 +1564,8 @@ def _task_job_started(store, task_id, run_id):
 
 
 def _task_payload(task_id, text=None, error=None):
+    if isinstance(text, (dict, list)):
+        text = json.dumps(text, ensure_ascii=False, sort_keys=True)
     if error is not None:
         payload = {"content": [{"type": "text", "text": "Error: %s" % error}],
                    "isError": True}
@@ -1551,6 +1574,154 @@ def _task_payload(task_id, text=None, error=None):
                    "isError": False}
     payload["_meta"] = {"io.modelcontextprotocol/related-task": {"taskId": task_id}}
     return payload
+
+
+_JOB_TERMINAL = ("done", "error", "cancelled")
+
+
+def _cfg_get(cfg, name, default=None):
+    try:
+        return cfg.get(name, default)
+    except AttributeError:
+        return getattr(cfg, name, default)
+
+
+def _job_state(run_id, cfg):
+    """Best-effort job status mapping; ``None`` when absent/unreadable."""
+    if not run_id:
+        return None
+    path = Path(cfg.jobs_dir) / (str(run_id) + ".status.json")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _task_journal(work_id, cfg):
+    """Return ``(events, result_record)`` for one work item; never raises."""
+    if not work_id or not jobs.work.valid_work_id(str(work_id)):
+        return [], None
+    try:
+        log_obj = events.EventLog(Path(cfg.state_dir) / "work" / str(work_id))
+        return log_obj.read_since(0), log_obj.read_result()
+    except Exception:
+        return [], None
+
+
+def _refresh_task_from_job(store, task_id, cfg):
+    """Sync one MCP task from its detached job and journal.
+
+    A detached job keeps the task ``working`` (or ``input_required`` for a
+    validated question) until the job/journal reaches a terminal state.  This
+    is the P1-3 truth fix: the handler returning is not completion.
+    """
+    task = store.get(task_id)
+    if task.get("status") in ("completed", "failed", "cancelled"):
+        return task
+    completion = str(_cfg_get(cfg, "task_completion", "job")
+                     or "job").strip().lower()
+    if completion == "request":
+        return task
+    run_id = task.get("job_id")
+    if run_id and not jobs._valid_run_id(str(run_id)):
+        run_id = None
+    state = _job_state(run_id, cfg) if run_id else None
+    work_id = (state or {}).get("work_id") or task.get("work_id")
+    journal, result_record = _task_journal(work_id, cfg)
+    question = events.pending_question(journal)
+    if state is None and not journal:
+        return task
+    current_run_id = events.latest_admitted_run_id(journal) or run_id
+    if (result_record and current_run_id
+            and result_record.get("run_id") not in (None, current_run_id)):
+        result_record = None
+    run = None
+    if current_run_id:
+        try:
+            run = find_run(current_run_id, cfg)[0]
+        except Exception:
+            run = None
+    projection = events.project(run, state, journal, result_record)
+    status = str((state or {}).get("status") or "").lower()
+    current_terminal = events.terminal_after_latest_admission(journal)
+    terminal_event = current_terminal
+
+    current_kind = (current_terminal or {}).get("type")
+    current_payload = (current_terminal or {}).get("payload") or {}
+    result_status = str((result_record or {}).get("status") or "").lower()
+    result_failed = result_status in (
+        "error", "failed", "no_balance", "deadline_exceeded",
+        "budget_exceeded")
+
+    if status == "cancelled" or (
+            state is None and current_kind == "cancelled"):
+        return store.cancel(task_id, reason=(state or {}).get("error")
+                            or "cancelled by client")
+    if status == "error" or (state is None and current_kind == "failed"):
+        message = (state or {}).get("error")
+        if not message:
+            message = current_payload.get("error")
+        return store.fail(task_id, message or "job failed")
+
+    if question is not None:
+        if task.get("status") != "input_required":
+            return store.update(
+                task_id, status="input_required",
+                question=question["question"], options=list(question["options"]),
+                work_id=work_id,
+                statusMessage=question["question"])
+        return task
+    if task.get("status") == "input_required":
+        store.update(task_id, status="working", question=None, options=[],
+                     statusMessage=None)
+
+    if status in _JOB_TERMINAL:
+        if status == "done":
+            if work_id:
+                # Only the latest attempt's terminal event may complete the
+                # task; an old result before a newer admitted is ignored.
+                if current_terminal is None:
+                    if terminal_event is None and result_record is not None:
+                        if result_failed:
+                            return store.fail(
+                                task_id,
+                                (result_record or {}).get("result")
+                                or "job failed")
+                        text = projection.get("result")
+                        return store.complete(
+                            task_id,
+                            _task_payload(task_id, text=str(text or "")))
+                    return store.get(task_id)
+                if current_kind == "failed":
+                    return store.fail(
+                        task_id, current_payload.get("error")
+                        or (result_record or {}).get("result") or "job failed")
+                if current_kind == "cancelled":
+                    return store.cancel(task_id, reason="cancelled by client")
+                if result_failed:
+                    return store.fail(
+                        task_id, (result_record or {}).get("result")
+                        or "job failed")
+            if projection["terminal"] or not work_id:
+                text = projection.get("result")
+                if text is None:
+                    text = (state or {}).get("result") or ""
+                return store.complete(
+                    task_id, _task_payload(task_id, text=str(text)))
+        return store.get(task_id)
+    if state is None:
+        if current_kind is not None:
+            if current_kind == "failed":
+                return store.fail(task_id, current_payload.get("error")
+                                  or "job failed")
+            if current_kind == "cancelled":
+                return store.cancel(task_id, reason="cancelled by client")
+            text = (current_payload.get("result")
+                    or (result_record or {}).get("result") or "")
+            return store.complete(task_id, _task_payload(task_id, text=str(text)))
+        return task
+    return store.get(task_id)
 
 
 def _execute_task(name, args, cfg, ctx):
@@ -1563,7 +1734,15 @@ def _execute_task(name, args, cfg, ctx):
         if ctx["cancel_event"].is_set() or store.is_cancelled(task_id):
             task = store.cancel(task_id, reason="cancelled by client")
         else:
-            task = store.complete(task_id, _task_payload(task_id, text=text))
+            current = store.get(task_id)
+            completion = str(_cfg_get(cfg, "task_completion", "job")
+                             or "job").lower()
+            if completion != "request" and current.get("job_id"):
+                # The handler detached a job; its return text is only a
+                # "still running" marker.  The journal decides terminality.
+                task = _refresh_task_from_job(store, task_id, cfg)
+            else:
+                task = store.complete(task_id, _task_payload(task_id, text=text))
     except Exception as exc:
         if ctx["cancel_event"].is_set() or store.is_cancelled(task_id):
             task = store.cancel(task_id, reason="cancelled by client")
@@ -1635,8 +1814,8 @@ def _wait_task(store, task_id, cfg):
         timeout = 600.0
     deadline = time.monotonic() + max(1.0, min(timeout, 600.0))
     while True:
-        task = store.get(task_id)
-        if _terminal(task):
+        task = _refresh_task_from_job(store, task_id, cfg)
+        if _terminal(task) or task.get("status") == "input_required":
             return task
         if time.monotonic() >= deadline:
             raise TimeoutError("task result is still pending")
@@ -1658,7 +1837,8 @@ def _handle_task_method(method, params, cfg):
         return _err(-32602, "taskId is required")
     try:
         if method == "tasks/get":
-            return _ok(tasks.TaskStore.to_wire(store.get(task_id)))
+            task = _refresh_task_from_job(store, task_id, cfg)
+            return _ok(tasks.TaskStore.to_wire(task))
         if method == "tasks/cancel":
             return _ok(tasks.TaskStore.to_wire(
                 _cancel_task(task_id, cfg, reason="cancelled by tasks/cancel")))
@@ -1666,6 +1846,20 @@ def _handle_task_method(method, params, cfg):
             task = _wait_task(store, task_id, cfg)
             if task.get("status") == "cancelled":
                 return _err(-32602, "Task %s was cancelled" % task_id)
+            if task.get("status") == "input_required":
+                question = task.get("question") or task.get("statusMessage")
+                options = list(task.get("options") or [])
+                payload = _task_payload(
+                    task_id,
+                    text="Input required: %s%s" % (
+                        question or "answer the question",
+                        (" (options: %s)" % ", ".join(options)) if options else ""))
+                payload["structuredContent"] = {
+                    "status": "input_required",
+                    "question": question,
+                    "options": options,
+                }
+                return _ok(payload)
             payload = task.get("result")
             if not isinstance(payload, dict):
                 payload = _task_payload(
@@ -1714,7 +1908,7 @@ def dispatch(method, params=None, tool_mode="all", cfg=None, context=None):
                 "expose the DeepSeek and Harness tools.")
         else:
             instructions = (
-                "crewforeman-mcp 3.7: a generic MCP stdio server for DeepSeek "
+                "crewforeman-mcp 3.8: a generic MCP stdio server for DeepSeek "
                 "text models and the separately installed DeepSeek Harness. Use "
                 "ask_deepseek for one cheap text call; consult_deepseek for "
                 "independent answers from configured OpenAI-compatible models; "
@@ -1773,6 +1967,16 @@ def dispatch(method, params=None, tool_mode="all", cfg=None, context=None):
         _context.value = ctx
         try:
             text = fn(args, cfg)
+            if isinstance(text, (dict, list)):
+                # Structured additive responses (deepseek_job_status with
+                # events_since) keep a JSON text block for old clients and add
+                # the MCP 2025 structuredContent field.
+                return _ok({
+                    "content": [{"type": "text", "text": json.dumps(
+                        text, ensure_ascii=False, sort_keys=True)}],
+                    "structuredContent": text,
+                    "isError": False,
+                })
             return _ok({"content": [{"type": "text", "text": text}], "isError": False})
         except Exception as exc:
             if ctx["cancel_event"].is_set():

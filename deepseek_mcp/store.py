@@ -135,7 +135,7 @@ def new_run(kind, args, prompt, cfg):
     run_id = args.get("_run_id") or new_id(now)
     if not _valid_run_id(run_id):
         raise RuntimeError("Invalid run id: %r" % run_id)
-    return {
+    run = {
         "id": run_id,
         "kind": kind,
         "created": now.isoformat(timespec="seconds"),
@@ -146,6 +146,18 @@ def new_run(kind, args, prompt, cfg):
         "prompt": prompt,
         "files": [],
     }
+    # P1-1: identity is durable and separate from the attempt. Old records
+    # simply lack these optional fields; every reader stays compatible.
+    if args.get("_work_id"):
+        run["work_id"] = str(args.get("_work_id"))
+    if args.get("_attempt_no") is not None:
+        try:
+            run["attempt_no"] = int(args.get("_attempt_no"))
+        except (TypeError, ValueError):
+            pass
+    if args.get("_fingerprint"):
+        run["request_fingerprint"] = str(args.get("_fingerprint"))
+    return run
 
 
 def _md(run):
@@ -158,6 +170,9 @@ def _md(run):
         "- **Model:** %s (reasoning: %s)" % (run.get("model"), run.get("reasoning_effort") or "default"),
         "- **Status:** %s" % run.get("status"),
     ]
+    if run.get("work_id"):
+        lines.append("- **Work:** %s (attempt %s)" % (
+            run.get("work_id"), run.get("attempt_no", "?")))
     if run.get("kind") == "harness":
         lines += [
             "- **Tokens:** input %s (uncached) / cache read %s / output %s" % (

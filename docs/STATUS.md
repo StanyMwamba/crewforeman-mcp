@@ -1,4 +1,4 @@
-# Run Status Vocabulary (v3.7.0)
+# Run Status Vocabulary (v3.8.0)
 
 `status.py` defines one flat vocabulary for terminal run status. A status is
 always a lowercase string; there is no enum and no `None`.
@@ -47,7 +47,7 @@ never counts as passing the gate.
 
 ## Backward compatibility
 
-The v3.7.0 report payload keeps the fields existing consumers rely on:
+The v3.8.0 report payload keeps the fields existing consumers rely on:
 
 * `status` remains a plain string and is always one of `STATUSES`.
 * `quality_score` is still emitted exactly as before (number or `None`).

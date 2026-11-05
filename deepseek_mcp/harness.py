@@ -25,6 +25,7 @@ from . import api
 from . import budget as budget_mod
 from . import checkpoints
 from . import concurrency
+from . import events as events_mod
 from . import observability
 from . import platforms
 from . import progress
@@ -33,6 +34,7 @@ from . import safety
 from . import scaling
 from . import status as status_mod
 from . import transport as transport_mod
+from . import work as work_mod
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
                       build_review_task, build_revision_task, choose_agents,
                       extract_quality_score, parse_review, plan_escalation,
@@ -1990,16 +1992,154 @@ def _saved_note(run, path):
     return note
 
 
+def _work_store(cfg):
+    return work_mod.WorkStore(Path(cfg.state_dir) / "work")
+
+
+def _run_event_log(run, cfg):
+    work_id = run.get("work_id")
+    if not work_id or not work_mod.valid_work_id(str(work_id)):
+        return None
+    return events_mod.EventLog(Path(cfg.state_dir) / "work" / str(work_id))
+
+
+def _emit_run_event(run, cfg, event_type, payload=None):
+    """Best-effort journal append; a journal failure never breaks a run."""
+    log_obj = _run_event_log(run, cfg)
+    if log_obj is None:
+        return None
+    body = dict(payload or {})
+    body.setdefault("run_id", run.get("id"))
+    try:
+        if event_type == "phase":
+            # Consecutive saves of the same phase must not grow the journal.
+            recent = log_obj.read_since(0)
+            if recent and recent[-1].get("type") == "phase":
+                prior = recent[-1].get("payload") or {}
+                if prior.get("phase") == body.get("phase"):
+                    return recent[-1]
+        return log_obj.append(event_type, body)
+    except Exception:
+        return None
+
+
+def _is_canonical_run(run, cfg):
+    """True when this run may write journal/result state for its work item."""
+    work_id = run.get("work_id")
+    if not work_id:
+        return False
+    try:
+        current = _work_store(cfg).load(str(work_id))
+    except Exception:
+        return True
+    canonical = (current or {}).get("canonical_run_id")
+    return not canonical or canonical == run.get("id")
+
+
+def _ensure_admitted(run, cfg):
+    """Append one ``admitted`` journal event for this run, once."""
+    if not _is_canonical_run(run, cfg):
+        return None
+    log_obj = _run_event_log(run, cfg)
+    if log_obj is None:
+        return None
+    try:
+        recent = log_obj.read_since(0)
+        for event in recent:
+            payload = event.get("payload") or {}
+            if (event.get("type") == "admitted"
+                    and payload.get("run_id") == run.get("id")):
+                return event
+        return log_obj.append("admitted", {
+            "run_id": run.get("id"),
+            "attempt_no": run.get("attempt_no"),
+            "tool": "harness_deepseek",
+        })
+    except Exception:
+        return None
+
+
+def _heartbeat_work(run, cfg):
+    work_id = run.get("work_id")
+    if not work_id:
+        return
+    try:
+        _work_store(cfg).heartbeat(
+            str(work_id), run_id=run.get("id"), pid=os.getpid())
+    except Exception:
+        pass
+
+
+def _finalize_work(run, cfg):
+    """Write the durable result and close the work item; never raise."""
+    work_id = run.get("work_id")
+    if not work_id:
+        return
+    if not _is_canonical_run(run, cfg):
+        # Guard before _ensure_admitted: a superseded run must not append an
+        # admitted event even when journal rotation dropped its old admission.
+        # WorkStore.finish would reject the run id, but the journal/result must
+        # stay untouched too.
+        return
+    _ensure_admitted(run, cfg)
+    if not _is_canonical_run(run, cfg):
+        # Close the narrow TOCTOU window between the first check and the
+        # admitted write; a concurrent resume may have started a new attempt.
+        return
+    log_obj = _run_event_log(run, cfg)
+    status = str(run.get("status") or "error")
+    text = run.get("answer")
+    if text is None:
+        text = run.get("error") or ""
+    if log_obj is not None and text:
+        question = events_mod.validate_attention(text)
+        if question is not None:
+            # A human answer is still required: do not write a terminal event
+            # or finish the work.  The job wrapper will surface the question.
+            try:
+                events_mod.record_attention(log_obj, text, source="harness")
+                log_obj.write_result(text, status="needs_input",
+                                     run_id=run.get("id"))
+            except Exception:
+                pass
+            try:
+                _work_store(cfg).hold(
+                    str(work_id), run_id=run.get("id"), status="needs_input")
+            except Exception:
+                pass
+            return
+    if log_obj is not None:
+        try:
+            events_mod.record_terminal(log_obj, run=run, text=text)
+        except Exception:
+            try:
+                log_obj.write_result(text, status=status, run_id=run.get("id"))
+            except Exception:
+                pass
+    try:
+        _work_store(cfg).finish(str(work_id), status, run_id=run.get("id"))
+    except Exception:
+        pass
+
+
 def _persist(run, cfg, phase=None):
     """Write the durable run record mid-flight; never break the run."""
     if phase:
         run["phase"] = phase
     run["updated"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     try:
-        return save_run(run, cfg, ledger=False)
+        path = save_run(run, cfg, ledger=False)
     except Exception as exc:
         run["save_error"] = api.redact_secrets(str(exc))
-        return None
+        path = None
+    if _is_canonical_run(run, cfg):
+        _ensure_admitted(run, cfg)
+        if phase:
+            _emit_run_event(run, cfg, "phase", {
+                "phase": phase, "status": run.get("status"),
+                "attempt_no": run.get("attempt_no")})
+        _heartbeat_work(run, cfg)
+    return path
 
 
 def _job_spec_for_checkpoint(run, args, workspace):
@@ -2038,6 +2178,9 @@ def _job_spec_for_checkpoint(run, args, workspace):
         "task_type": run.get("task_type"),
         "size_estimate": run.get("size_estimate"),
         "model": run.get("model"),
+        "work_id": run.get("work_id"),
+        "attempt_no": run.get("attempt_no"),
+        "request_fingerprint": run.get("request_fingerprint"),
     })
     return spec
 
@@ -2290,7 +2433,9 @@ def _observe_skills(run, cfg, history_runs, trace, cancel_check):
 def _save_terminal(run, cfg, history_runs, trace, cancel_check):
     """The single post-detection terminal save; observes before saving."""
     _observe_skills(run, cfg, history_runs, trace, cancel_check)
-    return save_run(run, cfg)
+    path = save_run(run, cfg)
+    _finalize_work(run, cfg)
+    return path
 
 
 def _process_pending_skills(cfg, trace=None, limit=1, cancel_check=None):
@@ -2327,7 +2472,17 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     # argument, where an agent could point this at another executable.
     dsh = Path(os.path.expanduser(cfg.dsh_bin))
     run = new_run("harness", args, prompt, cfg)
+    if run.get("work_id"):
+        try:
+            _work_store(cfg).bind_run(
+                str(run["work_id"]), int(run.get("attempt_no") or 1),
+                run["id"], pid=os.getpid())
+        except Exception as exc:
+            run["work_error"] = api.redact_secrets(str(exc))
     run["model"] = "harness default"
+    for name in ("attention_answer", "attention_option"):
+        if args.get(name) is not None:
+            run[name] = api.redact_secrets(str(args.get(name)))
     run["stall_seconds"] = _stall_seconds(cfg)
     run["stall_max_seconds"] = _stall_max_seconds(cfg)
     run["stall_cap_hard_max_seconds"] = _stall_cap_hard_max(cfg)
@@ -2336,6 +2491,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             "DeepSeek Harness CLI not found or not executable at %s "
             "(set DSH_BIN or config dsh_bin)." % dsh), seconds=0)
         path = save_run(run, cfg)
+        _finalize_work(run, cfg)
         raise RuntimeError("DeepSeek Harness CLI not found or not executable at %s "
                            "(set DSH_BIN or config dsh_bin).%s"
                            % (dsh, _saved_note(run, path)))
@@ -2372,6 +2528,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             run.update(status="error", seconds=0,
                        error="subagents must be a non-negative integer")
             path = save_run(run, cfg)
+            _finalize_work(run, cfg)
             raise RuntimeError("subagents must be a non-negative integer%s"
                                % _saved_note(run, path))
         if requested_agents > hard_max:
@@ -2380,6 +2537,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             run.update(status="error", seconds=0, error=message,
                        max_explicit_subagents=hard_max)
             path = save_run(run, cfg)
+            _finalize_work(run, cfg)
             raise RuntimeError(message + _saved_note(run, path))
     # History is a best-effort input: a missing/unreadable run folder must not
     # stop a new run, it just means no history-based nudge.
@@ -3760,6 +3918,16 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         result = dict(saved)
         result["resumed"] = True
         result["resumed_from"] = run_id
+        saved_work_id = saved.get("work_id") or spec.get("work_id")
+        if saved_work_id and not result.get("work_id"):
+            result["work_id"] = saved_work_id
+        if result.get("work_id") and result.get("attempt_no") is None:
+            try:
+                current = _work_store(cfg).load(str(result["work_id"]))
+                if isinstance(current, dict):
+                    result["attempt_no"] = current.get("attempt_no")
+            except Exception:
+                pass
         # A durable "accepted" checkpoint is written as soon as the reviewer
         # returns, before run_harness applies the post-review budget gates. A
         # kill in that window must not let resume relabel an over-budget run as
@@ -3807,6 +3975,10 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         # the first spawn. Once every phase is done (or the review was already
         # accepted) there is nothing left that could change the outcome, so
         # finalize instead of returning a permanently-running record.
+        for name in ("answer", "option"):
+            if args.get(name) is not None:
+                result["attention_" + name] = api.redact_secrets(
+                    str(args.get(name)))
         if result.get("status") in (None, "", "running"):
             last_review = next(
                 (item for item in reversed(prior_rounds)
@@ -3863,6 +4035,29 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
 
     builder_phase = (manifest.get("phases") or {}).get("builder") or {}
     builder_data = dict(builder_phase.get("data") or {})
+    # P1-1: an unfinished resume is a new attempt of the same work item, never
+    # a new work identity.  This happens only after the no-op early return so a
+    # completed run does not leave a leaking active lease.
+    work_id = saved.get("work_id") or spec.get("work_id")
+    resume_attempt = None
+    if work_id:
+        try:
+            work_doc = _work_store(cfg).begin_attempt(
+                str(work_id), reason="resume", pid=os.getpid())
+            resume_attempt = work_doc.get("attempt_no")
+            try:
+                manifest_cp = checkpoints.Checkpoint(root, run_id)
+                current = manifest_cp.load() or {}
+                metadata = dict(current.get("metadata") or {})
+                spec_copy = dict(metadata.get("spec") or {})
+                spec_copy["work_id"] = str(work_id)
+                spec_copy["attempt_no"] = resume_attempt
+                metadata["spec"] = spec_copy
+                manifest_cp.update(metadata=metadata)
+            except Exception:
+                pass
+        except Exception as exc:
+            saved["work_error"] = api.redact_secrets(str(exc))
     resume_args = {
         "prompt": prompt,
         "workspace": workspace,
@@ -3892,6 +4087,15 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }
+    if work_id:
+        resume_args["_work_id"] = str(work_id)
+        resume_args["_attempt_no"] = resume_attempt
+        resume_args["_fingerprint"] = (saved.get("request_fingerprint")
+                                       or spec.get("request_fingerprint"))
+    for name in ("answer", "option"):
+        if args.get(name) is not None:
+            saved["attention_" + name] = args.get(name)
+            resume_args["attention_" + name] = args.get(name)
     if builder_phase.get("status") == "done":
         resume_args["_prior_builder"] = {
             "status": "ok",

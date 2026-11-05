@@ -16,13 +16,109 @@ import threading
 import time
 from pathlib import Path
 
-from . import platforms, providers, safety, tasks
+from . import events as events_mod
+from . import platforms, providers, safety, tasks, work
 from .api import redact_secrets
 from .config import ENTRY_SCRIPT, load_config
 
 _status_path = None
+_work_ctx = None
 _listeners = {}
 _listener_lock = threading.Lock()
+
+
+def _cfg_get(cfg, name, default=None):
+    """Read a config key from Config, a dict or a SimpleNamespace test stub."""
+    try:
+        return cfg.get(name, default)
+    except AttributeError:
+        return getattr(cfg, name, default)
+
+
+def _work_store(cfg):
+    """Return the P1-1 work store rooted at ``<state_dir>/work``."""
+    stale = _cfg_get(cfg, "work_stale_seconds")
+    return work.WorkStore(
+        Path(cfg.state_dir) / "work",
+        heartbeat_seconds=float(_cfg_get(cfg, "work_heartbeat_seconds") or 30.0),
+        stale_after=(float(stale) if stale is not None else None),
+    )
+
+
+def _event_log(work_id, cfg):
+    if not work_id or not work.valid_work_id(str(work_id)):
+        return None
+    return events_mod.EventLog(Path(cfg.state_dir) / "work" / str(work_id))
+
+
+def _event(work_id, cfg, event_type, payload=None):
+    """Append a journal event; journal problems never break a job."""
+    log_obj = _event_log(work_id, cfg)
+    if log_obj is None:
+        return None
+    try:
+        return log_obj.append(event_type, payload or {})
+    except Exception:
+        return None
+
+
+def _result(work_id, cfg, text, status, run_id=None):
+    log_obj = _event_log(work_id, cfg)
+    if log_obj is None:
+        return None
+    try:
+        return log_obj.write_result(text, status=status, run_id=run_id)
+    except Exception:
+        return None
+
+
+def _finish_work(work_id, cfg, status, run_id=None):
+    if not work_id:
+        return None
+    try:
+        return _work_store(cfg).finish(work_id, status, run_id=run_id)
+    except Exception:
+        return None
+
+
+def _has_terminal(work_id, cfg):
+    log_obj = _event_log(work_id, cfg)
+    if log_obj is None:
+        return False
+    try:
+        return events_mod.terminal_after_latest_admission(
+            log_obj.read_since(0)) is not None
+    except Exception:
+        return False
+
+
+def _canonical_run_id(work_id, cfg):
+    if not work_id:
+        return None
+    try:
+        return _work_store(cfg).load(work_id).get("canonical_run_id")
+    except Exception:
+        return None
+
+
+def _read_status(jobs_dir, run_id):
+    try:
+        state = json.loads((Path(jobs_dir) / (run_id + ".status.json")).read_text(
+            encoding="utf-8"))
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _heartbeat():
+    """Refresh the current worker's work lease (throttled by WorkStore)."""
+    if not _work_ctx:
+        return
+    work_id, cfg, run_id = _work_ctx
+    try:
+        _work_store(cfg).heartbeat(work_id, run_id=run_id, pid=os.getpid())
+    except Exception:
+        pass
 
 
 def add_listener(run_id, callback):
@@ -105,6 +201,7 @@ def write_status(path, **fields):
 def progress(text):
     if _status_path:
         write_status(_status_path, status="running", progress=text)
+        _heartbeat()
 
 
 def keep_awake():
@@ -183,7 +280,10 @@ def cancel_job(run_id, cfg=None, reason="cancelled by client"):
         state = json.loads(status_path.read_text(encoding="utf-8"))
     except Exception:
         state = {}
-    if state.get("status") in ("done", "error", "cancelled"):
+    held_question = (state.get("status") == "done"
+                     and state.get("progress") == "needs_input"
+                     and state.get("work_id"))
+    if state.get("status") in ("done", "error", "cancelled") and not held_question:
         return state
     pid = state.get("pid")
     child_pid = state.get("child_pid")
@@ -200,6 +300,17 @@ def cancel_job(run_id, cfg=None, reason="cancelled by client"):
             _signal_group(target, signal.SIGKILL)
     write_status(status_path, status="cancelled", progress="cancelled",
                  error=reason, cancel_reason=reason)
+    work_id = state.get("work_id")
+    if work_id:
+        canonical = _canonical_run_id(work_id, cfg)
+        owns_work = (not canonical or canonical == run_id or held_question)
+        if owns_work:
+            target_run = canonical or run_id
+            if held_question or not _has_terminal(work_id, cfg):
+                _event(work_id, cfg, "cancelled", {
+                    "run_id": target_run, "reason": reason})
+            _result(work_id, cfg, reason, "cancelled", target_run)
+            _finish_work(work_id, cfg, "cancelled", target_run)
     try:
         return json.loads(status_path.read_text(encoding="utf-8"))
     except Exception:
@@ -217,7 +328,7 @@ def tool_cancel(args, cfg=None):
 
 def run_job(spec_path, handlers, cfg=None):
     """Entry point of a detached worker process."""
-    global _status_path
+    global _status_path, _work_ctx
     spec_path = Path(spec_path)
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
@@ -248,15 +359,38 @@ def run_job(spec_path, handlers, cfg=None):
         existing = json.loads(_status_path.read_text(encoding="utf-8"))
     except Exception:
         existing = {}
+    spec_args = spec.get("args") or {}
+    work_id = spec.get("work_id") or spec_args.get("_work_id")
+    attempt_no = spec.get("attempt_no") or spec_args.get("_attempt_no")
+    _work_ctx = (work_id, cfg, run_id) if work_id else None
     if existing.get("status") == "cancelled":
+        if work_id:
+            if not _has_terminal(work_id, cfg):
+                _event(work_id, cfg, "cancelled", {
+                    "run_id": run_id, "reason": existing.get("error")})
+            _result(work_id, cfg, existing.get("error") or "cancelled",
+                    "cancelled", run_id)
+            _finish_work(work_id, cfg, "cancelled", run_id)
         return _status_path
     keep_awake()
-    write_status(_status_path, status="running", pid=os.getpid(), progress="started")
+    if work_id:
+        _event(work_id, cfg, "phase", {
+            "run_id": run_id, "attempt_no": attempt_no, "phase": "job_started"})
+        try:
+            _work_store(cfg).heartbeat(work_id, run_id=run_id,
+                                       pid=os.getpid(), force=True)
+        except Exception:
+            pass
+    running_fields = {"status": "running", "pid": os.getpid(),
+                      "progress": "started"}
+    if work_id:
+        running_fields.update({"work_id": work_id, "attempt_no": attempt_no})
+    write_status(_status_path, **running_fields)
     fn = handlers.get(spec["tool"])
     try:
         if fn is None:
             raise RuntimeError("Unknown job tool: %s" % spec.get("tool"))
-        args = spec.get("args") or {}
+        args = spec_args
         # Pass the worker's config explicitly. Otherwise tools such as
         # tool_harness would reload the environment/default config and ignore
         # the server's --config file.
@@ -265,14 +399,175 @@ def run_job(spec_path, handlers, cfg=None):
         except (TypeError, ValueError):
             accepts_cfg = False
         text = fn(args, cfg) if accepts_cfg else fn(args)
-        write_status(_status_path, status="done", progress="finished", result=text)
+        if _read_status(jobs_dir, run_id).get("status") == "cancelled":
+            # A client cancel is terminal even if the handler happened to
+            # finish; never resurrect the job as done.
+            _finish_work(work_id, cfg, "cancelled", run_id)
+            return _status_path
+        canonical = _canonical_run_id(work_id, cfg)
+        if work_id and canonical and canonical != run_id:
+            # A resume/another attempt owns the journal and result.json. This
+            # job wrapper only reflects the handler outcome in its own status.
+            log_obj = _event_log(work_id, cfg)
+            journal = log_obj.read_since(0) if log_obj is not None else []
+            pending = events_mod.pending_question(journal)
+            if pending is not None:
+                write_status(_status_path, status="done",
+                             progress="needs_input", result=text,
+                             question=pending.get("question"))
+            else:
+                stored = log_obj.read_result() if log_obj is not None else None
+                write_status(_status_path, status="done",
+                             progress="finished",
+                             result=(stored or {}).get("result") or text)
+            return _status_path
+        # A validated one-question ATTENTION block keeps the work open: the
+        # job handler returned, but a human answer is still required.
+        question = None
+        if work_id:
+            log_obj = _event_log(work_id, cfg)
+            if log_obj is not None:
+                try:
+                    question = events_mod.record_attention(
+                        log_obj, text, source=spec.get("tool"))
+                except Exception:
+                    question = None
+        if question is not None:
+            try:
+                _work_store(cfg).hold(work_id, run_id=run_id,
+                                      status="needs_input")
+            except Exception:
+                pass
+            write_status(_status_path, status="done",
+                         progress="needs_input", result=text,
+                         question=question.get("payload", {}).get("question"))
+        else:
+            if work_id:
+                log_obj = _event_log(work_id, cfg)
+                if log_obj is not None:
+                    try:
+                        already = events_mod.terminal_after_latest_admission(
+                            log_obj.read_since(0)) is not None
+                        if not already:
+                            events_mod.record_terminal(
+                                log_obj,
+                                job={"run_id": run_id, "status": "done",
+                                     "result": text},
+                                text=text)
+                    except Exception:
+                        _result(work_id, cfg, text, "ok", run_id)
+                else:
+                    _result(work_id, cfg, text, "ok", run_id)
+                # The harness may already have closed the work with a richer
+                # terminal status (ok_below_gate, ok_unreviewed, ...). Do not
+                # downgrade it to a generic "ok" here.
+                try:
+                    current_work = _work_store(cfg).load(work_id)
+                except Exception:
+                    current_work = None
+                if not (isinstance(current_work, dict)
+                        and current_work.get("state") == "finished"):
+                    _finish_work(work_id, cfg, "ok", run_id)
+            write_status(_status_path, status="done", progress="finished",
+                         result=text)
     except Exception as exc:
-        write_status(_status_path, status="error", progress="failed", error=str(exc))
+        message = str(exc)
+        if _read_status(jobs_dir, run_id).get("status") == "cancelled":
+            _finish_work(work_id, cfg, "cancelled", run_id)
+            return _status_path
+        canonical = _canonical_run_id(work_id, cfg)
+        if work_id and canonical and canonical != run_id:
+            write_status(_status_path, status="error", progress="failed",
+                         error=message)
+            return _status_path
+        if work_id:
+            log_obj = _event_log(work_id, cfg)
+            if log_obj is not None and not _has_terminal(work_id, cfg):
+                try:
+                    events_mod.record_terminal(
+                        log_obj,
+                        job={"run_id": run_id, "status": "error",
+                             "error": message},
+                        text=message)
+                except Exception:
+                    _result(work_id, cfg, message, "error", run_id)
+            else:
+                _result(work_id, cfg, message, "error", run_id)
+            try:
+                current_work = _work_store(cfg).load(work_id)
+            except Exception:
+                current_work = None
+            if not (isinstance(current_work, dict)
+                    and current_work.get("state") == "finished"):
+                _finish_work(work_id, cfg, "error", run_id)
+        write_status(_status_path, status="error", progress="failed",
+                     error=message)
     return _status_path
 
 
 def _pid_alive(pid):
     return platforms.pid_alive(pid)
+
+
+def _admit_job(tool, args, cfg):
+    """Admit a harness request; return ``(admission, fingerprint)``."""
+    workspace = args.get("workspace") or cfg.harness_workspace
+    fingerprint = work.request_fingerprint(tool, args, workspace)
+    store = _work_store(cfg)
+    dedupe = bool(_cfg_get(cfg, "dedupe_active", True))
+    admission = store.admit(
+        fingerprint, idempotency_key=args.get("idempotency_key"),
+        dedupe_active=dedupe, note="job admission")
+    return admission, fingerprint
+
+
+def _await_binding(store, work_id, timeout=2.0):
+    """Wait briefly for the admitting caller to bind the minted run id."""
+    deadline = time.time() + max(0.0, float(timeout))
+    while time.time() <= deadline:
+        item = store.load(work_id)
+        if isinstance(item, dict) and item.get("canonical_run_id"):
+            return item.get("canonical_run_id")
+        time.sleep(0.02)
+    return None
+
+
+def _resume_work_identity(cfg, source_run_id):
+    """Resolve the durable work identity of the run being resumed.
+
+    The job wrapper needs it before spawning so its status file (and therefore
+    the structured status/task bridge) can find the journal.  The checkpoint
+    spec is the fallback when the run record is missing; old runs without a
+    work id simply return ``(None, None)``.
+    """
+    source = str(source_run_id or "").strip()
+    if not source or not _valid_run_id(source):
+        return None, None
+    work_id = None
+    try:
+        from .store import find_run
+        saved = find_run(source, cfg)[0]
+        work_id = saved.get("work_id")
+    except Exception:
+        work_id = None
+    if not work_id:
+        try:
+            from . import checkpoints
+            manifest = checkpoints.Checkpoint(
+                Path(cfg.state_dir) / "checkpoints", source).load() or {}
+            spec = (manifest.get("metadata") or {}).get("spec") or {}
+            work_id = spec.get("work_id")
+        except Exception:
+            work_id = None
+    if not work_id or not work.valid_work_id(str(work_id)):
+        return None, None
+    attempt_no = 1
+    try:
+        doc = _work_store(cfg).load(str(work_id)) or {}
+        attempt_no = int(doc.get("attempt_no") or 1)
+    except Exception:
+        pass
+    return str(work_id), attempt_no
 
 
 def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
@@ -293,10 +588,82 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
     except OSError:
         pass
     from .store import new_id
-    run_id = new_id()
     call_args = dict(args)
     wait = float(call_args.pop("wait_seconds", cfg.wait_seconds if wait is None else wait) or 0)
+    admission = None
+    fingerprint = None
+    resume_identity = None
+    resume_source = None
+    if tool == "resume_deepseek":
+        resume_source = call_args.get("run_id")
+    elif call_args.get("resume_run_id"):
+        resume_source = call_args.get("resume_run_id")
+    if resume_source:
+        try:
+            work_id, attempt_no = _resume_work_identity(cfg, resume_source)
+            if work_id:
+                resume_identity = (work_id, attempt_no)
+        except Exception as exc:
+            log("resume work identity skipped: %s" % exc)
+    if (tool == "harness_deepseek" and not call_args.get("resume_run_id")
+            and resume_identity is None):
+        try:
+            admission, fingerprint = _admit_job(tool, call_args, cfg)
+        except ValueError as exc:
+            # A malformed explicit key is a caller error, not a reason to
+            # silently disable deduplication.
+            raise RuntimeError("Invalid idempotency_key: %s" % exc)
+        except Exception as exc:
+            # A state-dir problem is an admission limitation, never a reason
+            # to refuse work that the old version would have started.
+            log("work admission skipped: %s" % exc)
+    if admission and admission.get("reused"):
+        existing = admission.get("run_id")
+        if not existing:
+            try:
+                existing = _await_binding(
+                    _work_store(cfg), admission["work_id"], timeout=2.0)
+            except Exception:
+                existing = None
+        if existing and not _valid_run_id(str(existing)):
+            existing = None
+        if existing:
+            if on_start:
+                try:
+                    on_start(existing, jobs_dir / (existing + ".status.json"))
+                except Exception:
+                    pass
+            state = _read_status(jobs_dir, existing)
+            if (state.get("status") == "done"
+                    and (state.get("progress") == "needs_input"
+                         or state.get("question"))):
+                question = state.get("question") or "a validated question"
+                return ("[DeepSeek job %s already asked: %s. It is waiting for "
+                        "an answer; use resume_deepseek run_id=%s answer=\"...\" "
+                        "or deepseek_job_status run_id=%s events_since=0.]"
+                        % (existing, question, existing, existing))
+            if state.get("status") == "done":
+                return state.get("result", "")
+            if state.get("status") == "error":
+                raise RuntimeError(state.get("error") or "Job failed")
+            return ("[DeepSeek job %s is already running for this request "
+                    "(work %s, attempt %s); not starting a duplicate. Check it "
+                    "with deepseek_job_status run_id=%s.]"
+                    % (existing, admission["work_id"],
+                       admission.get("attempt_no"), existing))
+        return ("[A matching DeepSeek job is being admitted (work %s); retry "
+                "deepseek_job_status in a moment.]" % admission["work_id"])
+    call_args.pop("idempotency_key", None)
+    run_id = new_id()
     call_args["_run_id"] = run_id
+    if resume_identity is not None:
+        call_args["_work_id"] = resume_identity[0]
+        call_args["_attempt_no"] = resume_identity[1]
+    if admission:
+        call_args["_work_id"] = admission["work_id"]
+        call_args["_attempt_no"] = admission["attempt_no"]
+        if fingerprint:
+            call_args["_fingerprint"] = fingerprint
     spec = jobs_dir / (run_id + ".job.json")
     # Redact the arguments (they may carry prompts/secrets) but keep the
     # config path resolved and absolute. A detached worker can run under a
@@ -309,20 +676,57 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
     config_path = cfg.get("_config_path")
     if config_path:
         config_path = str(Path(os.path.expanduser(str(config_path))).resolve())
-    spec.write_text(json.dumps({
+    spec_data = {
         "tool": tool,
         "run_id": run_id,
         "args": safe_args,
         "config_path": config_path,
-    }, ensure_ascii=False), encoding="utf-8")
+    }
+    if resume_identity is not None:
+        spec_data.update({
+            "work_id": resume_identity[0],
+            "attempt_no": resume_identity[1],
+        })
+    if admission:
+        spec_data.update({
+            "work_id": admission["work_id"],
+            "attempt_no": admission["attempt_no"],
+            "fingerprint": fingerprint,
+        })
+    spec.write_text(json.dumps(spec_data, ensure_ascii=False), encoding="utf-8")
     try:
         os.chmod(str(spec), 0o600)
     except OSError:
         pass
     status = jobs_dir / (run_id + ".status.json")
-    write_status(status, status="queued", tool=tool,
-                 title=call_args.get("title") or call_args.get("prompt", "")[:60],
-                 created=dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+    queued = {
+        "status": "queued", "tool": tool,
+        "title": call_args.get("title") or call_args.get("prompt", "")[:60],
+        "created": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    if resume_identity is not None:
+        queued.update({
+            "work_id": resume_identity[0],
+            "attempt_no": resume_identity[1],
+        })
+    if admission:
+        queued.update({
+            "work_id": admission["work_id"],
+            "attempt_no": admission["attempt_no"],
+            "request_fingerprint": fingerprint,
+        })
+    write_status(status, **queued)
+    if admission:
+        try:
+            _work_store(cfg).bind_run(
+                admission["work_id"], admission["attempt_no"], run_id)
+        except Exception as exc:
+            log("work binding skipped: %s" % exc)
+        _event(admission["work_id"], cfg, "admitted", {
+            "run_id": run_id,
+            "attempt_no": admission["attempt_no"],
+            "tool": tool,
+        })
     log_path = jobs_dir / (run_id + ".log")
     log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     log_handle = os.fdopen(log_fd, "ab")
@@ -349,8 +753,14 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 **platforms.popen_kwargs(),
             )
         except Exception as exc:
-            write_status(status, status="error", progress="failed", error="Could not start job: %s" % exc)
-            raise RuntimeError("Could not start job: %s" % exc)
+            message = "Could not start job: %s" % exc
+            if admission:
+                _event(admission["work_id"], cfg, "failed", {
+                    "run_id": run_id, "error": message})
+                _result(admission["work_id"], cfg, message, "error", run_id)
+                _finish_work(admission["work_id"], cfg, "error", run_id)
+            write_status(status, status="error", progress="failed", error=message)
+            raise RuntimeError(message)
     finally:
         log_handle.close()
     if on_start:
@@ -428,6 +838,58 @@ def _valid_run_id(run_id):
     return bool(run_id) and Path(run_id).name == run_id and run_id not in (".", "..")
 
 
+def _structured_status(args, state, run_id, cfg):
+    """Cursor-based journal view plus the pure stage/attention projection."""
+    try:
+        since = max(0, int(args.get("events_since") or 0))
+    except (TypeError, ValueError):
+        raise RuntimeError("events_since must be a non-negative integer")
+    work_id = state.get("work_id")
+    log_obj = _event_log(work_id, cfg) if work_id else None
+    all_events = []
+    if log_obj is not None:
+        try:
+            all_events = log_obj.read_since(0)
+        except Exception:
+            all_events = []
+    fresh = [event for event in all_events
+             if int(event.get("seq") or 0) > since]
+    result_doc = None
+    if log_obj is not None:
+        try:
+            result_doc = log_obj.read_result()
+        except Exception:
+            result_doc = None
+    run = None
+    try:
+        from .store import find_run
+        run = find_run(run_id, cfg)[0]
+    except Exception:
+        run = None
+    projection = events_mod.project(run, state, all_events, result_doc)
+    next_seq = 0
+    if log_obj is not None:
+        try:
+            next_seq = log_obj.next_seq()
+        except Exception:
+            next_seq = 0
+    payload = {
+        "events": fresh,
+        "next_seq": next_seq,
+        "stage": projection["stage"],
+        "attention": projection["attention"],
+        "question": projection["question"],
+        "options": projection["options"],
+        "next_action": projection["next_action"],
+        "terminal": projection["terminal"],
+        "result": projection["result"],
+    }
+    if work_id:
+        payload["work_id"] = work_id
+    payload["run_id"] = run_id
+    return payload
+
+
 def tool_status(args, cfg=None):
     cfg = cfg or load_config()
     jobs_dir = Path(cfg.jobs_dir)
@@ -451,6 +913,8 @@ def tool_status(args, cfg=None):
     if not path.exists():
         raise RuntimeError("No background job with id %r" % run_id)
     state = json.loads(path.read_text(encoding="utf-8"))
+    if "events_since" in args and args.get("events_since") is not None:
+        return _structured_status(args, state, run_id, cfg)
     if state.get("status") == "done":
         return state.get("result", "")
     if state.get("status") == "error":

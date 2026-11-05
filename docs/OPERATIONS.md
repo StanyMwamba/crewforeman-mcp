@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.7.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.8.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -25,6 +25,38 @@ environment variables in `config.example.json`.
 `DSH_BIN` overrides Harness discovery. When it is unset the server checks the
 per-OS application/runtime locations, then `PATH`. `DSH_SKILLS_DIR` points at
 the skill checklists when they are not next to the package.
+
+### Work identity, deduplication and the run journal (v3.8.0)
+
+`harness_deepseek` now has a durable work item separate from the run id. The
+work id is a SHA-256 fingerprint of the canonical request (prompt, workspace
+and file paths, sandbox/reviewer policy, quality and budget options, skill);
+`wait_seconds`, `title` and connector-internal fields are excluded. State lives
+under `<state_dir>/work/<work_id>/` (`work.json`, `attempts.jsonl`, a
+`events.jsonl` journal, `result.json` and an O_EXCL `.lock`).
+
+* `dedupe_active` (default `true`, `DSH_DEDUPE_ACTIVE`) returns an existing
+  active run for an identical fingerprint instead of buying a second pipeline.
+  Set it to `false` to allow identical concurrent runs; an explicit
+  `idempotency_key` always selects its own work item and can safely retry even
+  after the first run finished.
+* `task_completion` (default `"job"`, `DSH_TASK_COMPLETION`) keeps an MCP task
+  `working` until its detached job reaches a terminal journal state. Set it to
+  `"request"` for the old complete-on-handler-return behaviour during a client
+  migration window.
+* `deepseek_job_status` accepts `events_since`; with a cursor it returns the
+  new events plus `next_seq`, `stage`, `attention`, one `question`, `options`,
+  `next_action`, `terminal` and the durable `result`. Without it, the response
+  is the unchanged text. A pending answerable question is accepted only from
+  one fenced ```` ```attention ```` JSON block (`question`, `options`, optional
+  `evidence`). Review and failure follow-ups are deterministic status
+  projections, never questions inferred from prose.
+
+Journal files rotate at 1 MB (one previous segment is retained), so a client
+cursor older than the retained window receives the retained events rather than
+an error. Terminal work is never collapsed into a cached result: a later
+identical request starts a new attempt under the same work id, including one
+selected by an explicit idempotency key, and the attempt history stays auditable.
 
 ## Safety and sandboxing
 
