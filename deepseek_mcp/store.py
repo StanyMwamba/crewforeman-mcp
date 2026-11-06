@@ -332,7 +332,17 @@ def save_run(run, cfg, ledger=True):
     if ledger:
         try:
             from . import ledger
-            ledger.append_run(cfg, run)
+            appended = ledger.append_run(cfg, run)
+            if appended:
+                # The run's cost is now in the spend ledger; the reservation
+                # ledger can stop counting these committed rows for the daily
+                # ceiling (a later phase of the same run remains counted).
+                from . import budget
+                total = run.get("estimated_cost_usd")
+                if not isinstance(total, (int, float)):
+                    total = 0.0
+                budget.CostLedger(cfg.state_dir).mark_reflected(
+                    run["id"], total=total)
         except Exception:
             pass
     return str(base.with_suffix(".md"))

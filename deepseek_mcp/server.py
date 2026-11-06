@@ -357,12 +357,19 @@ TOOLS = [
     },
     {
         "name": "deepseek_maintenance",
-        "description": ("Inspect or clean local run/job/trace data and show state permissions. "
-                        "action: status | cleanup | dry_run. Cleanup respects retention_days, "
-                        "keep_runs and keep_jobs; it never deletes outside the configured roots."),
+        "description": ("Inspect or clean local run/job/trace data, show state permissions and "
+                        "component health. action: status | health | clear_health | cleanup | "
+                        "dry_run. clear_health clears a quarantined builder/reviewer so new "
+                        "automatic phases can start. Cleanup respects retention_days, keep_runs "
+                        "and keep_jobs; it never deletes outside the configured roots."),
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["status", "cleanup", "dry_run"],
-                       "description": "status (default), cleanup, or a no-write dry run."}},
+            "action": {"type": "string", "enum": ["status", "health", "clear_health",
+                                                  "cleanup", "dry_run"],
+                       "description": "status (default), health, clear_health, cleanup, "
+                                      "or a no-write dry run."},
+            "component": {"type": "string", "description": (
+                "Optional component for clear_health (builder, reviewer, revision, rescue). "
+                "Omit to clear every quarantined component.")}},
             "required": ["action"]},
     },
 ]
@@ -1303,6 +1310,22 @@ def tool_restart_client(args, cfg=None):
 def tool_maintenance(args, cfg=None):
     cfg = _cfg(cfg)
     action = (args.get("action") or "status").strip().lower()
+    from . import health as health_mod
+    board = health_mod.HealthBoard(cfg.state_dir)
+    if action == "health":
+        lines = list(board.status_lines())
+        snapshot = board.snapshot().get("components") or {}
+        for name in sorted(snapshot):
+            blocked = board.quarantine_block(name)
+            if blocked:
+                lines.append("  ! " + blocked)
+        return "\n".join(lines)
+    if action == "clear_health":
+        component = (args.get("component") or "").strip() or None
+        cleared = board.clear(component)
+        scope = component or "all components"
+        return ("Health cleared: %d quarantined component(s) reset (%s).\n%s"
+                % (cleared, scope, "\n".join(board.status_lines())))
     if action == "status":
         roots = {}
         for name in ("log_dir", "jobs_dir", "state_dir"):
@@ -1336,9 +1359,9 @@ def tool_maintenance(args, cfg=None):
             except OSError:
                 counts[name] = 0
         return ("Local data: %s. File counts: %s. Retention: days=%s, keep_runs=%s, "
-                "keep_jobs=%s. Use action=cleanup or action=dry_run."
+                "keep_jobs=%s. Use action=cleanup or action=dry_run. %s"
                 % (roots, counts, cfg.get("retention_days"), cfg.get("keep_runs"),
-                   cfg.get("keep_jobs")))
+                   cfg.get("keep_jobs"), " ".join(board.status_lines())))
     try:
         result = retention.cleanup(cfg, dry_run=(action == "dry_run"))
     except Exception as exc:

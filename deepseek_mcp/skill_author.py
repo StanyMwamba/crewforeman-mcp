@@ -1093,31 +1093,75 @@ def build_refresh_task(refresh, existing_content, repeated_lessons=None,
 # Agent calls (lazy harness import)
 # ---------------------------------------------------------------------------
 
-def _run_agent(cfg, task, workspace, label, max_seconds, cancel_check):
+def _run_agent(cfg, task, workspace, label, max_seconds, cancel_check,
+               envelope=None):
     try:
-        from . import harness
+        from . import authority, harness
+        # Auto-skill is a post-builder phase: it always receives a read-only
+        # continuation of the active run grant, never a fresh direct grant and
+        # never an inherited danger-full-access mode.
+        continuation = authority.auto_skill_continuation(
+            cfg, workspace=workspace, envelope=envelope)
+        root = continuation.workspace_root
+        if not workspace or not root or not authority.inside_root(workspace, root):
+            # The continuation records the run's workspace boundary.  Running
+            # an agent in a scratch directory outside it would grant a phase a
+            # workspace the operator never authorized, even read-only.
+            raise authority.WorkspaceRootError(
+                "auto-skill execution workspace %s is outside the recorded "
+                "authority root %s" % (workspace, root or "<none>"))
+        sandbox = continuation.sandbox
+        cap = continuation.job_max_seconds
+        if cap is not None:
+            try:
+                max_seconds = min(float(max_seconds), float(cap))
+            except (TypeError, ValueError):
+                max_seconds = float(cap)
         runner = getattr(harness, "run_agent_once", None)
         if runner is None:
             return {"status": "error", "error": "run_agent_once unavailable",
                     "answer": "", "seconds": 0}
-        return runner(cfg, task, workspace, sandbox="read-only",
-                      max_seconds=max_seconds, label=label,
-                      cancel_check=cancel_check)
+        result = runner(cfg, task, workspace, sandbox=sandbox,
+                        max_seconds=max_seconds, label=label,
+                        cancel_check=cancel_check)
+        if isinstance(result, dict):
+            result["authority"] = continuation.to_dict()
+        return result
     except Exception as exc:
         return {"status": "error", "error": str(exc), "answer": "", "seconds": 0}
 
 
-def _workspace(cfg, evidence):
-    state = getattr(cfg, "state_dir", None) or ".deepseek"
+def _workspace(cfg, evidence, envelope=None):
+    """Create the scratch workspace for one auto-skill agent call.
+
+    The run's recorded authority root is the only directory a continuation may
+    execute in, so connector-created scratch space lives *under* that root
+    (``<root>/.deepseek/skill-build/...``) rather than under ``state_dir``,
+    which may be outside the grant.  If the directory cannot be created or
+    verified inside the root, raise: callers fail closed instead of executing
+    outside the envelope.
+    """
+    from . import authority
     cluster = "manual"
     if isinstance(evidence, dict) and evidence.get("cluster_id"):
         cluster = re.sub(r"[^A-Za-z0-9_.-]", "-", str(evidence["cluster_id"]))
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-    path = Path(str(state)) / "skill-build" / cluster / stamp
+    continuation = authority.auto_skill_continuation(cfg, envelope=envelope)
+    root = continuation.workspace_root
+    if not root:
+        raise authority.WorkspaceRootError(
+            "auto-skill authority has no recorded workspace root")
+    path = Path(root) / ".deepseek" / "skill-build" / cluster / stamp
     try:
         path.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise authority.WorkspaceRootError(
+            "cannot create an auto-skill workspace inside the recorded root "
+            "%s: %s" % (root, exc))
+    if not authority.inside_root(path, root):
+        raise authority.WorkspaceRootError(
+            "auto-skill scratch workspace %s is outside the recorded root %s"
+            % (path, root))
     return path
 
 
@@ -1131,7 +1175,7 @@ def _cancelled(cancel_check):
 
 
 def author_draft(action, evidence, existing=None, cfg=None, cancel_check=None,
-                 previous=None, review=None):
+                 previous=None, review=None, envelope=None):
     """Run one author call; never raises. Failure returns an action=skip dict."""
     if _cancelled(cancel_check):
         return {"action": "skip", "reason": "cancelled"}
@@ -1141,10 +1185,10 @@ def author_draft(action, evidence, existing=None, cfg=None, cancel_check=None,
             duplicate = evidence.get("_duplicate")
         task = build_author_task(action, evidence, existing, duplicate=duplicate,
                                  previous=previous, review=review)
-        result = _run_agent(cfg, task, _workspace(cfg, evidence),
+        result = _run_agent(cfg, task, _workspace(cfg, evidence, envelope=envelope),
                             "skill-author",
                             _cfg(cfg, "auto_skills_author_seconds", 180),
-                            cancel_check)
+                            cancel_check, envelope=envelope)
         raw = result.get("answer") if isinstance(result, dict) else ""
         if not isinstance(raw, str) or result.get("status") != "ok":
             error = result.get("error") if isinstance(result, dict) else "no result"
@@ -1284,7 +1328,7 @@ def parse_review(text, draft, gate_score=8.5):
 
 
 def review_draft(draft, evidence, existing, duplicate=None, cfg=None,
-                 round_no=1, cancel_check=None):
+                 round_no=1, cancel_check=None, envelope=None):
     """One fresh reviewer call per round; never raises."""
     if _cancelled(cancel_check):
         return _review_failure("E_REVIEW_UNAVAILABLE", "cancelled")
@@ -1293,10 +1337,10 @@ def review_draft(draft, evidence, existing, duplicate=None, cfg=None,
         validator = validate_draft(copy.deepcopy(draft), None, action)
         # A registry is not needed for the reviewer; pass the list as existing.
         task = build_review_task(draft, evidence, existing, duplicate, validator)
-        result = _run_agent(cfg, task, _workspace(cfg, evidence),
+        result = _run_agent(cfg, task, _workspace(cfg, evidence, envelope=envelope),
                             "skill-reviewer",
                             _cfg(cfg, "auto_skills_review_seconds", 120),
-                            cancel_check)
+                            cancel_check, envelope=envelope)
         if not isinstance(result, dict) or result.get("status") != "ok":
             error = result.get("error") if isinstance(result, dict) else "no result"
             return _review_failure("E_REVIEW_UNAVAILABLE",
@@ -1318,7 +1362,7 @@ def review_draft(draft, evidence, existing, duplicate=None, cfg=None,
 
 
 def review_refresh(refresh, evidence, existing_content, cfg=None,
-                   cancel_check=None):
+                   cancel_check=None, envelope=None):
     """One fresh refresh reviewer; same fail-closed parser."""
     if _cancelled(cancel_check):
         return _review_failure("E_REVIEW_UNAVAILABLE", "cancelled")
@@ -1328,10 +1372,10 @@ def review_refresh(refresh, evidence, existing_content, cfg=None,
                                   (evidence or {}).get("repeated_lessons")
                                   if isinstance(evidence, dict) else None,
                                   preview=preview, evidence=evidence)
-        result = _run_agent(cfg, task, _workspace(cfg, evidence),
+        result = _run_agent(cfg, task, _workspace(cfg, evidence, envelope=envelope),
                             "skill-reviewer",
                             _cfg(cfg, "auto_skills_review_seconds", 120),
-                            cancel_check)
+                            cancel_check, envelope=envelope)
         if not isinstance(result, dict) or result.get("status") != "ok":
             error = result.get("error") if isinstance(result, dict) else "no result"
             return _review_failure("E_REVIEW_UNAVAILABLE",
@@ -1365,7 +1409,7 @@ def _resolve(draft, registry):
     return None, render_skill(draft)
 
 
-def gate(draft, evidence, registry, cfg, cancel_check=None):
+def gate(draft, evidence, registry, cfg, cancel_check=None, envelope=None):
     """PLAN 10.3 gate: duplicate before validation, fresh reviewer each round."""
     if not isinstance(draft, dict):
         return _gate_result(False, "invalid",
@@ -1412,8 +1456,11 @@ def gate(draft, evidence, registry, cfg, cancel_check=None):
                                     attempts=attempts,
                                     target=duplicate.get("target") if duplicate else None,
                                     reason="cancelled", review=review)
+            review_kwargs = ({} if envelope is None
+                             else {"envelope": envelope})
             review = review_draft(work, evidence, _entry_list(registry),
-                                  duplicate, cfg, round_no, cancel_check)
+                                  duplicate, cfg, round_no, cancel_check,
+                                  **review_kwargs)
             cost_usd += float(review.get("cost_usd") or 0.0)
             seconds += float(review.get("seconds") or 0.0)
             if review.get("accepted"):
@@ -1429,9 +1476,11 @@ def gate(draft, evidence, registry, cfg, cancel_check=None):
                 break
             if _cancelled(cancel_check):
                 break
+            revise_kwargs = ({} if envelope is None
+                             else {"envelope": envelope})
             revised = author_draft("revise", evidence, _entry_list(registry),
                                    cfg, cancel_check, previous=work,
-                                   review=review)
+                                   review=review, **revise_kwargs)
             if not isinstance(revised, dict):
                 break
             cost_usd += float(revised.get("_cost_usd") or 0.0)
@@ -1479,7 +1528,8 @@ def gate(draft, evidence, registry, cfg, cancel_check=None):
                             errors=[_err("E_GATE", "", _summarise(exc))])
 
 
-def gate_refresh(refresh, evidence, existing_content, cfg, cancel_check=None):
+def gate_refresh(refresh, evidence, existing_content, cfg, cancel_check=None,
+                 envelope=None):
     """PLAN 10.3 refresh gate: validate, preview, one fresh reviewer."""
     try:
         errors = validate_refresh(refresh, existing_content, cfg)
@@ -1497,8 +1547,9 @@ def gate_refresh(refresh, evidence, existing_content, cfg, cancel_check=None):
             return {"accepted": False, "decision": "cancelled",
                     "errors": [], "preview": preview, "review": None,
                     "attempts": 0}
+        review_kwargs = ({} if envelope is None else {"envelope": envelope})
         review = review_refresh(refresh, evidence, existing_content, cfg,
-                                cancel_check)
+                                cancel_check, **review_kwargs)
         if review.get("accepted"):
             return {"accepted": True, "decision": "refresh",
                     "preview": preview, "review": review,

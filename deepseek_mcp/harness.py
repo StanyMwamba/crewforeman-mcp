@@ -22,8 +22,10 @@ import time
 from pathlib import Path
 
 from . import api
+from . import authority
 from . import budget as budget_mod
 from . import checkpoints
+from . import health
 from . import concurrency
 from . import events as events_mod
 from . import observability
@@ -32,6 +34,7 @@ from . import progress
 from . import render
 from . import safety
 from . import scaling
+from . import spend as spend_mod
 from . import status as status_mod
 from . import transport as transport_mod
 from . import work as work_mod
@@ -1105,8 +1108,66 @@ def _reviewer_home(cfg, workspace, policy, label):
         return None
 
 
+def _sdk_usage_cost(cfg, raw_usage):
+    """Normalise SDK usage and price it; ``(usage, cost_or_None)``."""
+    raw_usage = raw_usage if isinstance(raw_usage, dict) else {}
+    usage = {
+        "input_tokens": raw_usage.get("input_tokens"),
+        "cache_read_tokens": raw_usage.get("cache_read_tokens"),
+        "output_tokens": raw_usage.get("output_tokens"),
+    }
+    if usage.get("input_tokens") is None:
+        return usage, None
+    cost = api.estimate_cost(str(cfg.get("dsh_model") or "deepseek-flash"), {
+        "prompt_tokens": usage.get("input_tokens") or 0,
+        "completion_tokens": usage.get("output_tokens") or 0,
+        "prompt_cache_hit_tokens": usage.get("cache_read_tokens") or 0,
+        "prompt_cache_miss_tokens": max(
+            (usage.get("input_tokens") or 0) - (usage.get("cache_read_tokens") or 0), 0),
+    })
+    return usage, cost
+
+
+def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
+                          event_count, session_id):
+    """Execution record for an SDK run stopped by the live cost ceiling."""
+    usage, cost = _sdk_usage_cost(cfg, raw_usage)
+    return {
+        "status": "error", "answer": None, "exit_code": None,
+        "error": ("live cost usage crossed the whole-job ceiling; the "
+                  "SDK run was stopped at an event boundary"),
+        "tools_used": {}, "events": event_count,
+        "output_files": [], "seconds": round(time.time() - started, 1),
+        "stderr_tail": "", "session_logs": [],
+        "tokens_in": usage.get("input_tokens"),
+        "cache_read_tokens": usage.get("cache_read_tokens"),
+        "tokens_out": usage.get("output_tokens"),
+        "total_tokens": sum(
+            value for value in usage.values()
+            if isinstance(value, (int, float))),
+        "estimated_cost_usd": cost,
+        "cost_source": "sdk_usage" if cost is not None else "unknown",
+        "cost_known": cost is not None,
+        "usage_unknown_reason": (
+            None if cost is not None else "SDK live usage unavailable"),
+        "models": [cfg.get("dsh_model")] if cfg.get("dsh_model") else None,
+        "usage": usage if usage.get("input_tokens") is not None else None,
+        "stalled": False, "stalled_step": None, "stall_elapsed": None,
+        "stall_seconds": _stall_seconds(cfg),
+        "stall_max_seconds": _stall_max_seconds(cfg),
+        "stall_cap_hard_max_seconds": _stall_cap_hard_max(cfg),
+        "stall_cap_hit": False, "timed_out": False,
+        "stop_reason": "budget", "child_progress_events": 0,
+        "child_sessions_active": 0, "transport": "sdk",
+        "sandbox": policy, "os_sandbox": sandbox_meta,
+        "os_sandbox_wrapped": bool(sandbox_meta.get("wrapped")),
+        "transport_session_id": session_id,
+    }
+
+
 def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
-                   session_id, started, output_slack, cancel_check=None):
+                   session_id, started, output_slack, cancel_check=None,
+                   live_usage_cb=None):
     """Run one task through the documented SDK JSON-RPC transport.
 
     Returns an execution dict on success/failure, or ``{"_sdk_unavailable": ...}``
@@ -1137,6 +1198,23 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
         extra_writes=extra_writes,
         dsh_home=str(reviewer_home) if reviewer_home else None)
     client = None
+    observed_usage_events = []
+
+    def _observe_sdk_usage(event, _aggregated):
+        """Adapt the SDK event/usage observer to the headless callback shape."""
+        if live_usage_cb is None:
+            return None
+        try:
+            parsed = parse_event(event)
+        except Exception:
+            parsed = None
+        try:
+            reason = live_usage_cb(event, parsed or {})
+        except Exception:
+            return None
+        observed_usage_events.append(1)
+        return reason
+
     try:
         if progress_cb:
             try:
@@ -1145,14 +1223,28 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                 pass
         client = transport_mod.SdkClient(
             str(dsh), str(workspace), env=env, command=command,
-            timeout=float(limit) if limit else float(cfg.timeout))
+            timeout=float(limit) if limit else float(cfg.timeout),
+            usage_observer=(_observe_sdk_usage
+                            if live_usage_cb is not None else None))
         result = client.run(
             task, timeout=float(limit) if limit else float(cfg.timeout),
             session_id=session_id, resume=bool(session_id),
             provider=str(cfg.get("dsh_provider") or "deepseek-official"),
             model=str(cfg.get("dsh_model") or "deepseek-flash"),
             reasoning_effort=str(cfg.get("reasoning") or "max"),
-            cancel_check=cancel_check)
+            cancel_check=cancel_check,
+            usage_observer=(_observe_sdk_usage
+                            if live_usage_cb is not None else None))
+    except transport_mod.BudgetStopped:
+        # The reader thread saw a usage event that crossed the whole-job
+        # ceiling, signalled the SDK process group and aborted the in-flight
+        # request.  Settle exactly what was observed before the stop instead
+        # of waiting for a final answer or falling back to another transport.
+        return _sdk_budget_execution(
+            cfg, policy, sandbox_meta, started,
+            dict(getattr(client, "_usage", {}) or {}),
+            len(getattr(client, "_events", []) or []),
+            client._session_id if client else None)
     except transport_mod.Cancelled:
         return {
             "status": "cancelled", "answer": None, "exit_code": None,
@@ -1210,20 +1302,23 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
             shutil.rmtree(tmpdir, ignore_errors=True)
         if reviewer_home is not None:
             shutil.rmtree(str(reviewer_home), ignore_errors=True)
+    # Safety net for a client/transport that returns final usage without
+    # emitting a session.event notification: consult the live callback once
+    # with that aggregate.  When notifications were observed they are
+    # authoritative, so this never double-counts a phase.
+    if live_usage_cb is not None and not observed_usage_events:
+        raw_usage = result.get("usage") or {}
+        if raw_usage:
+            reason = _observe_sdk_usage(
+                {"type": "usage", "data": {"usage": raw_usage}}, raw_usage)
+            if reason:
+                return _sdk_budget_execution(
+                    cfg, policy, sandbox_meta, started, raw_usage,
+                    len(result.get("events") or []),
+                    result.get("session_id") or (
+                        client._session_id if client else None))
     answer = (result.get("answer") or "").strip()
-    raw_usage = result.get("usage") or {}
-    usage = {
-        "input_tokens": raw_usage.get("input_tokens"),
-        "cache_read_tokens": raw_usage.get("cache_read_tokens"),
-        "output_tokens": raw_usage.get("output_tokens"),
-    }
-    cost = api.estimate_cost(str(cfg.get("dsh_model") or "deepseek-flash"), {
-        "prompt_tokens": usage.get("input_tokens") or 0,
-        "completion_tokens": usage.get("output_tokens") or 0,
-        "prompt_cache_hit_tokens": usage.get("cache_read_tokens") or 0,
-        "prompt_cache_miss_tokens": max(
-            (usage.get("input_tokens") or 0) - (usage.get("cache_read_tokens") or 0), 0),
-    }) if usage.get("input_tokens") is not None else None
+    usage, cost = _sdk_usage_cost(cfg, result.get("usage") or {})
     try:
         outputs = sorted(
             str(path.relative_to(workspace))
@@ -1305,7 +1400,7 @@ def _workspace_signature(workspace, limit=4000):
 def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
                   exclude_logs=None, clock=None, output_slack=2.0,
                   policy=None, session_id=None, cancel_check=None,
-                  transport_name=None, add_dirs=None):
+                  transport_name=None, add_dirs=None, live_usage_cb=None):
     """Run one Harness process and return its parsed result.
 
     ``limit`` is a per-process wall-clock limit. ``clock`` is injectable for the
@@ -1323,7 +1418,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
     if transport_name in ("sdk", "auto"):
         sdk_result = _sdk_execution(cfg, workspace, task, limit, progress_cb,
                                     label, policy, session_id, started,
-                                    output_slack, cancel_check=cancel_check)
+                                    output_slack, cancel_check=cancel_check,
+                                    live_usage_cb=live_usage_cb)
         if "_sdk_unavailable" not in sdk_result:
             sdk_result["sandbox"] = policy
             return sdk_result
@@ -1558,6 +1654,19 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
         parsed = parse_event(event)
         if not parsed:
             return
+        # P2-3: live cost enforcement is claimed only when the child actually
+        # emits a priced usage event. The callback is consulted at this event
+        # boundary; a truthy reason stops the process group. With no usage
+        # event the run relies on reserve-at-admission / settle-at-exit.
+        if live_usage_cb is not None:
+            try:
+                live_reason = live_usage_cb(event, parsed)
+            except Exception:
+                live_reason = None
+            if live_reason:
+                if _request_stop(str(live_reason)):
+                    _terminate_process(proc)
+                return
         if parsed["kind"] == "tool":
             tools[parsed["name"]] = tools.get(parsed["name"], 0) + 1
             watch.touch("tool", "tool %r (%d tool call(s))" % (
@@ -2279,6 +2388,8 @@ def _synthetic_saved_run(manifest):
         "add_dirs": spec.get("add_dirs") or [],
         "output_files": builder.get("output_files") or [],
         "answer": None,
+        "authority": metadata.get("authority"),
+        "authority_version": metadata.get("authority_version"),
     }
     for phase in phases.values():
         data = (phase or {}).get("data") or {}
@@ -2405,9 +2516,10 @@ def _observe_skills(run, cfg, history_runs, trace, cancel_check):
     else:
         try:
             from . import skill_auto
-            block = skill_auto.after_run(
-                run, cfg, history_runs=history_runs or [],
-                trace=trace, cancel_check=cancel_check)
+            with authority.activate(run.get("authority")):
+                block = skill_auto.after_run(
+                    run, cfg, history_runs=history_runs or [],
+                    trace=trace, cancel_check=cancel_check)
         except Exception as exc:
             block = {"observed": True, "summary": "auto-skills unavailable",
                      "changes": [], "pending": [],
@@ -2438,12 +2550,15 @@ def _save_terminal(run, cfg, history_runs, trace, cancel_check):
     return path
 
 
-def _process_pending_skills(cfg, trace=None, limit=1, cancel_check=None):
+def _process_pending_skills(cfg, trace=None, limit=1, cancel_check=None,
+                            envelope=None):
     """Best-effort wrapper around skill_auto.process_pending; never raises."""
     try:
         from . import skill_auto
-        changes = skill_auto.process_pending(
-            cfg, trace=trace, limit=limit, cancel_check=cancel_check)
+        with authority.activate(envelope):
+            changes = skill_auto.process_pending(
+                cfg, trace=trace, limit=limit, cancel_check=cancel_check,
+                envelope=envelope)
         return list(changes) if changes else []
     except Exception as exc:
         if trace is not None:
@@ -2453,6 +2568,232 @@ def _process_pending_skills(cfg, trace=None, limit=1, cancel_check=None):
             except Exception:
                 pass
         return []
+
+
+def _cost_ledger_for(cfg):
+    """Build the shared reservation ledger; a state-dir problem is not fatal."""
+    try:
+        return budget_mod.CostLedger(
+            cfg.state_dir,
+            ttl=getattr(cfg, "cost_reservation_ttl_seconds", 900))
+    except Exception:
+        return None
+
+
+def _phase_policy(envelope, cfg, origin, run=None):
+    """Derive one post-builder phase from ``envelope.continuation``.
+
+    Rescue, live-scaling and revision are not new direct grants.  Deriving
+    their policy from the continuation guarantees a direct danger grant can
+    never be inherited by them (continuation downgrades it to
+    workspace-write).
+    """
+    phase_env = envelope.continuation(origin, cfg)
+    if isinstance(run, dict):
+        run.setdefault("phase_authority", {})[origin] = phase_env.to_dict()
+    policy = safety.resolve(
+        {"sandbox": phase_env.sandbox, "approval": "ask"},
+        cfg, reviewer=False)
+    if isinstance(run, dict):
+        run.setdefault("phase_policies", {})[origin] = {
+            "basis": phase_env.basis,
+            "sandbox": policy.get("sandbox"),
+            "origin": origin,
+        }
+    return policy, phase_env
+
+
+def _guard_prior(admission, prior, known):
+    """Combine running-cost prior with the ledger's committed snapshot."""
+    ledger_prior = (admission or {}).get("prior_committed")
+    if ledger_prior is not None:
+        try:
+            prior = max(float(prior or 0.0), float(ledger_prior))
+        except (TypeError, ValueError):
+            pass
+        known = bool(known) and bool(
+            (admission or {}).get("prior_known", True))
+    return prior, known
+
+
+def _cost_admit(run, cfg, ledger, phase, agents, seconds, job_budget):
+    """Reserve a conservative phase estimate; return an error dict on refusal.
+
+    A ledger that cannot be opened or read is fail-closed whenever *either* a
+    whole-job or a daily ceiling exists; a transient lock error must not turn
+    a daily-only run into an unbounded one.
+    """
+    daily_limit = getattr(cfg, "daily_limit_usd", None)
+    has_ceiling = (job_budget.max_cost_usd is not None
+                   or daily_limit is not None)
+    estimate = budget_mod.estimate_phase_cost(
+        getattr(cfg, "dsh_model", None) or getattr(cfg, "model", None),
+        phase, agents, seconds)
+    if ledger is None:
+        if has_ceiling:
+            return {"error": "cost ledger unavailable; refusing a paid phase "
+                             "under a ceiling", "estimate": estimate}
+        return None
+    spent_today = (lambda now=None: spend_mod.spend_today(cfg, now=now)) \
+        if daily_limit is not None else 0.0
+    prior_committed = 0.0
+    prior_known = True
+    try:
+        try:
+            before = ledger.snapshot(run["id"], limit=job_budget.max_cost_usd)
+            prior_committed = float(before.get("committed") or 0.0)
+            prior_known = bool(before.get("cost_known", True))
+            first_phase = (prior_committed <= 0.0
+                           and float(before.get("reserved") or 0.0) <= 0.0)
+        except Exception:
+            first_phase = False
+            prior_known = False
+        reservation = ledger.reserve(
+            run["id"], phase, estimate.get("cost_usd"),
+            cost_known=bool(estimate.get("cost_known")),
+            job_limit=job_budget.max_cost_usd,
+            daily_limit=daily_limit,
+            spent_today=spent_today,
+            allow_overrun=(first_phase and bool(getattr(
+                cfg, "allow_first_phase_overrun", False))))
+    except (budget_mod.BudgetExceeded, budget_mod.CostUnknown) as exc:
+        run.setdefault("cost_ledger_events", []).append({
+            "phase": phase, "event": "refused", "reason": str(exc),
+            "estimate": estimate})
+        return {"error": str(exc), "estimate": estimate}
+    except Exception as exc:
+        # A lock timeout/corrupt ledger is a disk/state problem. With either
+        # ceiling set the phase cannot be proven admissible, so fail closed
+        # instead of spending.
+        run["cost_ledger_error"] = api.redact_secrets(str(exc))
+        if has_ceiling:
+            return {"error": "cost ledger unavailable: %s" % exc,
+                    "estimate": estimate}
+        return None
+    if reservation.get("overrun"):
+        overrun = {
+            "phase": phase,
+            "estimate": estimate.get("cost_usd"),
+            "limit": job_budget.max_cost_usd,
+            "reason": ("first paid phase started above an unusually small "
+                       "ceiling; its reservation is recorded and all later "
+                       "phases are admitted strictly"),
+        }
+        run["admission_overrun"] = overrun
+        run.setdefault("admission_overruns", []).append(overrun)
+    run["cost_ledger"] = ledger.snapshot(
+        run["id"], limit=job_budget.max_cost_usd,
+        estimated=estimate.get("cost_usd"),
+        cost_known=bool(estimate.get("cost_known")))
+    run.setdefault("cost_ledger_events", []).append({
+        "phase": phase, "event": "reserved",
+        "estimate": estimate.get("cost_usd"),
+        "cost_known": estimate.get("cost_known"),
+        "reservation": reservation.get("id")})
+    return {"reservation": reservation, "estimate": estimate,
+            "prior_committed": prior_committed, "prior_known": prior_known}
+
+
+def _cost_settle(run, ledger, phase, execution, job_budget,
+                 operation_id=None):
+    """Settle a finished phase and refresh the run's cost snapshot."""
+    if ledger is None:
+        return None
+    known = bool((execution or {}).get("cost_known"))
+    actual = (execution or {}).get("estimated_cost_usd") if known else None
+    try:
+        result = ledger.settle(run["id"], actual, phase=phase,
+                               cost_known=known, operation_id=operation_id)
+    except Exception as exc:
+        run["cost_ledger_error"] = api.redact_secrets(str(exc))
+        return None
+    run["cost_ledger"] = ledger.snapshot(
+        run["id"], limit=job_budget.max_cost_usd, estimated=0.0,
+        cost_known=known)
+    run.setdefault("cost_ledger_events", []).append({
+        "phase": phase, "event": "settled",
+        "actual": result.get("actual"), "cost_known": known,
+        "released": result.get("released")})
+    return result
+
+
+def _cost_release(run, ledger, phase, job_budget):
+    """Release a reservation whose phase was admitted but never started."""
+    if ledger is None:
+        return 0
+    try:
+        removed = ledger.release(run["id"], phase=phase)
+        run["cost_ledger"] = ledger.snapshot(
+            run["id"], limit=job_budget.max_cost_usd, estimated=0.0,
+            cost_known=True)
+        run.setdefault("cost_ledger_events", []).append({
+            "phase": phase, "event": "released", "reason": "phase not started"})
+        return removed
+    except Exception as exc:
+        run["cost_ledger_error"] = api.redact_secrets(str(exc))
+        return 0
+
+
+def _cost_budget_stop(run, cfg, checkpoint, message, history_runs=None,
+                      trace=None, cancel_check=None):
+    """Mark a paid phase refused by the reservation ledger and stop the run."""
+    run["status"] = "budget_exceeded"
+    run["stop_reason"] = "budget"
+    run["status_detail"] = status_mod.STATUS_MEANING["budget_exceeded"]
+    run["error"] = message
+    run["job_budget"] = run.get("job_budget") or {}
+    if checkpoint:
+        try:
+            checkpoint.interrupted(message)
+        except Exception:
+            pass
+    path = _save_terminal(run, cfg, history_runs or [], trace, cancel_check)
+    return path
+
+
+def _health_record(board, component, execution, label=None):
+    """Record one phase outcome; never raise because health is best effort."""
+    try:
+        if (execution or {}).get("status") == "ok":
+            entry = board.record_success(component)
+        else:
+            entry = board.record_failure(
+                component,
+                health.classify_execution(execution),
+                error=api.redact_secrets(
+                    str((execution or {}).get("error") or
+                        (execution or {}).get("stop_reason") or "")),
+                retry_after=health.retry_after(
+                    str((execution or {}).get("error") or "")))
+        return entry
+    except Exception:
+        return None
+
+
+def _health_attention(run, cfg, component, entry):
+    """Emit one structured journal event when a component is quarantined."""
+    if not entry or not entry.get("quarantined"):
+        return None
+    return _emit_run_event(
+        run, cfg, "progress",
+        health.structured_attention(component, entry, run_id=run.get("id")))
+
+
+def _health_block_attention(run, cfg, board, component, message=None):
+    """Attention for a phase refused *before* it runs because it is already
+    quarantined.  This branch does not record a new failure; it reports the
+    persisted quarantine entry and is best effort."""
+    try:
+        entry = ((board.snapshot().get("components") or {}).get(component)
+                 or {})
+    except Exception:
+        entry = {}
+    entry = dict(entry)
+    entry.setdefault("quarantined", True)
+    return _emit_run_event(
+        run, cfg, "progress",
+        health.structured_attention(component, entry, run_id=run.get("id"),
+                                    message=message))
 
 
 def run_harness(args, cfg, progress_cb=None, cancel_check=None):
@@ -2495,20 +2836,93 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         raise RuntimeError("DeepSeek Harness CLI not found or not executable at %s "
                            "(set DSH_BIN or config dsh_bin).%s"
                            % (dsh, _saved_note(run, path)))
-    workspace = Path(os.path.expanduser(args.get("workspace") or cfg.harness_workspace))
+    try:
+        workspace_path = authority.resolve_workspace(args, cfg)
+    except authority.AuthorityError as exc:
+        run.update(status="error", error=str(exc), seconds=0)
+        path = save_run(run, cfg)
+        _finalize_work(run, cfg)
+        raise RuntimeError("%s%s" % (exc, _saved_note(run, path)))
+    workspace = Path(workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
     run["workspace"] = str(workspace)
 
-    # Permission presets are resolved once per run. The reviewer is deliberately
-    # resolved from its own argument (default read-only), never from the
-    # builder's per-call sandbox, so a builder cannot widen the reviewer.
-    builder_policy = safety.resolve(args, cfg, reviewer=False)
-    review_args = {}
-    if args.get("reviewer_sandbox"):
-        review_args["sandbox"] = args.get("reviewer_sandbox")
-    reviewer_policy = safety.resolve(review_args, cfg, reviewer=True)
+    # P2-1: one authority envelope authorizes every phase of this job. A direct
+    # grant is opened only here; resume/rescue/reviewer/revision phases inherit
+    # it as a continuation. The reviewer is read-only unless an operator
+    # override was recorded, so a builder can never widen it.
+    try:
+        if args.get("_authority_envelope") is not None:
+            # A resume passes the revalidated envelope explicitly. It is always
+            # a continuation, never a fresh direct grant.
+            envelope = authority.AuthorityEnvelope.from_dict(
+                args.get("_authority_envelope"))
+            envelope = envelope.continuation("run_harness-resume", cfg)
+            envelope, resume_drift = envelope.revalidate(
+                cfg, workspace=str(workspace))
+            run["policy_drift"] = resume_drift
+        elif args.get("_resume_from"):
+            raise authority.InvalidAuthority(
+                "resume is missing its authority envelope; refusing to start")
+        else:
+            envelope = authority.direct(args, cfg)
+    except authority.AuthorityError as exc:
+        run.update(status="error", error=str(exc), seconds=0)
+        path = save_run(run, cfg)
+        _finalize_work(run, cfg)
+        raise RuntimeError("%s%s" % (exc, _saved_note(run, path)))
+    run["authority"] = envelope.to_dict()
+    run["authority_version"] = authority.AUTHORITY_VERSION
+    run["policy_digest"] = envelope.policy_digest
+    run["reviewer_policy_source"] = (
+        "reviewer_override" if envelope.reviewer_override else "forced_read_only")
+    builder_args = dict(args)
+    builder_args["sandbox"] = envelope.sandbox
+    builder_policy = safety.resolve(builder_args, cfg, reviewer=False)
+    # The reviewer is a continuation too: a danger direct grant is downgraded,
+    # and reviewer_policy_for can only ever return read-only unless the
+    # operator recorded a writing override (workspace-write at most).
+    reviewer_env = envelope.continuation("reviewer", cfg)
+    run.setdefault("phase_authority", {})["reviewer"] = reviewer_env.to_dict()
+    reviewer_policy = safety.resolve(
+        {"sandbox": authority.reviewer_policy_for(reviewer_env, cfg),
+         "approval": "ask"}, cfg, reviewer=True)
+    # All post-builder writing phases derive their policy from a continuation.
+    # Recording them up front makes the authority trail auditable even when a
+    # phase is never reached.
+    rescue_policy, _rescue_env = _phase_policy(
+        envelope, cfg, "rescue", run)
+    scaling_policy, _scaling_env = _phase_policy(
+        envelope, cfg, "live-scaling", run)
+    revision_policy, _revision_env = _phase_policy(
+        envelope, cfg, "revision", run)
+    try:
+        auto_env = envelope.continuation("auto-skill", cfg).narrow(
+            sandbox="read-only")
+        run.setdefault("phase_authority", {})["auto-skill"] = auto_env.to_dict()
+    except authority.AuthorityError:
+        pass
     run["builder_sandbox"] = builder_policy
     run["reviewer_sandbox"] = reviewer_policy
+    run["reviewer_override"] = bool(envelope.reviewer_override)
+    run["health_gate"] = bool(getattr(cfg, "health_gate", True))
+
+    # P2-2: a component that failed three times in a row is quarantined until
+    # an operator clears it. Completed runs are unaffected and remain readable.
+    health_board = health.HealthBoard(cfg.state_dir)
+    if bool(getattr(cfg, "health_gate", True)):
+        blocked = health_board.quarantine_block("builder")
+        if blocked:
+            run.update(status="error", error=blocked, seconds=0,
+                       health_quarantined=True)
+            _emit_run_event(run, cfg, "progress",
+                            health.structured_attention(
+                                "builder", health_board.snapshot().get(
+                                    "components", {}).get("builder"),
+                                run_id=run["id"]))
+            path = save_run(run, cfg)
+            _finalize_work(run, cfg)
+            raise RuntimeError(blocked + _saved_note(run, path))
     run["transport"] = (args.get("transport") or cfg.get("dsh_transport") or "headless")
     run["add_dirs"] = list(args.get("add_dirs") or cfg.get("add_dirs") or [])
 
@@ -2551,7 +2965,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     if (getattr(cfg, "auto_skills", "off") != "off"
             and not args.get("_resume_from")):
         pending_changes = _process_pending_skills(
-            cfg, trace=None, limit=1, cancel_check=cancel_check)
+            cfg, trace=None, limit=1, cancel_check=cancel_check,
+            envelope=envelope)
         run["_skill_pending_changes"] = list(pending_changes)
     # A single-agent task needs no child slots; do not pay for a probe just to
     # fill a field that the task text and sizing will not use.
@@ -2651,6 +3066,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "subagents": run.get("subagents"),
                     "workspace": str(workspace),
                     "resumed_from": args.get("_resume_from"),
+                    "authority": run.get("authority"),
+                    "authority_version": run.get("authority_version"),
                     "spec": _job_spec_for_checkpoint(run, args, workspace),
                 })
             run["checkpoint_path"] = str(checkpoint.path)
@@ -2741,12 +3158,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
 
     # Whole-job budget: every phase, retry, rescue and live-scaling wave draws
     # from the same deadline and cost ceiling.
-    job_seconds = args.get("job_max_seconds")
-    if job_seconds is None:
-        job_seconds = getattr(cfg, "job_max_seconds", None)
-    job_cost = args.get("job_max_cost_usd")
-    if job_cost is None:
-        job_cost = getattr(cfg, "job_max_cost_usd", None)
+    # The envelope already clamped caller values inside the config hard caps;
+    # using it here keeps admission and execution on the same numbers.
+    job_seconds = envelope.job_max_seconds
+    job_cost = envelope.job_max_cost_usd
     # A resume continues the same job. Seed the monotonic clock with the time
     # already booked by the checkpoint instead of giving the restart a fresh
     # whole-job deadline.
@@ -2757,6 +3172,63 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     job_budget = budget_mod.JobBudget(
         job_seconds, job_cost, started=time.monotonic() - prior_elapsed)
     run["job_budget_initial"] = job_budget.snapshot(0.0, True)
+    run["max_agents"] = envelope.max_agents
+    try:
+        actual_agents = int(run.get("subagents") or 0)
+    except (TypeError, ValueError):
+        actual_agents = 0
+    if actual_agents > envelope.max_agents:
+        run.update(status="error", seconds=0,
+                   error=("chosen subagents=%d exceeds the authority envelope "
+                          "max_agents=%d" % (actual_agents, envelope.max_agents)))
+        path = _save_terminal(run, cfg, history_runs, None, cancel_check)
+        raise RuntimeError(run["error"] + _saved_note(run, path))
+
+    # P2-3: one shared ledger for this state dir. A reservation is advisory
+    # when no ceiling exists, but it is always recorded so concurrent jobs and
+    # the daily preflight see committed + reserved rather than only yesterday's
+    # settled spend.
+    cost_ledger = None
+    try:
+        cost_ledger = budget_mod.CostLedger(
+            cfg.state_dir, ttl=getattr(cfg, "cost_reservation_ttl_seconds", 900))
+    except Exception as exc:
+        run["cost_ledger_error"] = api.redact_secrets(str(exc))
+    if cost_ledger is not None:
+        try:
+            # A resume/restart is a new attempt but the same job. Seed the
+            # already-booked cost so admission for its remaining phases cannot
+            # ignore what the earlier attempt spent.
+            prior_spent, prior_known = 0.0, True
+            seen_prior = False
+            prior_items = list(args.get("_prior_rounds") or [])
+            if args.get("_prior_builder") is not None:
+                prior_items.append(args.get("_prior_builder"))
+            for item in prior_items:
+                if not isinstance(item, dict):
+                    continue
+                seen_prior = True
+                cost = item.get("estimated_cost_usd")
+                if cost is None:
+                    cost = item.get("cost")
+                if cost is None:
+                    prior_known = False
+                else:
+                    try:
+                        prior_spent += float(cost)
+                    except (TypeError, ValueError):
+                        prior_known = False
+            if seen_prior:
+                cost_ledger.record_committed(
+                    run["id"], prior_spent if prior_known else None,
+                    phase="prior", cost_known=prior_known)
+            # Every run record carries the reservation view, even when the
+            # builder is reused from a checkpoint and no new reservation is
+            # taken in this process.
+            run["cost_ledger"] = cost_ledger.snapshot(
+                run["id"], limit=job_budget.max_cost_usd)
+        except Exception as exc:
+            run["cost_ledger_error"] = api.redact_secrets(str(exc))
 
     trace = None
     if cfg.get("trace", True):
@@ -2822,6 +3294,37 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         run["resumed"] = True
         run["resumed_from"] = args.get("_resume_from")
     else:
+        builder_before = safety.snapshot_workspace(workspace)
+        builder_writing = ((builder_policy or {}).get("sandbox")
+                           != "read-only")
+        admission = _cost_admit(run, cfg, cost_ledger, "builder",
+                                run.get("subagents") or 1,
+                                job_budget.phase_limit(limit), job_budget)
+        if admission and admission.get("error"):
+            message = ("cost admission refused the builder: %s"
+                       % admission["error"])
+            path = _cost_budget_stop(run, cfg, checkpoint, message,
+                                     history_runs, trace, cancel_check)
+            raise RuntimeError(message + _saved_note(run, path))
+        live_guard = None
+        live_cb = None
+        if job_budget.max_cost_usd is not None:
+            live_guard = budget_mod.LiveCostGuard(
+                limit=job_budget.max_cost_usd,
+                reserved=(admission or {}).get("estimate", {}).get(
+                    "cost_usd") or 0.0,
+                prior_committed=(admission or {}).get(
+                    "prior_committed") or 0.0,
+                prior_known=(admission or {}).get("prior_known", True),
+                model=getattr(cfg, "dsh_model", None))
+
+            def live_cb(event, parsed, _guard=live_guard):
+                usage = _usage_from_event(event)
+                if not usage:
+                    return None
+                if _guard.observe(usage, _model_from_event(event)):
+                    return "budget"
+                return None
         builder = _execute_once(cfg, workspace, task,
                                 limit=job_budget.phase_limit(limit),
                                 progress_cb=progress_cb, label="builder",
@@ -2829,12 +3332,37 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 add_dirs=run["add_dirs"],
                                 transport_name=run["transport"],
                                 session_id=args.get("resume_session_id"),
-                                cancel_check=cancel_check)
+                                cancel_check=cancel_check,
+                                live_usage_cb=live_cb)
         executions.append(builder)
         used_logs.update(builder.get("session_logs") or [])
+        _cost_settle(run, cost_ledger, "builder", builder, job_budget,
+                     operation_id=(admission or {}).get(
+                         "reservation", {}).get("id"))
 
         retry_reason = (_transient_failure_reason(builder)
                         if getattr(cfg, "transient_retry", False) else None)
+        builder_retry_policy = None
+        if retry_reason:
+            # P2-2: the same policy object that governs reviewer retries also
+            # gates the legacy builder transient retry. Hard-stop classes and
+            # the whole-job deadline/cost gates win over the transient regex.
+            builder_retry_policy = health.RetryPolicy(
+                "builder",
+                base=getattr(cfg, "retry_backoff_base_seconds", 1.0),
+                cap=getattr(cfg, "retry_backoff_cap_seconds", 60.0))
+            spent_gate, known_gate = _running_cost(executions)
+            allowed, why = builder_retry_policy.should_retry(
+                1, health.classify_execution(builder),
+                remaining_seconds=job_budget.remaining_seconds(),
+                spent=spent_gate, ceiling=job_budget.max_cost_usd,
+                cost_known=known_gate)
+            if not allowed:
+                run["builder_retry"] = {
+                    "reason": retry_reason, "status": "skipped",
+                    "skip_reason": why,
+                }
+                retry_reason = None
         # A retry is another paid phase. The first attempt may already have
         # crossed the whole-job ceiling (or produced no priceable log, which
         # cannot be proven under budget), so check the cost gate before it.
@@ -2852,33 +3380,108 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 "cost_usd": retry_spent if retry_known else None,
                 "cost_known": retry_known,
             }
+        retry_admission = None
         if retry_reason and not retry_blocked and not job_budget.time_exceeded():
             retry_limit = _retry_budget(job_budget.phase_limit(limit),
                                         time.time() - overall_started)
             if retry_limit:
-                if progress_cb:
-                    try:
-                        progress_cb("builder: %s; retrying once (<=%.0f s)" % (
-                            retry_reason, retry_limit))
-                    except Exception:
-                        pass
-                first = builder
-                retried = _execute_once(
-                    cfg, workspace, task, limit=retry_limit,
-                    progress_cb=progress_cb, label="builder retry",
-                    exclude_logs=used_logs, policy=builder_policy,
-                    add_dirs=run["add_dirs"], transport_name=run["transport"],
-                    cancel_check=cancel_check)
-                executions.append(retried)
-                used_logs.update(retried.get("session_logs") or [])
-                run["builder_retry"] = {
-                    "reason": retry_reason,
-                    "first_seconds": first.get("seconds"),
-                    "retry_seconds": retried.get("seconds"),
-                    "status": retried.get("status"),
-                    "limit_seconds": retry_limit,
-                }
-                builder = retried
+                retry_admission = _cost_admit(
+                    run, cfg, cost_ledger, "builder-retry",
+                    run.get("subagents") or 1, retry_limit, job_budget)
+                if retry_admission and retry_admission.get("error"):
+                    run["builder_retry"] = {
+                        "reason": retry_reason, "status": "skipped",
+                        "skip_reason": ("cost admission refused the retry: %s"
+                                        % retry_admission["error"]),
+                    }
+                else:
+                    # P2-2 side-effect guard: a writing builder may have
+                    # already changed files before it failed. Retrying it would
+                    # duplicate those effects.
+                    guard_ok, guard_changes = health.side_effect_guard(
+                        workspace, builder_before, phase="builder",
+                        writing=builder_writing)
+                    if not guard_ok:
+                        _cost_release(run, cost_ledger, "builder-retry",
+                                      job_budget)
+                        run["builder_retry"] = {
+                            "reason": retry_reason, "status": "skipped",
+                            "skip_reason": ("workspace changed outside allowed "
+                                            "evidence before the retry"),
+                            "changes": guard_changes[:8],
+                        }
+                    else:
+                        if progress_cb:
+                            try:
+                                progress_cb(
+                                    "builder: %s; retrying once (<=%.0f s)" % (
+                                        retry_reason, retry_limit))
+                            except Exception:
+                                pass
+                        first = builder
+                        # A retry is still the same failed attempt for health
+                        # strike purposes; record the retry timestamp only.
+                        try:
+                            health_board.record_retry(
+                                "builder", health.classify_execution(first),
+                                error=api.redact_secrets(str(
+                                    first.get("error") or "")),
+                                retry_after=health.retry_after(str(
+                                    first.get("error") or "")))
+                        except Exception:
+                            pass
+                        delay = builder_retry_policy.delay(
+                            1, health.retry_after(str(
+                                builder.get("error") or "")))
+                        builder_retry_policy.sleep(delay)
+                        retry_guard = None
+                        retry_live_cb = None
+                        if job_budget.max_cost_usd is not None:
+                            retry_prior, _retry_known = _guard_prior(
+                                retry_admission,
+                                *_running_cost(executions))
+                            retry_guard = budget_mod.LiveCostGuard(
+                                limit=job_budget.max_cost_usd,
+                                reserved=(retry_admission or {}).get(
+                                    "estimate", {}).get("cost_usd") or 0.0,
+                                prior_committed=retry_prior,
+                                prior_known=_retry_known,
+                                model=getattr(cfg, "dsh_model", None))
+
+                            def retry_live_cb(event, parsed,
+                                              _guard=retry_guard):
+                                usage = _usage_from_event(event)
+                                if not usage:
+                                    return None
+                                if _guard.observe(usage,
+                                                  _model_from_event(event)):
+                                    return "budget"
+                                return None
+                        retried = _execute_once(
+                            cfg, workspace, task, limit=retry_limit,
+                            progress_cb=progress_cb, label="builder retry",
+                            exclude_logs=used_logs, policy=builder_policy,
+                            add_dirs=run["add_dirs"],
+                            transport_name=run["transport"],
+                            cancel_check=cancel_check,
+                            live_usage_cb=retry_live_cb)
+                        executions.append(retried)
+                        used_logs.update(retried.get("session_logs") or [])
+                        _cost_settle(run, cost_ledger, "builder-retry",
+                                     retried, job_budget,
+                                     operation_id=(retry_admission or {}).get(
+                                         "reservation", {}).get("id"))
+                        run["builder_retry"] = {
+                            "reason": retry_reason,
+                            "first_seconds": first.get("seconds"),
+                            "retry_seconds": retried.get("seconds"),
+                            "status": retried.get("status"),
+                            "limit_seconds": retry_limit,
+                        }
+                        builder = retried
+    builder_health = _health_record(health_board, "builder", builder,
+                                    label="builder")
+    _health_attention(run, cfg, "builder", builder_health)
     builder_stop = _stop_reason_from_execution(builder)
     spent, cost_known = _running_cost(executions)
     run["job_budget"] = job_budget.snapshot(spent, cost_known)
@@ -2905,7 +3508,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     stop_reason=builder.get("stop_reason"),
                     output_files=len(builder.get("output_files") or []))
     _apply_execution(run, builder)
-    if checkpoint:
+    # A live budget stop is an interruption.  Do not finish the builder phase
+    # first: ``finish`` would mark it failed/done and ``interrupted()`` only
+    # rewrites phases that are still running.  The budget branch below calls
+    # ``checkpoint.interrupted`` so resume sees the phase as interrupted.
+    builder_budget_stop = (str(builder.get("stop_reason")) == "budget"
+                           or builder_stop == "budget")
+    if checkpoint and not builder_budget_stop:
         try:
             checkpoint.finish(
                 "builder", status=_checkpoint_status(builder.get("status")),
@@ -2946,6 +3555,26 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     run["rescued"] = False
     review_scope = list(builder.get("output_files") or [])
 
+    if stop_reason == "budget" or str(builder.get("stop_reason")) == "budget":
+        # The live cost guard stopped the phase at an event boundary. The
+        # workspace may contain a partial write, so the phase is treated as
+        # interrupted and resumed/repaired from the checkpoint rather than
+        # accepted as a complete builder.
+        message = ("live cost usage crossed the whole-job ceiling; the builder "
+                   "was stopped at an event boundary")
+        run["status"] = "budget_exceeded"
+        run["stop_reason"] = "budget"
+        run["status_detail"] = status_mod.STATUS_MEANING["budget_exceeded"]
+        run["error"] = message
+        run["job_budget"] = job_budget.snapshot(*_running_cost(executions))
+        if checkpoint:
+            try:
+                checkpoint.interrupted(message)
+            except Exception:
+                pass
+        path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
+        raise RuntimeError(message + _saved_note(run, path))
+
     if builder.get("status") != "ok" and _is_no_balance(builder):
         totals = _sum_executions(executions)
         run.update(totals)
@@ -2978,6 +3607,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 remaining_seconds=remaining,
             )
             run["rescue"] = rescue
+            if checkpoint:
+                try:
+                    checkpoint.begin("rescue")
+                except Exception:
+                    pass
             if rescue_limit <= 0:
                 rescue["status"] = "budget_exhausted"
                 run["status"] = "deadline_exceeded"
@@ -3018,14 +3652,98 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 stopped_after=builder.get("seconds"), skill=skill,
                 quality=quality, quality_target=DEFAULT_QUALITY_TARGET,
                 limit_seconds=rescue_limit)
+            rescue_block = (health_board.quarantine_block("rescue")
+                            if getattr(cfg, "health_gate", True) else None)
+            if rescue_block:
+                rescue["status"] = "health_blocked"
+                rescue["reason"] = rescue_block
+                run["rescue"] = rescue
+                run["status"] = "error"
+                run["error"] = rescue_block
+                _health_block_attention(run, cfg, health_board, "rescue",
+                                        rescue_block)
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(rescue_block)
+                    except Exception:
+                        pass
+                path = _save_terminal(run, cfg, history_runs, trace,
+                                      cancel_check)
+                raise RuntimeError(rescue_block + _saved_note(run, path))
+            rescue_admission = _cost_admit(
+                run, cfg, cost_ledger, "rescue",
+                max(1, int(run.get("subagents") or 1)), rescue_limit,
+                job_budget)
+            if rescue_admission and rescue_admission.get("error"):
+                rescue["status"] = "budget_exhausted"
+                run["status"] = "budget_exceeded"
+                run["error"] = ("cost admission refused the finisher: %s"
+                                % rescue_admission["error"])
+                run["stop_reason"] = "budget"
+                run["status_detail"] = status_mod.STATUS_MEANING[
+                    "budget_exceeded"]
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(run["error"])
+                    except Exception:
+                        pass
+                path = _save_terminal(run, cfg, history_runs, trace,
+                                      cancel_check)
+                raise RuntimeError(run["error"] + _saved_note(run, path))
+            rescue_guard = None
+            rescue_live_cb = None
+            if job_budget.max_cost_usd is not None:
+                rescue_prior, _rescue_known = _guard_prior(
+                    rescue_admission, *_running_cost(executions))
+                rescue_guard = budget_mod.LiveCostGuard(
+                    limit=job_budget.max_cost_usd,
+                    reserved=(rescue_admission or {}).get(
+                        "estimate", {}).get("cost_usd") or 0.0,
+                    prior_committed=rescue_prior,
+                    prior_known=_rescue_known,
+                    model=getattr(cfg, "dsh_model", None))
+
+                def rescue_live_cb(event, parsed, _guard=rescue_guard):
+                    usage = _usage_from_event(event)
+                    if not usage:
+                        return None
+                    if _guard.observe(usage, _model_from_event(event)):
+                        return "budget"
+                    return None
             finisher = _execute_once(
                 cfg, workspace, finisher_task, limit=rescue_limit,
                 progress_cb=progress_cb, label="finisher", exclude_logs=used_logs,
-                output_slack=0.0, policy=builder_policy,
+                output_slack=0.0, policy=rescue_policy,
                 add_dirs=run["add_dirs"], transport_name=run["transport"],
-                cancel_check=cancel_check)
+                cancel_check=cancel_check, live_usage_cb=rescue_live_cb)
             executions.append(finisher)
             used_logs.update(finisher.get("session_logs") or [])
+            _cost_settle(run, cost_ledger, "rescue", finisher, job_budget,
+                         operation_id=(rescue_admission or {}).get(
+                             "reservation", {}).get("id"))
+            finisher_health = _health_record(
+                health_board, "rescue", finisher)
+            _health_attention(run, cfg, "rescue", finisher_health)
+            if (str(finisher.get("stop_reason")) == "budget"
+                    or (rescue_guard is not None and rescue_guard.exceeded)):
+                message = ("live cost usage crossed the whole-job ceiling; "
+                           "the finisher was stopped at an event boundary")
+                run.update(status="budget_exceeded", stop_reason="budget",
+                           error=message,
+                           status_detail=status_mod.STATUS_MEANING[
+                               "budget_exceeded"],
+                           job_budget=job_budget.snapshot(
+                               *_running_cost(executions)))
+                rescue["status"] = "budget_exhausted"
+                run["rescue"] = rescue
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(message)
+                    except Exception:
+                        pass
+                path = _save_terminal(run, cfg, history_runs, trace,
+                                      cancel_check)
+                raise RuntimeError(message + _saved_note(run, path))
             run["finisher"] = {
                 "seconds": finisher.get("seconds"),
                 "cost": finisher.get("estimated_cost_usd"),
@@ -3051,6 +3769,20 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             else:
                 rescue["status"] = "finisher_error"
             run["rescue"] = rescue
+            if checkpoint:
+                try:
+                    checkpoint.finish(
+                        "rescue",
+                        status=_checkpoint_status(finisher.get("status")),
+                        files=finisher.get("output_files") or [],
+                        rescued=bool(run.get("rescued")),
+                        seconds=finisher.get("seconds"),
+                        cost=finisher.get("estimated_cost_usd"),
+                        session_id=finisher.get("transport_session_id"),
+                        error=(finisher.get("error") or "")[:500] or None,
+                    )
+                except Exception:
+                    pass
 
             if not run["rescued"]:
                 totals = _sum_executions(executions)
@@ -3230,6 +3962,34 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     entry["reason"] = ("live scaling stopped: whole-job deadline "
                                        "left no time for wave %d" % wave_number)
                     break
+                # Begin the wave checkpoint before admission.  A refusal is a
+                # real interruption of this wave: with no running phase,
+                # ``interrupted()`` would be a no-op and the phase would never
+                # appear in the resume manifest at all.
+                if checkpoint:
+                    try:
+                        checkpoint.begin("live-wave-%d" % wave_number)
+                    except Exception:
+                        pass
+                wave_admission = _cost_admit(
+                    run, cfg, cost_ledger, "live-wave",
+                    max(1, int(run.get("subagents") or 1)), extra_limit,
+                    job_budget)
+                if wave_admission and wave_admission.get("error"):
+                    entry["reason"] = (
+                        "live scaling stopped: cost admission refused wave %d "
+                        "(%s)" % (wave_number, wave_admission["error"]))
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["status_detail"] = status_mod.STATUS_MEANING[
+                        "budget_exceeded"]
+                    run["error"] = entry["reason"]
+                    if checkpoint:
+                        try:
+                            checkpoint.interrupted(entry["reason"])
+                        except Exception:
+                            pass
+                    break
                 entry["added"] = True
                 entry["limit_seconds"] = extra_limit
                 _persist(run, cfg, "live-wave-%d" % wave_number)
@@ -3237,14 +3997,37 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     trace.event("live-wave-%d" % wave_number, "start",
                                 limit_seconds=extra_limit,
                                 approaches=entry.get("approaches"))
+                wave_guard = None
+                wave_live_cb = None
+                wave_prior, _wave_known = _guard_prior(
+                    wave_admission, *_running_cost(executions))
+                if job_budget.max_cost_usd is not None:
+                    wave_guard = budget_mod.LiveCostGuard(
+                        limit=job_budget.max_cost_usd,
+                        reserved=(wave_admission or {}).get(
+                            "estimate", {}).get("cost_usd") or 0.0,
+                        prior_committed=wave_prior,
+                        prior_known=_wave_known,
+                        model=getattr(cfg, "dsh_model", None))
+
+                    def wave_live_cb(event, parsed, _guard=wave_guard):
+                        usage = _usage_from_event(event)
+                        if not usage:
+                            return None
+                        if _guard.observe(usage, _model_from_event(event)):
+                            return "budget"
+                        return None
                 extra = _execute_once(
                     cfg, workspace, extra_task, limit=extra_limit,
                     progress_cb=progress_cb, label="wave %d builder" % wave_number,
-                    exclude_logs=used_logs, policy=builder_policy,
+                    exclude_logs=used_logs, policy=scaling_policy,
                     add_dirs=run["add_dirs"], transport_name=run["transport"],
-                    cancel_check=cancel_check)
+                    cancel_check=cancel_check, live_usage_cb=wave_live_cb)
                 executions.append(extra)
                 used_logs.update(extra.get("session_logs") or [])
+                _cost_settle(run, cost_ledger, "live-wave", extra, job_budget,
+                             operation_id=(wave_admission or {}).get(
+                                 "reservation", {}).get("id"))
                 scaling_state["extra_waves_used"] += 1
                 run["live_scaling"] = scaling_state
                 # A live-scaling wave extends the builder; it must not replace
@@ -3275,6 +4058,35 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 seconds=extra.get("seconds"),
                                 output_files=len(extra.get("output_files") or []))
                 _persist(run, cfg, "live-wave-%d_done" % wave_number)
+                if (str(extra.get("stop_reason")) == "budget"
+                        or (wave_guard is not None and wave_guard.exceeded)):
+                    message = ("live cost usage crossed the whole-job ceiling; "
+                               "the extra wave was stopped at an event boundary")
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["status_detail"] = status_mod.STATUS_MEANING[
+                        "budget_exceeded"]
+                    run["error"] = message
+                    entry["reason"] = message
+                    if checkpoint:
+                        try:
+                            checkpoint.interrupted(message)
+                        except Exception:
+                            pass
+                    break
+                if checkpoint:
+                    try:
+                        checkpoint.finish(
+                            "live-wave-%d" % wave_number,
+                            status=_checkpoint_status(extra.get("status")),
+                            files=extra.get("output_files") or [],
+                            seconds=extra.get("seconds"),
+                            cost=extra.get("estimated_cost_usd"),
+                            session_id=extra.get("transport_session_id"),
+                            error=(extra.get("error") or "")[:500] or None,
+                        )
+                    except Exception:
+                        pass
                 if extra.get("status") != "ok":
                     entry["reason"] = ("extra wave failed: %s"
                                        % (extra.get("error") or "no final answer"))
@@ -3288,6 +4100,26 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     except Exception as exc:
         scaling_state["error"] = api.redact_secrets(str(exc))
     run["live_scaling"] = scaling_state
+
+    if (run.get("status") == "budget_exceeded"
+            or run.get("stop_reason") == "budget"):
+        # Admission refusal and a live budget stop are terminal for the job.
+        # Do not fall through to the reviewer/revision loop: both are paid
+        # phases and the ceiling is already crossed (or unprovable).
+        message = (run.get("error")
+                   or "live scaling crossed the whole-job budget; stopping")
+        run["status"] = "budget_exceeded"
+        run["stop_reason"] = "budget"
+        run["status_detail"] = status_mod.STATUS_MEANING["budget_exceeded"]
+        run["error"] = message
+        run["job_budget"] = job_budget.snapshot(*_running_cost(executions))
+        if checkpoint:
+            try:
+                checkpoint.interrupted(message)
+            except Exception:
+                pass
+        path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
+        raise RuntimeError(message + _saved_note(run, path))
 
     deliverable_files = _deliverable_files(workspace, review_scope)
     # Reviewer-facing browser evidence: console errors, failed requests and a
@@ -3468,31 +4300,181 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     trace.event("review-%d" % round_no, "start",
                                 deliverables=len(deliverable_files))
                 review_before = safety.snapshot_workspace(workspace)
-                review = _execute_once(
-                    cfg, workspace, review_task,
-                    limit=job_budget.phase_limit(limit),
-                    progress_cb=progress_cb,
-                    label="reviewer round %d" % round_no,
-                    exclude_logs=used_logs, policy=reviewer_policy,
-                    add_dirs=run["add_dirs"],
-                    transport_name=run["transport"],
-                    cancel_check=cancel_check)
-                review_after = safety.snapshot_workspace(workspace)
-                violations = safety.diff_workspace(
-                    review_before, review_after,
-                    allowed=("REVIEW.md", ".browser-evidence/", "EVIDENCE.json"))
+                retry_policy = health.RetryPolicy(
+                    "reviewer",
+                    base=getattr(cfg, "retry_backoff_base_seconds", 1.0),
+                    cap=getattr(cfg, "retry_backoff_cap_seconds", 60.0),
+                    jitter=0.0)
+                review = None
+                violations = []
+                review_attempt = 1
+                reviewer_blocked = (health_board.quarantine_block("reviewer")
+                                    if getattr(cfg, "health_gate", True)
+                                    else None)
+                if reviewer_blocked:
+                    review = {"status": "error", "error": reviewer_blocked,
+                              "seconds": 0, "estimated_cost_usd": None,
+                              "cost_known": False, "session_logs": []}
+                    _emit_run_event(run, cfg, "progress",
+                                    health.structured_attention(
+                                        "reviewer", health_board.snapshot().get(
+                                            "components", {}).get("reviewer"),
+                                        run_id=run["id"]))
+                while review is None or (
+                        review.get("status") != "ok"
+                        and not reviewer_blocked):
+                    admission = _cost_admit(
+                        run, cfg, cost_ledger, "reviewer",
+                        max(1, int(run.get("subagents") or 1)),
+                        job_budget.phase_limit(limit), job_budget)
+                    if admission and admission.get("error"):
+                        review = {
+                            "status": "error",
+                            "stop_reason": "budget",
+                            "error": ("cost admission refused the reviewer: %s"
+                                      % admission["error"]),
+                            "seconds": 0, "estimated_cost_usd": None,
+                            "cost_known": False, "session_logs": [],
+                        }
+                        run["status"] = "budget_exceeded"
+                        run["stop_reason"] = "budget"
+                        run["status_detail"] = status_mod.STATUS_MEANING[
+                            "budget_exceeded"]
+                        if checkpoint:
+                            try:
+                                checkpoint.interrupted(review["error"])
+                            except Exception:
+                                pass
+                        break
+                    live_guard = None
+                    review_prior, _review_known = _guard_prior(
+                        admission,
+                        *_running_cost(executions + reviewer_executions))
+                    if job_budget.max_cost_usd is not None:
+                        live_guard = budget_mod.LiveCostGuard(
+                            limit=job_budget.max_cost_usd,
+                            reserved=(admission or {}).get("estimate", {}).get(
+                                "cost_usd") or 0.0,
+                            prior_committed=review_prior,
+                            prior_known=_review_known,
+                            model=getattr(cfg, "dsh_model", None))
+
+                    def review_live_cb(event, parsed, _guard=live_guard):
+                        if _guard is None:
+                            return None
+                        usage = _usage_from_event(event)
+                        if not usage:
+                            return None
+                        if _guard.observe(usage, _model_from_event(event)):
+                            return "budget"
+                        return None
+
+                    review = _execute_once(
+                        cfg, workspace, review_task,
+                        limit=job_budget.phase_limit(limit),
+                        progress_cb=progress_cb,
+                        label="reviewer round %d" % round_no,
+                        exclude_logs=used_logs, policy=reviewer_policy,
+                        add_dirs=run["add_dirs"],
+                        transport_name=run["transport"],
+                        cancel_check=cancel_check,
+                        live_usage_cb=review_live_cb)
+                    reviewer_executions.append(review)
+                    used_logs.update(review.get("session_logs") or [])
+                    _cost_settle(run, cost_ledger, "reviewer", review,
+                                 job_budget,
+                                 operation_id=(admission or {}).get(
+                                     "reservation", {}).get("id"))
+                    if str(review.get("stop_reason")) == "budget":
+                        # A live budget kill is an interruption, not a normal
+                        # completed review phase.
+                        if checkpoint:
+                            try:
+                                checkpoint.interrupted(
+                                    "live cost usage crossed the whole-job "
+                                    "ceiling during the reviewer")
+                            except Exception:
+                                pass
+                    review_after = safety.snapshot_workspace(workspace)
+                    violations = safety.diff_workspace(
+                        review_before, review_after,
+                        allowed=("REVIEW.md", ".browser-evidence/",
+                                 "EVIDENCE.json"))
+                    if violations:
+                        review["status"] = "error"
+                        review["error"] = (
+                            "reviewer modified files outside REVIEW.md: %s"
+                            % ", ".join(
+                                "%s (%s)" % (item["path"], item["change"])
+                                for item in violations[:8]))
+                        review["write_violations"] = violations
+                        _review_health = _health_record(
+                            health_board, "reviewer", review)
+                        _health_attention(run, cfg, "reviewer",
+                                          _review_health)
+                        break
+                    if review.get("status") == "ok":
+                        _health_record(health_board, "reviewer", review)
+                        break
+                    _review_health = _health_record(
+                        health_board, "reviewer", review)
+                    _health_attention(run, cfg, "reviewer", _review_health)
+                    spent_now, known_now = _running_cost(
+                        executions + reviewer_executions)
+                    allowed, reason = retry_policy.should_retry(
+                        review_attempt,
+                        health.classify_execution(review),
+                        remaining_seconds=job_budget.remaining_seconds(),
+                        spent=spent_now,
+                        ceiling=job_budget.max_cost_usd,
+                        cost_known=known_now)
+                    if not allowed:
+                        review["retry"] = {
+                            "attempt": review_attempt,
+                            "stopped": reason,
+                        }
+                        break
+                    writing = ((reviewer_policy or {}).get("sandbox")
+                               != "read-only")
+                    safe, changes = health.side_effect_guard(
+                        workspace, review_before, phase="reviewer",
+                        writing=writing)
+                    if not safe:
+                        review["retry"] = {
+                            "attempt": review_attempt,
+                            "stopped": ("previous reviewer attempt changed "
+                                        "files outside allowed evidence"),
+                            "changes": changes[:8],
+                        }
+                        break
+                    delay = retry_policy.delay(
+                        review_attempt,
+                        health.retry_after(
+                            str(review.get("error") or "")))
+                    review["retry"] = {
+                        "attempt": review_attempt,
+                        "next_delay_seconds": delay,
+                        "class": health.classify_execution(review),
+                    }
+                    try:
+                        health_board.record_retry(
+                            "reviewer", health.classify_execution(review),
+                            error=api.redact_secrets(str(
+                                review.get("error") or "")),
+                            retry_after=health.retry_after(str(
+                                review.get("error") or "")))
+                    except Exception:
+                        pass
+                    retry_policy.sleep(delay)
+                    review_attempt += 1
                 # Read-only DSH cannot write REVIEW.md; the connector persists
                 # the reviewer's final report after checking the write guard.
+                if review is None:
+                    review = {"status": "error", "error": "reviewer not run",
+                              "seconds": 0, "estimated_cost_usd": None,
+                              "cost_known": False, "session_logs": []}
                 _materialize_review(workspace, review)
                 review["write_violations"] = violations
-                if violations:
-                    review["status"] = "error"
-                    review["error"] = (
-                        "reviewer modified files outside REVIEW.md: %s"
-                        % ", ".join("%s (%s)" % (item["path"], item["change"])
-                                    for item in violations[:8]))
-                reviewer_executions.append(review)
-                used_logs.update(review.get("session_logs") or [])
                 report_text, report_path = _read_review(workspace)
                 parsed = parse_review(report_text, review.get("answer") or "",
                                       task_type=run.get("task_type"))
@@ -3533,7 +4515,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                      and blocking == 0),
                 }
                 review_rounds.append(entry)
-                if checkpoint:
+                if checkpoint and str(review.get("stop_reason")) != "budget":
                     try:
                         checkpoint.finish(
                             "review-%d" % round_no,
@@ -3565,6 +4547,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 review_status = "error"
                 review_error = (NO_BALANCE_MESSAGE if _is_no_balance(review)
                                 else review.get("error") or "reviewer run failed")
+                if str(review.get("stop_reason")) == "budget":
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["status_detail"] = status_mod.STATUS_MEANING[
+                        "budget_exceeded"]
                 break
             # Budget is a whole-job ceiling: check it before accepting, because
             # the reviewer itself is a paid phase and can take the run over the
@@ -3621,17 +4608,77 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             if trace:
                 trace.event("revision-%d" % round_no, "start",
                             fixes=len(fixes), blocking=blocking)
+            revision_block = (health_board.quarantine_block("revision")
+                              if getattr(cfg, "health_gate", True) else None)
+            if revision_block:
+                review_status = "stopped"
+                review_error = revision_block
+                run["revision_health_block"] = revision_block
+                _health_block_attention(run, cfg, health_board, "revision",
+                                        revision_block)
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(revision_block)
+                    except Exception:
+                        pass
+                break
+            rev_admission = _cost_admit(
+                run, cfg, cost_ledger, "revision",
+                max(1, int(run.get("subagents") or 1)),
+                job_budget.phase_limit(limit), job_budget)
+            if rev_admission and rev_admission.get("error"):
+                review_status = "stopped"
+                review_error = ("cost admission refused the revision: %s"
+                                % rev_admission["error"])
+                run["status"] = "budget_exceeded"
+                run["stop_reason"] = "budget"
+                run["status_detail"] = status_mod.STATUS_MEANING[
+                    "budget_exceeded"]
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(review_error)
+                    except Exception:
+                        pass
+                break
+            revision_guard = None
+            revision_live_cb = None
+            if job_budget.max_cost_usd is not None:
+                revision_prior, _rev_known = _guard_prior(
+                    rev_admission,
+                    *_running_cost(executions + reviewer_executions))
+                revision_guard = budget_mod.LiveCostGuard(
+                    limit=job_budget.max_cost_usd,
+                    reserved=(rev_admission or {}).get(
+                        "estimate", {}).get("cost_usd") or 0.0,
+                    prior_committed=revision_prior,
+                    prior_known=_rev_known,
+                    model=getattr(cfg, "dsh_model", None))
+
+                def revision_live_cb(event, parsed, _guard=revision_guard):
+                    usage = _usage_from_event(event)
+                    if not usage:
+                        return None
+                    if _guard.observe(usage, _model_from_event(event)):
+                        return "budget"
+                    return None
             revision = _execute_once(
                 cfg, workspace, revision_task,
                 limit=job_budget.phase_limit(limit),
                 progress_cb=progress_cb,
                 label="revision round %d" % round_no,
-                exclude_logs=used_logs, policy=builder_policy,
+                exclude_logs=used_logs, policy=revision_policy,
                 add_dirs=run["add_dirs"],
                 transport_name=run["transport"],
-                cancel_check=cancel_check)
+                cancel_check=cancel_check,
+                live_usage_cb=revision_live_cb)
             reviewer_executions.append(revision)
             used_logs.update(revision.get("session_logs") or [])
+            _cost_settle(run, cost_ledger, "revision", revision, job_budget,
+                         operation_id=(rev_admission or {}).get(
+                             "reservation", {}).get("id"))
+            revision_health = _health_record(
+                health_board, "revision", revision)
+            _health_attention(run, cfg, "revision", revision_health)
             rev_entry = {
                 "round": round_no,
                 "kind": "revision",
@@ -3650,6 +4697,25 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 "escalation": escalation,
             }
             review_rounds.append(rev_entry)
+            if (str(revision.get("stop_reason")) == "budget"
+                    or (revision_guard is not None and revision_guard.exceeded)):
+                message = ("live cost usage crossed the whole-job ceiling; "
+                           "the revision was stopped at an event boundary")
+                run["status"] = "budget_exceeded"
+                run["stop_reason"] = "budget"
+                run["status_detail"] = status_mod.STATUS_MEANING[
+                    "budget_exceeded"]
+                run["error"] = message
+                review_status = "stopped"
+                review_error = message
+                rev_entry["status"] = "budget_exceeded"
+                rev_entry["error"] = message
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(message)
+                    except Exception:
+                        pass
+                break
             if checkpoint:
                 try:
                     checkpoint.finish(
@@ -3835,15 +4901,23 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
 
     if checkpoint:
         try:
-            checkpoint.finalize({
-                "status": run.get("status"),
-                "status_detail": run.get("status_detail"),
-                "quality_score": run.get("quality_score"),
-                "review_status": run.get("review_status"),
-                "review_passed": run.get("review_passed"),
-                "deliverable_files": deliverable_files,
-            })
-            run["checkpoint_status"] = "finished"
+            if (run.get("status") == "budget_exceeded"
+                    and run.get("stop_reason") == "budget"):
+                # A budget kill is an interruption, not a finished manifest:
+                # leave the phase/manifest resumable instead of finalizing.
+                checkpoint.interrupted(
+                    run.get("error") or "whole-job budget exceeded")
+                run["checkpoint_status"] = "interrupted"
+            else:
+                checkpoint.finalize({
+                    "status": run.get("status"),
+                    "status_detail": run.get("status_detail"),
+                    "quality_score": run.get("quality_score"),
+                    "review_status": run.get("review_status"),
+                    "review_passed": run.get("review_passed"),
+                    "deliverable_files": deliverable_files,
+                })
+                run["checkpoint_status"] = "finished"
         except Exception as exc:
             run["checkpoint_error"] = str(exc)
     path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
@@ -3890,6 +4964,34 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         saved, md_path = _synthetic_saved_run(manifest), None
     metadata = manifest.get("metadata") or {}
     spec = dict(metadata.get("spec") or {})
+    # P2-1: revalidate before any phase. A pre-authority 3.8.0 record gets a
+    # conservative legacy envelope; a record that advertises authority but has
+    # none/invalid/newer authority fails closed.
+    try:
+        effective_authority, policy_drift = authority.revalidate_run(
+            saved, cfg, metadata)
+    except authority.AuthorityError as exc:
+        raise RuntimeError(
+            "Authority revalidation failed for run %s: %s" % (run_id, exc))
+    saved["authority"] = effective_authority.to_dict()
+    saved["authority_version"] = authority.AUTHORITY_VERSION
+    saved["policy_drift"] = policy_drift
+    saved["reviewer_override"] = bool(effective_authority.reviewer_override)
+    saved["reviewer_policy_source"] = (
+        "reviewer_override" if effective_authority.reviewer_override
+        else "forced_read_only")
+    # Keep the checkpoint copy in step with the revalidated envelope so a later
+    # resume starts from the same stricter intersection.
+    try:
+        cp = checkpoints.Checkpoint(root, run_id)
+        current = cp.load() or {}
+        current_metadata = dict(current.get("metadata") or {})
+        current_metadata["authority"] = effective_authority.to_dict()
+        current_metadata["authority_version"] = authority.AUTHORITY_VERSION
+        current_metadata["policy_drift"] = policy_drift
+        cp.update(metadata=current_metadata)
+    except Exception:
+        pass
     # Fill gaps in an early skeleton (or a synthetic record) from the spec.
     for key in ("prompt", "workspace", "title", "subagents", "quality_used",
                 "independent_review", "quality_rounds", "skill",
@@ -4067,16 +5169,14 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "independent_review": saved.get("independent_review"),
         "quality_rounds": saved.get("quality_rounds"),
         "skill": saved.get("skill"),
-        "sandbox": (saved.get("builder_sandbox") or {}).get("preset"),
-        "reviewer_sandbox": (saved.get("reviewer_sandbox") or {}).get("preset"),
+        "sandbox": effective_authority.sandbox,
+        "reviewer_sandbox": authority.reviewer_policy_for(
+            effective_authority, cfg),
         "transport": saved.get("transport"),
         "add_dirs": list(saved.get("add_dirs") or []),
-        "job_max_seconds": (spec.get("job_max_seconds")
-                            if spec.get("job_max_seconds") is not None
-                            else saved.get("job_max_seconds")),
-        "job_max_cost_usd": (spec.get("job_max_cost_usd")
-                             if spec.get("job_max_cost_usd") is not None
-                             else saved.get("job_max_cost_usd")),
+        "job_max_seconds": effective_authority.job_max_seconds,
+        "job_max_cost_usd": effective_authority.job_max_cost_usd,
+        "_authority_envelope": effective_authority.to_dict(),
         "live_scaling": saved.get("live_scaling", spec.get("live_scaling")),
         "live_scaling_threshold": saved.get("live_scaling_threshold",
                                             spec.get("live_scaling_threshold")),

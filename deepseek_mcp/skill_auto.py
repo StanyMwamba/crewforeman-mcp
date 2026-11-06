@@ -1300,11 +1300,13 @@ def _emit_change(change, run, synthetic):
 
 
 @_safe(lambda: {"action": "error", "error": "build_failed"})
-def build_cluster(cluster_id, cfg, run=None, trace=None, cancel_check=None):
+def build_cluster(cluster_id, cfg, run=None, trace=None, cancel_check=None,
+                  envelope=None):
     synthetic = run is None
     if synthetic:
         run = {"id": "pending-%s" % cluster_id,
                "skill_auto": {"observed": True, "changes": []}}
+    auth_env = envelope or (run or {}).get("authority")
     mode = _mode(cfg)
     if mode == "off":
         return _emit_change({"action": "skipped", "reason": "off",
@@ -1359,8 +1361,11 @@ def build_cluster(cluster_id, cfg, run=None, trace=None, cancel_check=None):
     try:
         from . import skill_author
         existing = _registry_entries(cfg)
+        author_kwargs = {"cancel_check": cancel_check}
+        if auth_env is not None:
+            author_kwargs["envelope"] = auth_env
         draft = skill_author.author_draft("create", evidence, existing, cfg=cfg,
-                                          cancel_check=cancel_check)
+                                          **author_kwargs)
     except Exception as exc:
         _release(cfg, cluster_id, "ready", _cooldown_until(
             int(cluster.get("attempts") or 0) + 1, cfg))
@@ -1418,8 +1423,11 @@ def build_cluster(cluster_id, cfg, run=None, trace=None, cancel_check=None):
         return _emit_change({"action": "pending", "reason": "cost_cap",
                              "cluster_id": cluster_id}, run, synthetic)
     try:
+        gate_kwargs = {"cancel_check": cancel_check}
+        if auth_env is not None:
+            gate_kwargs["envelope"] = auth_env
         gate = skill_author.gate(draft, evidence, _registry(cfg), cfg,
-                                 cancel_check=cancel_check)
+                                 **gate_kwargs)
     except Exception as exc:
         _release(cfg, cluster_id, "ready", _cooldown_until(
             int(cluster.get("attempts") or 0) + 1, cfg))
@@ -1763,7 +1771,9 @@ def _save_refresh(registry, key, repeated=None, version=None, failed=False):
 
 
 @_safe(lambda: {"action": "hold", "reason": "error"})
-def maybe_refresh(key, cfg, run=None, trace=None, cancel_check=None):
+def maybe_refresh(key, cfg, run=None, trace=None, cancel_check=None,
+                  envelope=None):
+    auth_env = envelope or (run or {}).get("authority")
     if not key or _mode(cfg) == "off":
         return {"action": "skipped", "reason": "off"}
     if not _cfg_bool(cfg, "auto_skills_refresh", True):
@@ -1797,10 +1807,12 @@ def maybe_refresh(key, cfg, run=None, trace=None, cancel_check=None):
     try:
         from . import skill_author
         existing = _registry_entries(cfg)
+        author_kwargs = {"cancel_check": cancel_check,
+                         "previous": existing_content}
+        if auth_env is not None:
+            author_kwargs["envelope"] = auth_env
         refresh = skill_author.author_draft("refresh", evidence, existing,
-                                            cfg=cfg,
-                                            cancel_check=cancel_check,
-                                            previous=existing_content)
+                                            cfg=cfg, **author_kwargs)
     except Exception as exc:
         _save_refresh(registry, key, failed=True)
         record_decision("refresh_error", cfg, key=key, run_id=run_id,
@@ -1813,8 +1825,11 @@ def maybe_refresh(key, cfg, run=None, trace=None, cancel_check=None):
                             (refresh or {}).get("reason") or "author_skip", 100))
         return {"action": "skipped", "reason": "author_skip"}
     try:
+        gate_kwargs = {"cancel_check": cancel_check}
+        if auth_env is not None:
+            gate_kwargs["envelope"] = auth_env
         gate = skill_author.gate_refresh(refresh, evidence, existing_content, cfg,
-                                         cancel_check=cancel_check)
+                                         **gate_kwargs)
     except Exception as exc:
         _save_refresh(registry, key, failed=True)
         record_decision("refresh_error", cfg, key=key, run_id=run_id,
@@ -2122,7 +2137,8 @@ def observe_run(run, cfg, history_runs=None):
 
 
 @_safe(lambda: [])
-def process_pending(cfg, trace=None, limit=1, cancel_check=None):
+def process_pending(cfg, trace=None, limit=1, cancel_check=None,
+                    envelope=None):
     if _mode(cfg) == "off":
         return []
     changes = []
@@ -2144,7 +2160,7 @@ def process_pending(cfg, trace=None, limit=1, cancel_check=None):
         cluster_id = cluster.get("id")
         seen.add(cluster_id)
         result = build_cluster(cluster_id, cfg, run=None, trace=trace,
-                               cancel_check=cancel_check)
+                               cancel_check=cancel_check, envelope=envelope)
         if isinstance(result, list):
             for item in result:
                 if isinstance(item, dict):

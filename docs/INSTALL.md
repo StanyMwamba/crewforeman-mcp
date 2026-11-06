@@ -1,4 +1,4 @@
-# Installing crewforeman-mcp 3.8.0
+# Installing crewforeman-mcp 3.8.1
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime
 dependencies**. It ships a local MCP stdio server and five skill checklists
@@ -129,7 +129,7 @@ then builds and inspects the sdist. It removes its own `venv/`, `sdist/`,
 
 On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
-Expected results: the version prints `3.8.0`, each `--help` exits 0, and the
+Expected results: the version prints `3.8.1`, each `--help` exits 0, and the
 file listing shows the five `.md` skill data files under
 `share/crewforeman-mcp/skills`. If the files are present but a run says
 skills are missing, set `DSH_SKILLS_DIR` to that directory (see docs/OPERATIONS.md).

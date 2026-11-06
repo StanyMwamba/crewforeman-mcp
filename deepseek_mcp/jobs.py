@@ -887,6 +887,17 @@ def _structured_status(args, state, run_id, cfg):
     if work_id:
         payload["work_id"] = work_id
     payload["run_id"] = run_id
+    # P2-3: the reservation view is part of the structured status contract.
+    # The plain (no events_since) text response stays byte-for-byte compatible.
+    payload["cost"] = (run or {}).get("cost_ledger")
+    if (run or {}).get("admission_overrun"):
+        payload["admission_overrun"] = run.get("admission_overrun")
+    try:
+        from . import health as health_mod
+        board = health_mod.HealthBoard(cfg.state_dir)
+        payload["health"] = board.snapshot().get("components") or {}
+    except Exception:
+        payload["health"] = {}
     return payload
 
 

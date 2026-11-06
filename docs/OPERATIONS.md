@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.8.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.8.1)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -85,6 +85,107 @@ variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
+## Authority envelope (P2-1)
+
+Every `harness_deepseek` call opens one **direct** authority envelope. The run
+record and checkpoint metadata carry it: `basis` (`direct|continuation`),
+`origin`, `policy_digest`, `sandbox`, `reviewer_policy`,
+`reviewer_override`, `workspace_root`, `job_max_seconds`,
+`job_max_cost_usd`, `max_agents`, `created` and `expires`. P1-2 (prompt bundle
+hashing) is not implemented, so the envelope deliberately has **no**
+`prompt_bundle_hash` field.
+
+`resume_deepseek`, rescue, live-scaling, reviewer, revision and auto-skill
+phases are continuations. A continuation can only narrow sandbox, reviewer,
+budget, agent count or workspace root; widening raises a typed
+`WideningError`. `danger-full-access` is never inherited (it downgrades to
+`workspace-write`), including by rescue, live-scaling, revision, reviewer and
+auto-skill. A resume revalidates the recorded envelope against the current
+config, writes `policy_drift` into the run record and uses the stricter
+intersection. Deserialization is fail-closed: a non-integral/future version,
+non-finite or non-positive budget, malformed timestamp, non-boolean flag,
+negative agent count, relative workspace root or danger reviewer invalidates
+the whole envelope. The recorded expiry is checked before any lease refresh, so
+an expired grant produces an `expired` drift entry. A pre-authority 3.8.0
+record gets a conservative legacy envelope (builder sandbox capped by current
+config, reviewer read-only, budgets and agent count clamped). A record that
+advertises `authority_version` but has a missing, corrupt or newer envelope
+fails closed.
+
+Auto-skill agents are read-only continuations and execute only inside the
+recorded `workspace_root`: the connector creates scratch space at
+`<workspace_root>/.deepseek/skill-build/<cluster>/<stamp>` and verifies every
+actual execution workspace with the same containment check before invoking an
+agent. If that directory cannot be created inside the root, auto-skill fails
+closed instead of executing in a scratch path outside the grant.
+
+The reviewer is read-only by default. A caller-supplied `reviewer_sandbox`
+other than `read-only` is refused. If an operator genuinely needs a writing
+reviewer, set `allow_writing_reviewer=true`; the run then records
+`reviewer_override` and the writing reviewer gets the same workspace-diff
+retry guard as a builder. `allowed_workspace_roots` (a list, empty by default)
+bounds a new run's workspace and a resume's recorded root; requests outside it
+are refused before any DSH process starts.
+
+## Retry and component health (P2-2)
+
+`deepseek_mcp/health.py` classifies failures as `rate_limit`, `network`,
+`provider_5xx`, `auth`, `no_balance`, `budget`, `deadline`, `stall`, `prepare`,
+`reviewer`, `cancelled` or `unknown`, and parses `Retry-After` seconds or HTTP
+dates. Retry attempts are phase-specific: builder 2, reviewer 2, revision 1,
+rescue 1. Backoff is exponential with jitter, capped at
+`retry_backoff_cap_seconds` (60); a provider `Retry-After` is clamped to the
+same cap and receives the same jitter. Auth, no balance, prepare, cancel,
+deadline and budget never retry. A retry is also refused when the whole-job deadline or
+cost ceiling is crossed, or when a workspace snapshot shows that the previous
+writing attempt changed files outside `REVIEW.md`/evidence. A failed reviewer
+is retried on its own; the paid builder is never restarted for it.
+
+Health lives in `<state_dir>/health.json`, written under an O_EXCL lock with an
+atomic replace. Each component records consecutive failures, last class,
+retry-after, last success and quarantine. `error` appears only at three
+consecutive failures; any success resets the entry. A quarantined component
+blocks new automatic phases and emits a structured `progress` journal event
+(`kind=attention`, `attention=health_quarantine`); completed run records remain
+readable. Inspect with `deepseek_maintenance action=health` (or the status
+section) and clear with `action=clear_health` (`component` optional). A corrupt
+`health.json` is treated as quarantined until cleared; `clear_health` resets a
+corrupt board to a clean state. `health_gate=false`
+disables the gate but keeps recording.
+
+## Cost reservations (P2-3)
+
+`CostLedger` (in `deepseek_mcp/budget.py`) reserves a conservative estimate
+before each paid phase and settles the actual cost from session logs after it.
+Admission checks `committed + reserved + estimate` against
+`job_max_cost_usd` and, when set, against `daily_limit_usd` including active
+reservations. A daily preflight also counts reservations, so two concurrent
+jobs cannot jointly pass the same limit. Unknown cost fails closed whenever a
+ceiling exists; there is no `allow_unknown_cost` option. Each run record and
+the structured `deepseek_job_status` payload carry
+`{limit, estimated, reserved, committed, available, cost_known}`. Reservations
+left by a dead worker are reclaimed after `cost_reservation_ttl_seconds`
+(default 900).
+
+Estimates come from the local price table, not from billing. Admission is
+strict by default: `committed + reserved + estimate` must fit the job ceiling
+for the first and every later paid phase. `allow_first_phase_overrun` is an
+opt-in compatibility switch (default `false`); when enabled it records
+`admission_overrun` and still reserves the oversized estimate. Live mid-phase
+enforcement projects `prior committed spend + live usage + the remaining
+reserve`, so a retry, reviewer, rescue, revision or live-scaling wave is judged
+against the whole job, not just its own estimate. When the child emits a priced
+usage event over that projection, the process is stopped at the event boundary,
+the checkpoint is marked interrupted, and the run records `budget_exceeded`.
+This also applies to the `sdk` and `auto` transports: `SdkClient` consults a
+synchronous observer on every `session.event` usage notification, signals the
+SDK process group and aborts the turn at that boundary, preserving the observed
+usage for settlement. If an SDK client returns only final usage without a
+notification, the aggregate is checked once after completion. Transports with
+no observable live usage fall back to reserve-at-admission and settle-at-exit. Settlement is idempotent by reservation/operation id: a repeated
+settle returns the existing committed row instead of adding a second one, and a
+post-TTL settle uses one deterministic fallback row.
+
 ## Watchdog and budgets
 
 Two timers protect a Harness process:
@@ -115,6 +216,14 @@ live-scaling waves, reviewer, revisions, rescue and retries:
 | --- | --- | --- |
 | `job_max_seconds` | `7200` | Wall-clock deadline for the whole call. `0`/`null` disables it. |
 | `job_max_cost_usd` | unset | Estimated-cost ceiling for the whole call. Unknown cost cannot be proven under budget, so further phases stop and the run records it. |
+| `daily_limit_usd` | unset | Daily ceiling; admission adds active reservations to settled spend. |
+| `cost_reservation_ttl_seconds` | `900` | Lease after which a dead worker's reservation is reclaimed. |
+| `allow_first_phase_overrun` | `false` | Opt-in 3.8.0 compatibility: when `true`, a fresh run's first paid phase may start above an unusually small ceiling; the overrun is reserved and recorded as `admission_overrun`. The default is strict admission for every phase. |
+| `retry_backoff_base_seconds` / `retry_backoff_cap_seconds` | `1.0` / `60.0` | Exponential retry base and hard cap. |
+| `health_gate` | `true` | Block new automatic phases for a quarantined component. |
+| `allow_writing_reviewer` | `false` | Operator-only escape hatch; records `reviewer_override`. |
+| `allowed_workspace_roots` | `[]` | Optional allow-list for run/resume workspace roots. |
+| `authority_ttl_seconds` | `604800` | Envelope expiry; a resume reports expiry drift and refreshes it. |
 
 A rescue finisher is deliberately short (at most 8 minutes and 12 tool calls)
 and only runs when the builder left usable output files. It is not a way to

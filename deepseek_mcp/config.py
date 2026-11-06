@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.8.0"
+SERVER_VERSION = "3.8.1"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -137,6 +137,25 @@ DEFAULTS = {
     # reviewer. ``danger`` is accepted only as an explicit per-call opt-in.
     "sandbox": "workspace-write",
     "reviewer_sandbox": "read-only",
+    # P2-1: the reviewer is read-only unless the operator explicitly allows a
+    # writing reviewer; such a run records reviewer_override and gets the same
+    # workspace-diff guard as a builder.
+    "allow_writing_reviewer": False,
+    # Optional positive allow-list. When set, a new run's workspace (and a
+    # resumed run's recorded root) must be inside one of these roots.
+    "allowed_workspace_roots": [],
+    "authority_ttl_seconds": 604800,
+    # Opt-in 3.8.0 compatibility: when true, a fresh run's first paid phase may
+    # start above an unusually small ceiling and records admission_overrun.
+    # Default false so every admission enforces committed+reserved+estimate.
+    "allow_first_phase_overrun": False,
+    # P2-2: retry/health. A quarantined component blocks new automatic phases
+    # until deepseek_maintenance action=clear_health.
+    "health_gate": True,
+    "retry_backoff_base_seconds": 1.0,
+    "retry_backoff_cap_seconds": 60.0,
+    # P2-3: reservations left by a dead worker are reclaimed after this lease.
+    "cost_reservation_ttl_seconds": 900,
     # macOS Seatbelt wrapper. "auto" uses sandbox-exec when it is present;
     # "off"/false disables it. It is an extra boundary around DSH, not a
     # container and not a network sandbox.
@@ -300,6 +319,22 @@ ENV_MAP = {
     "DEEPSEEK_SANDBOX": "sandbox",
     "DSH_REVIEWER_SANDBOX": "reviewer_sandbox",
     "DEEPSEEK_REVIEWER_SANDBOX": "reviewer_sandbox",
+    "DSH_ALLOW_WRITING_REVIEWER": "allow_writing_reviewer",
+    "DEEPSEEK_ALLOW_WRITING_REVIEWER": "allow_writing_reviewer",
+    "DSH_ALLOWED_WORKSPACE_ROOTS": "allowed_workspace_roots",
+    "DEEPSEEK_ALLOWED_WORKSPACE_ROOTS": "allowed_workspace_roots",
+    "DSH_AUTHORITY_TTL_SECONDS": "authority_ttl_seconds",
+    "DSH_ALLOW_FIRST_PHASE_OVERRUN": "allow_first_phase_overrun",
+    "DEEPSEEK_ALLOW_FIRST_PHASE_OVERRUN": "allow_first_phase_overrun",
+    "DEEPSEEK_AUTHORITY_TTL_SECONDS": "authority_ttl_seconds",
+    "DSH_HEALTH_GATE": "health_gate",
+    "DEEPSEEK_HEALTH_GATE": "health_gate",
+    "DSH_RETRY_BACKOFF_BASE_SECONDS": "retry_backoff_base_seconds",
+    "DEEPSEEK_RETRY_BACKOFF_BASE_SECONDS": "retry_backoff_base_seconds",
+    "DSH_RETRY_BACKOFF_CAP_SECONDS": "retry_backoff_cap_seconds",
+    "DEEPSEEK_RETRY_BACKOFF_CAP_SECONDS": "retry_backoff_cap_seconds",
+    "DSH_COST_RESERVATION_TTL_SECONDS": "cost_reservation_ttl_seconds",
+    "DEEPSEEK_COST_RESERVATION_TTL_SECONDS": "cost_reservation_ttl_seconds",
     "DSH_OS_SANDBOX": "os_sandbox",
     "DEEPSEEK_OS_SANDBOX": "os_sandbox",
     "DSH_TRANSPORT": "dsh_transport",
@@ -355,7 +390,8 @@ BOOL_KEYS = {"quality", "independent_review", "child_progress",
              "workspace_progress", "live_scaling",
              "auto_skills_allow_single_severe", "auto_skills_refresh",
              "auto_skills_store_evidence_text",
-             "auto_skills_capture_explicit_none"}
+             "auto_skills_capture_explicit_none", "allow_writing_reviewer",
+             "health_gate", "allow_first_phase_overrun"}
 INT_KEYS = {"max_parallel", "default_subagents", "subagent_soft_cap",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
             "task_ttl", "max_explicit_subagents",
@@ -370,10 +406,12 @@ INT_KEYS = {"max_parallel", "default_subagents", "subagent_soft_cap",
             "auto_skills_demote_after", "auto_skills_retire_after_days",
             "auto_skills_max_skills", "auto_skills_max_candidates",
             "auto_skills_max_skill_chars", "auto_skills_max_versions",
-            "auto_skills_refresh_after"}
+            "auto_skills_refresh_after", "authority_ttl_seconds",
+            "cost_reservation_ttl_seconds"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request")}
-LIST_KEYS = {"providers", "consult_models", "add_dirs"}
+LIST_KEYS = {"providers", "consult_models", "add_dirs",
+             "allowed_workspace_roots"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "daily_alert_usd", "daily_limit_usd", "render_probe_timeout",
               "stall_cap_grace_seconds", "stall_cap_extension_seconds",
@@ -388,7 +426,8 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "auto_skills_review_seconds", "auto_skills_build_seconds",
               "auto_skills_max_cost_usd",
               "auto_skills_cluster_cooldown_hours",
-              "auto_skills_refresh_cooldown_days"}
+              "auto_skills_refresh_cooldown_days",
+              "retry_backoff_base_seconds", "retry_backoff_cap_seconds"}
 PATH_KEYS = {"log_dir", "jobs_dir", "pid_file", "skills_dir", "harness_workspace",
              "dsh_sessions_dir", "state_dir", "chrome_bin"}
 

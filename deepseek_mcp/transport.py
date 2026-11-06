@@ -7,9 +7,16 @@ pipe cannot fill up) live on stderr and are never put into exception text.
 Public API (v3.5.0 wave 1, section B)::
 
     SdkClient(dsh_bin, workspace, env=None, timeout=600.0,
-              popen_factory=None, log=None)
+              popen_factory=None, log=None, usage_observer=None)
     .start() .initialize(...) .prompt(...) .wait(...) .close() .run(...)
-    TransportError, SdkUnavailable, fallback_reason(exc)
+    TransportError, SdkUnavailable, BudgetStopped, fallback_reason(exc)
+
+``usage_observer`` is an optional synchronous callback ``(event, usage)``.
+It is invoked from the reader thread as soon as a ``session.event`` carries
+usage; a truthy return value means the whole-job budget ceiling was crossed.
+The client then signals the child process group and aborts the in-flight
+JSON-RPC request with :class:`BudgetStopped`, so the caller can settle the
+usage observed so far instead of waiting for the turn to finish.
 
 Only the Python 3.9 standard library is used.  No network access is performed.
 """
@@ -60,6 +67,15 @@ class SdkUnavailable(TransportError):
 
 class Cancelled(TransportError):
     """The caller's cancel check fired; the SDK child was signalled to stop."""
+
+
+class BudgetStopped(TransportError):
+    """A live usage observer crossed the budget ceiling at an event boundary.
+
+    This is a deliberate interruption, not a transport failure.  The caller
+    must settle the usage observed so far and mark the phase ``budget``; it
+    must not retry or fall back to another transport.
+    """
 
 
 def redact(text):
@@ -236,13 +252,16 @@ class SdkClient:
     """One `dsh --profile sdk` child process speaking JSON-RPC on stdio."""
 
     def __init__(self, dsh_bin, workspace, env=None, timeout=600.0,
-                 popen_factory=None, log=None, command=None):
+                 popen_factory=None, log=None, command=None,
+                 usage_observer=None):
         self.dsh_bin = dsh_bin
         self.workspace = workspace
         self.timeout = float(timeout)
         self.env = dict(env) if env is not None else None
         self.log = log
         self._popen_factory = popen_factory or subprocess.Popen
+        self._usage_observer = usage_observer
+        self._budget_stop_reason = None
         # ``command`` is the complete argv when the caller already wrapped it
         # (for example with the macOS Seatbelt sandbox).  The default keeps
         # the documented ``dsh --profile sdk`` invocation.
@@ -425,12 +444,15 @@ class SdkClient:
 
     def run(self, task, timeout=None, session_id=None, resume=False,
             provider="deepseek-official", model="deepseek-flash",
-            reasoning_effort="max", cancel_check=None):
+            reasoning_effort="max", cancel_check=None, usage_observer=None):
         """initialize -> (resume) -> prompt -> wait -> close.
 
         ``cancel_check`` is polled while each request waits; when it returns
         true the child process group is signalled and :class:`Cancelled` is
-        raised.  The caller's finally block still performs the hard close.
+        raised.  ``usage_observer`` overrides the client-level observer for
+        this run only.  A truthy observer result stops the process group and
+        raises :class:`BudgetStopped` at the usage-event boundary.  The
+        caller's finally block still performs the hard close.
         """
         total = self.timeout if timeout is None else float(timeout)
         deadline = time.monotonic() + total
@@ -440,6 +462,9 @@ class SdkClient:
             return max(0.05, deadline - time.monotonic())
 
         previous_check = self._cancel_check
+        previous_observer = self._usage_observer
+        if usage_observer is not None:
+            self._usage_observer = usage_observer
         self._cancel_check = cancel_check
         try:
             self.start()
@@ -454,6 +479,7 @@ class SdkClient:
             result = self.wait(timeout=remaining())
         finally:
             self._cancel_check = previous_check
+            self._usage_observer = previous_observer
             self.close()
         result["seconds"] = round(time.monotonic() - started, 3)
         result["transport"] = "sdk"
@@ -461,6 +487,10 @@ class SdkClient:
 
     def _request(self, method, params=None, timeout=None):
         self.start()
+        if self._budget_stop_reason is not None:
+            raise BudgetStopped(
+                "live usage crossed the budget ceiling; %s was not sent"
+                % method)
         if self._protocol_error:
             raise SdkUnavailable(self._protocol_error)
         timeout = self.timeout if timeout is None else float(timeout)
@@ -632,6 +662,8 @@ class SdkClient:
             if usage:
                 self._usage.update(usage)
             self._append_event({"method": method, "event": event})
+            if usage:
+                self._notify_usage(event)
         elif method == "session.status":
             status = _find_status(params)
             if status:
@@ -645,6 +677,33 @@ class SdkClient:
             self._append_event(summary)
         else:
             self._append_event({"method": str(method), "params": params})
+
+    @property
+    def usage(self):
+        """Usage observed so far (also preserved after a budget stop)."""
+        return dict(self._usage)
+
+    def _notify_usage(self, event):
+        """Call the live observer at one usage boundary.
+
+        A truthy return is a whole-job budget crossing.  Stop the child
+        process group immediately and fail the in-flight request with
+        :class:`BudgetStopped`; the aggregated ``self._usage`` stays readable
+        so the caller can price and settle what was actually consumed.
+        """
+        observer = self._usage_observer
+        if observer is None or self._budget_stop_reason is not None:
+            return
+        try:
+            reason = observer(event, dict(self._usage))
+        except Exception:
+            return
+        if not reason:
+            return
+        self._budget_stop_reason = str(reason)
+        self._signal_group(signal.SIGTERM)
+        self._fail_all(BudgetStopped(
+            "live usage crossed the budget ceiling at an SDK event boundary"))
 
     def _append_event(self, event):
         self._events.append(event)

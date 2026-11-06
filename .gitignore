@@ -17,6 +17,7 @@ venv/
 env/
 
 # Local runtime data and agent workspaces
+.tmp/
 runs/
 jobs/
 state/

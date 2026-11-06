@@ -5,6 +5,96 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.8.1 — P2 authority, health and cost controls
+
+### Added
+
+- P2-1 authority envelope: every `harness_deepseek` run records a direct
+  authority basis, resolved sandbox, forced read-only reviewer policy,
+  workspace root, whole-job time/cost bounds and agent cap. Resume, rescue,
+  live-scaling, reviewer, revision and automatic-skill phases are
+  continuations that may only narrow the envelope; a resume under stricter
+  config records `policy_drift` and uses the intersection. `reviewer_sandbox`
+  values other than read-only are refused unless the operator sets
+  `allow_writing_reviewer` (then `reviewer_override` is recorded). Optional
+  `allowed_workspace_roots` bounds both new and resumed workspaces. Ancient
+  3.8.0 records get a conservative legacy envelope; a record that advertises
+  authority but cannot supply a valid one fails closed. P1-2 is not
+  implemented, so no `prompt_bundle_hash` is recorded or claimed.
+- P2-2 retry and health state machine: `deepseek_mcp/health.py` classifies
+  provider/network failures, parses `Retry-After`, applies phase-specific
+  attempts (builder 2, reviewer 2, revision 1, rescue 1) with capped
+  exponential backoff, and hard-stops auth/no-balance/prepare/cancel/deadline/
+  budget. A writing-phase retry is refused when a workspace snapshot shows
+  changes outside allowed evidence. A locked `state_dir/health.json` tracks
+  per-component consecutive failures, retry timestamps and quarantine;
+  three consecutive failures quarantine a component and block new automatic
+  phases until `deepseek_maintenance action=clear_health`. `action=health`
+  and the status sections expose the board; completed runs stay readable.
+- P2-3 cost reservation ledger: `CostLedger` reserves a conservative phase
+  estimate at admission, checks `committed + reserved + estimate` against the
+  job ceiling and the daily limit (including active reservations), settles the
+  actual cost per reservation, reclaims expired leases from dead workers, and
+  records `{limit, estimated, reserved, committed, available, cost_known}` in
+  the run record and structured job status. Settlement is idempotent by
+  reservation/operation id, so a repeated settle cannot double-count. Unknown
+  committed or active reservation cost blocks a paid phase whenever a ceiling
+  exists; there is no `allow_unknown_cost` bypass. Live scaling waves reserve
+  and settle like every other paid phase. When a child actually emits priced
+  usage, a whole-job guard (prior committed + live usage + remaining reserve)
+  stops it at that event boundary and the run records `budget_exceeded`. The
+  `sdk` and `auto` transports observe `session.event` usage synchronously,
+  signal the SDK process group and abort the turn at the boundary while keeping
+  the observed usage for settlement; a final-usage fallback covers a client
+  that returns usage without a notification. Transports with no observable
+  live usage stay reserve-at-admission / settle-at-exit.
+
+### Changed
+
+- `deepseek_maintenance` accepts `health` and `clear_health` actions (and an
+  optional `component`), keeping the 20 MCP tool names and existing response
+  prefixes. `deepseek_maintenance action=status` appends a health line.
+- Daily preflight now counts active cost reservations, so concurrent jobs
+  cannot both pass the same daily check.
+- New config keys: `allow_writing_reviewer` (false),
+  `allowed_workspace_roots` (empty), `authority_ttl_seconds` (604800),
+  `health_gate` (true), `retry_backoff_base_seconds` (1.0),
+  `retry_backoff_cap_seconds` (60.0), `cost_reservation_ttl_seconds` (900) and
+  `allow_first_phase_overrun` (false), with `DSH_*`/`DEEPSEEK_*` environment
+  equivalents.
+- Admission is strict by default, including the first paid phase; the old
+  first-phase overrun is opt-in and recorded as `admission_overrun`.
+- Authoritative envelope deserialization is fail-closed (integral version,
+  finite numeric budgets, ISO timestamps, real booleans, absolute workspace
+  root) and an expired grant records `policy_drift` instead of silently
+  refreshing before the check. `Retry-After` obeys the 60 s cap and jitter.
+- Automatic-skill agents now execute only inside the recorded authority
+  workspace: scratch dirs are created under
+  `<workspace_root>/.deepseek/skill-build/...`, verified with the same
+  containment check before every agent call, and refused if they cannot be
+  created inside the grant.
+- Settlement identity is decisive: a named operation that settles after its
+  reservation was released (TTL reclaim/restart) gets its own deterministic
+  committed row instead of borrowing another same-phase row, and stale-row
+  cleanup is scoped to that operation.
+- Every budget stop leaves the running checkpoint phase `interrupted`
+  (builder live stop, reviewer admission/live stop, rescue, revision and
+  live-wave), and already-quarantined rescue/revision entries emit structured
+  health attention. `check_live()` fails closed on unknown active reservations.
+- Test `tests/__init__.py` honours `TMPDIR` (then `TMP`/`TEMP`) and falls back
+  to a verified writable `.tmp` under the repository/workspace, so a read-only
+  reviewer with no usable system temp directory can run the suite.
+- README now explains the three roles (builder, independent reviewer,
+  client/coordinator) and how to route review phases to a different vendor
+  through the shipped `DSH_BIN` hook; it does not claim a reviewer-only model
+  setting that the tree does not have.
+
+### Tests
+
+- 796 tests pass, including `tests/test_p2_authority.py`,
+  `tests/test_p2_health.py`, `tests/test_p2_cost.py` and
+  `tests/test_p2_review_regressions.py` (49 fail-first regressions).
+
 ## 3.8.0 — durable work identity and run journal
 
 ### Added

@@ -32,7 +32,7 @@ class ServerProtocolTests(unittest.TestCase):
         response = server.dispatch("initialize", {"protocolVersion": "2025-06-18"}, cfg=self.cfg())
         self.assertEqual(response["result"]["serverInfo"]["name"],
                          "crewforeman-mcp")
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.8.0")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.8.1")
         instructions = response["result"]["instructions"]
         self.assertIn("checkpoints every phase", instructions)
         self.assertIn("ok_below_gate", instructions)

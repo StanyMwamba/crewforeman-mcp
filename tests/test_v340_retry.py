@@ -103,7 +103,8 @@ class RetryIntegrationTests(unittest.TestCase):
     def test_whole_job_cost_budget_blocks_the_transient_retry(self):
         """The retry is a paid phase: an exceeded ceiling must stop it."""
         with self.assertRaises(RuntimeError):
-            self._run(job={"job_max_cost_usd": 1e-6})
+            self._run(job={"job_max_cost_usd": 1e-6},
+                      DSH_ALLOW_FIRST_PHASE_OVERRUN="1")
         state = json.loads((self.root / "fake-state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["flaky"], 1, "a paid retry started after the ceiling")
         run = json.loads(sorted((self.root / "runs").glob("*.json"))[-1]

@@ -68,6 +68,7 @@ class ScalingHarnessTests(unittest.TestCase):
         return self.counter.read_text(encoding="utf-8").split()
 
     def _run(self, env=None, **extra):
+        env = env or self.env
         args = {
             "prompt": PROMPT,
             "workspace": str(self.workspace),
@@ -79,8 +80,9 @@ class ScalingHarnessTests(unittest.TestCase):
             "live_scaling_max_extra_waves": 1,
         }
         args.update(extra)
-        with mock.patch.dict(os.environ, env or self.env, clear=False):
-            return harness.run_harness(args, self._cfg())
+        with mock.patch.dict(os.environ, env, clear=False):
+            cfg = load_config(config_path=self.root / "config.json", env=env)
+            return harness.run_harness(args, cfg)
 
     def test_weak_first_wave_adds_one_extra_wave(self):
         _text, run, _path = self._run()
@@ -95,7 +97,9 @@ class ScalingHarnessTests(unittest.TestCase):
         self.assertEqual(self._calls().count("builder"), 2)
 
     def test_cost_budget_blocks_extra_wave(self):
-        _text, run, _path = self._run(job_max_cost_usd=1e-6)
+        _text, run, _path = self._run(
+            env=dict(self.env, DSH_ALLOW_FIRST_PHASE_OVERRUN="1"),
+            job_max_cost_usd=1e-6)
         scaling = run["live_scaling"]
         self.assertEqual(scaling["extra_waves_used"], 0)
         decisions = scaling["decisions"]
@@ -109,6 +113,7 @@ class ScalingHarnessTests(unittest.TestCase):
         """No priceable session log + a ceiling: the wave cannot be proven."""
         env = dict(self.env)
         env.pop("FAKE_DSH_SESSIONS", None)
+        env["DSH_ALLOW_FIRST_PHASE_OVERRUN"] = "1"
         _text, run, _path = self._run(env=env, job_max_cost_usd=1.0)
         scaling = run["live_scaling"]
         self.assertEqual(scaling["extra_waves_used"], 0)
@@ -125,7 +130,9 @@ class ScalingHarnessTests(unittest.TestCase):
 
     def test_cost_budget_blocks_the_reviewer_before_it_starts(self):
         """The whole-job ceiling spans the reviewer, not just extra waves."""
-        _text, run, _path = self._run(job_max_cost_usd=1e-6)
+        _text, run, _path = self._run(
+            env=dict(self.env, DSH_ALLOW_FIRST_PHASE_OVERRUN="1"),
+            job_max_cost_usd=1e-6)
         calls = self._calls()
         self.assertEqual(calls.count("builder"), 1)
         self.assertNotIn("review", calls,

@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.8.0)
+# Known limitations and failure modes (3.8.1)
 
 Only limitations that remain in this version are listed here.
 
