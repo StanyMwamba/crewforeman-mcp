@@ -17,12 +17,58 @@ import time
 from pathlib import Path
 
 from . import events as events_mod
+from . import admission as admission_mod
 from . import platforms, providers, safety, tasks, work
 from .api import redact_secrets
 from .config import ENTRY_SCRIPT, load_config
 
 _status_path = None
 _work_ctx = None
+_admission_store = None
+_admission_work_id = None
+_admission_token = None
+_admission_last_hb = 0.0
+_admission_released = False
+_admission_controllers = {}
+_admission_controllers_lock = threading.Lock()
+
+
+def _admission_store_for(cfg):
+    root = os.path.join(str(_cfg_get(cfg, "state_dir", os.path.join(os.getcwd(), "state"))), "queue")
+    return admission_mod.AdmissionStore(
+        root,
+        heartbeat_seconds=float(_cfg_get(cfg, "admission_heartbeat_seconds", 30.0) or 30.0),
+        lease_seconds=float(_cfg_get(cfg, "admission_lease_seconds", 90.0) or 90.0))
+
+
+def _admission_controller(cfg):
+    """One controller (and therefore one dispatcher) per state directory."""
+    root = str(_cfg_get(cfg, "state_dir", os.path.join(os.getcwd(), "state")))
+    with _admission_controllers_lock:
+        controller = _admission_controllers.get(root)
+        if controller is None:
+            controller = admission_mod.AdmissionController(
+                cfg, store=_admission_store_for(cfg))
+            _admission_controllers[root] = controller
+        return controller
+
+
+def _admission_note_status(status):
+    global _admission_last_hb, _admission_released
+    if _admission_store is None or not _admission_work_id or _admission_released:
+        return
+    try:
+        if status in ("done", "error", "cancelled"):
+            _admission_store.release(_admission_work_id, status=status,
+                                     token=_admission_token)
+            _admission_released = True
+        elif status in (None, "running") and _admission_token is not None:
+            interval = max(1.0, float(_admission_store.heartbeat_seconds) / 2.0)
+            if time.monotonic() - _admission_last_hb >= interval:
+                if _admission_store.heartbeat(_admission_work_id, _admission_token, pid=os.getpid()):
+                    _admission_last_hb = time.monotonic()
+    except Exception:
+        pass
 _listeners = {}
 _listener_lock = threading.Lock()
 
@@ -196,6 +242,7 @@ def write_status(path, **fields):
             pass
         raise
     _notify(path.name.split(".", 1)[0], current)
+    _admission_note_status(fields.get("status"))
 
 
 def progress(text):
@@ -300,6 +347,11 @@ def cancel_job(run_id, cfg=None, reason="cancelled by client"):
             _signal_group(target, signal.SIGKILL)
     write_status(status_path, status="cancelled", progress="cancelled",
                  error=reason, cancel_reason=reason)
+    try:
+        queue_id = state.get("admission_work_id") or run_id
+        _admission_store_for(cfg).release(queue_id, status="cancelled")
+    except Exception:
+        pass
     work_id = state.get("work_id")
     if work_id:
         canonical = _canonical_run_id(work_id, cfg)
@@ -327,8 +379,34 @@ def tool_cancel(args, cfg=None):
 
 
 def run_job(spec_path, handlers, cfg=None):
-    """Entry point of a detached worker process."""
+    """Entry point of a detached worker process.
+
+    Worker globals are process-wide; restoring them in ``finally`` keeps an
+    in-process caller (and sequential tests) from leaving ``progress()`` and
+    heartbeat writes pointed at a stale job status file.
+    """
     global _status_path, _work_ctx
+    global _admission_store, _admission_work_id, _admission_token
+    global _admission_last_hb, _admission_released
+    saved = (_status_path, _work_ctx, _admission_store, _admission_work_id,
+             _admission_token, _admission_last_hb, _admission_released)
+    try:
+        return _run_job_impl(spec_path, handlers, cfg)
+    finally:
+        (_status_path, _work_ctx, _admission_store, _admission_work_id,
+         _admission_token, _admission_last_hb, _admission_released) = saved
+
+
+def _run_job_impl(spec_path, handlers, cfg=None):
+    """Implementation of :func:`run_job`; owns the worker globals."""
+    global _status_path, _work_ctx
+    global _admission_store, _admission_work_id, _admission_token
+    global _admission_last_hb, _admission_released
+    _admission_store = None
+    _admission_work_id = None
+    _admission_token = None
+    _admission_last_hb = 0.0
+    _admission_released = False
     spec_path = Path(spec_path)
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
@@ -363,7 +441,23 @@ def run_job(spec_path, handlers, cfg=None):
     work_id = spec.get("work_id") or spec_args.get("_work_id")
     attempt_no = spec.get("attempt_no") or spec_args.get("_attempt_no")
     _work_ctx = (work_id, cfg, run_id) if work_id else None
+    try:
+        _aw = spec.get("admission_work_id")
+        _at = spec.get("admission_token")
+        if _aw and _at is not None:
+            _admission_store = _admission_store_for(cfg)
+            _admission_work_id = str(_aw)
+            _admission_token = int(_at)
+            _admission_last_hb = 0.0
+            _admission_released = False
+    except Exception:
+        _admission_store = None
     if existing.get("status") == "cancelled":
+        try:
+            _admission_store.release(_admission_work_id, status="cancelled",
+                                     token=_admission_token)
+        except Exception:
+            pass
         if work_id:
             if not _has_terminal(work_id, cfg):
                 _event(work_id, cfg, "cancelled", {
@@ -570,6 +664,101 @@ def _resume_work_identity(cfg, source_run_id):
     return str(work_id), attempt_no
 
 
+def _spawn_worker(spec, status, log_path, cfg, entry=None, python=None):
+    """Popen the detached ``--job`` worker; shared by immediate and queued starts."""
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    log_handle = os.fdopen(log_fd, "ab")
+    try:
+        if entry:
+            worker_cmd = [python or sys.executable, str(entry), "--job", str(spec)]
+            worker_cwd = str(Path(entry).parent)
+        elif ENTRY_SCRIPT.is_file():
+            worker_cmd = [python or sys.executable, str(ENTRY_SCRIPT), "--job", str(spec)]
+            worker_cwd = str(ENTRY_SCRIPT.parent)
+        else:
+            worker_cmd = [python or sys.executable, "-m", "deepseek_mcp",
+                          "--job", str(spec)]
+            worker_cwd = str(Path(cfg.jobs_dir))
+        return subprocess.Popen(
+            worker_cmd,
+            stdin=subprocess.DEVNULL, stdout=log_handle, stderr=log_handle,
+            cwd=worker_cwd, env=_worker_env(cfg),
+            **platforms.popen_kwargs(),
+        )
+    finally:
+        log_handle.close()
+
+
+def _rewrite_admission_spec(record, spec_path):
+    """Persist the claimed work id/token into the queueable job spec."""
+    path = Path(spec_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["admission_work_id"] = record.get("work_id")
+    data["admission_token"] = record.get("fencing_token")
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
+def _status_is_cancelled(status_path):
+    try:
+        state = json.loads(Path(status_path).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return state.get("status") == "cancelled"
+
+
+def _dispatch_admitted(record, cfg):
+    """Spawn a worker for a record claimed by the persistent dispatcher."""
+    spec_path = record.get("spec_path")
+    if not spec_path:
+        try:
+            _admission_store_for(cfg).release(record.get("work_id"), status="failed")
+        except Exception:
+            pass
+        return None
+    _rewrite_admission_spec(record, spec_path)
+    data = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    run_id = data.get("run_id")
+    jobs_dir = Path(cfg.jobs_dir)
+    status = jobs_dir / (run_id + ".status.json")
+    if _status_is_cancelled(status):
+        try:
+            _admission_store_for(cfg).release(
+                record.get("work_id"), status="cancelled",
+                token=record.get("fencing_token"))
+        except Exception:
+            pass
+        return None
+    entry = data.get("worker_entry") or None
+    python = data.get("worker_python") or None
+    child = _spawn_worker(spec_path, status, jobs_dir / (run_id + ".log"), cfg,
+                          entry=entry, python=python)
+    try:
+        if record.get("fencing_token") is not None:
+            _admission_store_for(cfg).heartbeat(
+                record.get("work_id"), record.get("fencing_token"),
+                pid=child.pid)
+    except Exception:
+        pass
+    try:
+        write_status(status, status="running", pid=child.pid, queue_position=0,
+                     priority=record.get("priority"),
+                     priority_label=record.get("priority_label"))
+    except Exception:
+        pass
+    return child
+
+
+def resume_admission(cfg):
+    """Start the lazy persistent-queue dispatcher (idempotent)."""
+    controller = _admission_controller(cfg)
+    controller.start(spawn=lambda record: _dispatch_admitted(record, cfg))
+    return controller
+
+
 def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
               progress_cb=None, cancel_event=None, on_start=None):
     """Start a detached job and wait up to ``wait`` seconds for its result.
@@ -681,6 +870,8 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         "run_id": run_id,
         "args": safe_args,
         "config_path": config_path,
+        "worker_entry": str(entry) if entry else None,
+        "worker_python": str(python) if python else None,
     }
     if resume_identity is not None:
         spec_data.update({
@@ -693,6 +884,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             "attempt_no": admission["attempt_no"],
             "fingerprint": fingerprint,
         })
+    spec_data["admission_work_id"] = (admission or {}).get("work_id") or run_id
     spec.write_text(json.dumps(spec_data, ensure_ascii=False), encoding="utf-8")
     try:
         os.chmod(str(spec), 0o600)
@@ -703,6 +895,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         "status": "queued", "tool": tool,
         "title": call_args.get("title") or call_args.get("prompt", "")[:60],
         "created": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "admission_work_id": run_id,
     }
     if resume_identity is not None:
         queued.update({
@@ -728,46 +921,134 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             "tool": tool,
         })
     log_path = jobs_dir / (run_id + ".log")
-    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    log_handle = os.fdopen(log_fd, "ab")
-    try:
+    priority = (admission_mod.PRIORITY_RESUME
+                if tool == "resume_deepseek" or call_args.get("resume_run_id")
+                else admission_mod.PRIORITY_BUILD)
+    # One queue record per run attempt. The durable P1 work id can be shared
+    # by several attempts (dedupe disabled); the run id is the queue identity.
+    queue_work_id = run_id
+    controller = _admission_controller(cfg)
+    spawned_child = {"child": None}
+
+    def _spawn_record(record):
+        # A shared dispatcher may start a record created by an earlier call;
+        # always use the spec/status paths stored on that record.
+        record_spec = Path(record.get("spec_path") or spec)
+        record_run_id = record.get("run_id") or run_id
+        record_status = jobs_dir / (record_run_id + ".status.json")
+        record_log = jobs_dir / (record_run_id + ".log")
         try:
-            # The worker only gets keys it can actually use; unrelated server
-            # credentials are dropped instead of forked into every job.
-            if entry:
-                worker_cmd = [python or sys.executable, str(entry), "--job", str(spec)]
-                worker_cwd = str(Path(entry).parent)
-            elif ENTRY_SCRIPT.is_file():
-                worker_cmd = [python or sys.executable, str(ENTRY_SCRIPT),
-                              "--job", str(spec)]
-                worker_cwd = str(ENTRY_SCRIPT.parent)
-            else:
-                # Installed wheel/pipx/uvx: there is no adjacent entry script.
-                worker_cmd = [python or sys.executable, "-m", "deepseek_mcp",
-                              "--job", str(spec)]
-                worker_cwd = str(Path(cfg.jobs_dir))
-            child = subprocess.Popen(
-                worker_cmd,
-                stdin=subprocess.DEVNULL, stdout=log_handle, stderr=log_handle,
-                cwd=worker_cwd, env=_worker_env(cfg),
-                **platforms.popen_kwargs(),
-            )
+            _rewrite_admission_spec(record, record_spec)
         except Exception as exc:
-            message = "Could not start job: %s" % exc
-            if admission:
-                _event(admission["work_id"], cfg, "failed", {
-                    "run_id": run_id, "error": message})
-                _result(admission["work_id"], cfg, message, "error", run_id)
-                _finish_work(admission["work_id"], cfg, "error", run_id)
-            write_status(status, status="error", progress="failed", error=message)
+            log("admission token persist skipped: %s" % exc)
+        try:
+            record_data = json.loads(record_spec.read_text(encoding="utf-8"))
+        except Exception:
+            record_data = {}
+        record_entry = record_data.get("worker_entry") or None
+        record_python = record_data.get("worker_python") or None
+        if _status_is_cancelled(record_status):
+            return None
+        child = _spawn_worker(record_spec, record_status, record_log, cfg,
+                              record_entry, record_python)
+        if record_run_id == run_id:
+            spawned_child["child"] = child
+        try:
+            if record.get("fencing_token") is not None:
+                controller.store.heartbeat(record.get("work_id"),
+                                           record.get("fencing_token"),
+                                           pid=child.pid)
+        except Exception:
+            pass
+        try:
+            write_status(record_status, status="running", pid=child.pid,
+                         queue_position=0,
+                         admission_work_id=record_run_id,
+                         priority=record.get("priority", priority),
+                         priority_label=admission_mod.priority_label(
+                             record.get("priority", priority)))
+        except Exception:
+            pass
+        return child
+
+    def _fail_start(message):
+        """Record a failed start without ever spawning a worker."""
+        message = redact_secrets(str(message))
+        failed_work = ((admission or {}).get("work_id")
+                       or spec_data.get("work_id"))
+        if failed_work:
+            _event(failed_work, cfg, "failed", {
+                "run_id": run_id, "error": message})
+            _result(failed_work, cfg, message, "error", run_id)
+            _finish_work(failed_work, cfg, "error", run_id)
+        try:
+            write_status(status, status="error", progress="failed",
+                         error=message)
+        except Exception:
+            pass
+        return message
+
+    # The bounded queue is scoped to Harness jobs. ask/consult/swarm keep the
+    # pre-P3 direct spawn path: an operator cap for Harness children must not
+    # silently queue unrelated tools.
+    if tool in ("harness_deepseek", "resume_deepseek"):
+        try:
+            submitted = controller.submit(
+                queue_work_id, priority=priority, run_id=run_id,
+                spec_path=str(spec), tool=tool, spawn=_spawn_record)
+        except Exception as exc:
+            # Fail closed: if the queue or its lock cannot be acquired, do not
+            # bypass max_harness_jobs with an unbounded direct spawn.
+            try:
+                controller.store.release(queue_work_id, status="failed")
+            except Exception:
+                pass
+            message = _fail_start(
+                "Admission unavailable; job not started: %s" % exc)
+            log(message)
             raise RuntimeError(message)
-    finally:
-        log_handle.close()
+    else:
+        try:
+            _spawn_record({"work_id": queue_work_id, "fencing_token": None})
+        except Exception as exc:
+            message = _fail_start("Could not start job: %s" % exc)
+            raise RuntimeError(message)
+        submitted = {"state": "started", "position": 0, "priority": priority,
+                     "priority_label": admission_mod.priority_label(priority)}
+    # A task-augmented caller must learn the run id before either return path
+    # (queued or started), otherwise the MCP task completes on the queue
+    # marker while the detached job is still pending.
     if on_start:
         try:
             on_start(run_id, status)
         except Exception:
             pass
+    if submitted.get("state") == "queued":
+        fields = {}
+        try:
+            fields = controller.store.status_fields(queue_work_id)
+        except Exception:
+            pass
+        position = fields.get("queue_position")
+        if position is None:
+            position = submitted.get("position")
+        if position is None:
+            position = 1
+        label = submitted.get("priority_label") or admission_mod.priority_label(priority)
+        write_status(status, status="queued", queue_position=position,
+                     priority=submitted.get("priority"), priority_label=label,
+                     holder=fields.get("holder"),
+                     lease_until=fields.get("lease_until"),
+                     admission_work_id=queue_work_id)
+        # A queue-only submit needs a live dispatcher in this process; the
+        # startup dispatcher exits when it has nothing to do.
+        try:
+            controller.start(spawn=_spawn_record)
+        except Exception as exc:
+            log("admission dispatcher start skipped: %s" % exc)
+        return ("[DeepSeek job ID %s queued at position %d (%s); it will start "
+                "when a slot frees. Check deepseek_job_status run_id=%s.]"
+                % (run_id, position, label, run_id))
 
     last_seen = None
 
@@ -797,22 +1078,26 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         state = snapshot()
         cancelled(state)
         if state.get("status") == "done":
-            try:
-                child.wait(timeout=5)
-            except Exception:
-                pass
+            if spawned_child["child"] is not None:
+                try:
+                    spawned_child["child"].wait(timeout=5)
+                except Exception:
+                    pass
             return state.get("result", "")
         if state.get("status") == "error":
-            try:
-                child.wait(timeout=5)
-            except Exception:
-                pass
+            if spawned_child["child"] is not None:
+                try:
+                    spawned_child["child"].wait(timeout=5)
+                except Exception:
+                    pass
             raise RuntimeError(state.get("error") or "Job failed")
         pid = state.get("pid")
         if state.get("status") == "running" and pid and not _pid_alive(pid):
             raise RuntimeError("Job %s stopped without finishing (last step: %s)"
                                % (run_id, state.get("progress")))
-        if child.poll() is not None and state.get("status") in ("queued", "running"):
+        if (spawned_child["child"] is not None
+                and spawned_child["child"].poll() is not None
+                and state.get("status") in ("queued", "running")):
             # Give an atexit status write a moment, then surface the failure.
             time.sleep(0.2)
             state = snapshot()
@@ -836,6 +1121,25 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
 
 def _valid_run_id(run_id):
     return bool(run_id) and Path(run_id).name == run_id and run_id not in (".", "..")
+
+
+def _admission_status_fields(cfg, run_id, state):
+    """Queue projection for a run id; zeros/nulls once running or done."""
+    work_id = state.get("admission_work_id") or run_id
+    try:
+        fields = _admission_store_for(cfg).status_fields(work_id)
+    except Exception:
+        fields = {}
+    position = fields.get("queue_position")
+    if position is None:
+        position = state.get("queue_position") or 0
+    return {
+        "queue_position": position,
+        "priority": fields.get("priority", state.get("priority")),
+        "priority_label": fields.get("priority_label") or state.get("priority_label"),
+        "holder": fields.get("holder"),
+        "lease_until": fields.get("lease_until"),
+    }
 
 
 def _structured_status(args, state, run_id, cfg):
@@ -887,6 +1191,7 @@ def _structured_status(args, state, run_id, cfg):
     if work_id:
         payload["work_id"] = work_id
     payload["run_id"] = run_id
+    payload.update(_admission_status_fields(cfg, run_id, state))
     # P2-3: the reservation view is part of the structured status contract.
     # The plain (no events_since) text response stays byte-for-byte compatible.
     payload["cost"] = (run or {}).get("cost_ledger")
@@ -924,8 +1229,16 @@ def tool_status(args, cfg=None):
     if not path.exists():
         raise RuntimeError("No background job with id %r" % run_id)
     state = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        state.update(_admission_status_fields(cfg, run_id, state))
+    except Exception:
+        pass
     if "events_since" in args and args.get("events_since") is not None:
         return _structured_status(args, state, run_id, cfg)
+    if state.get("status") == "queued":
+        return ("[DeepSeek job ID %s queued at position %d (%s); waiting for a "
+                "free slot.]" % (run_id, state.get("queue_position") or 0,
+                                 state.get("priority_label") or "P1 new build"))
     if state.get("status") == "done":
         return state.get("result", "")
     if state.get("status") == "error":

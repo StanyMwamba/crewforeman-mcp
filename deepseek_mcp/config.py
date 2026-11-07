@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.8.1"
+SERVER_VERSION = "3.9.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -103,6 +103,12 @@ DEFAULTS = {
     "job_max_seconds": 7200.0,
     "job_max_cost_usd": None,
     "max_parallel": 10,
+    # P3-1: bounded, fair admission of Harness child jobs. 0 disables the
+    # connector-side cap (the Harness child limit still applies).
+    "max_harness_jobs": 4,
+    "reserve_resume_slot": True,
+    "admission_heartbeat_seconds": 30.0,
+    "admission_lease_seconds": 90.0,
     "wait_seconds": 45.0,
     "default_subagents": 16,
     "subagent_soft_cap": 32,
@@ -129,7 +135,17 @@ DEFAULTS = {
     "transient_retry": True,
     "quality": True,
     "quality_max_rounds": 3,
+    # P3-2: "observe" records the would-stop convergence decision but keeps the
+    # normal loop; "auto" stops the revision loop and asks one question.
+    "quality_convergence": "observe",
     "independent_review": True,
+    # R1: before review the connector runs the full test suite on the reviewed
+    # tree and hands the reviewer signed evidence. "auto" detects a tests/
+    # directory; "" disables; a string/list overrides the command.
+    "review_test_suite": "auto",
+    "review_test_command": "",
+    "review_test_timeout_seconds": 300.0,
+    "review_context_max_chars": 60000,
     "daily_alert_usd": None,
     "daily_limit_usd": None,
     "max_file_chars": 400000,
@@ -239,6 +255,10 @@ DEFAULTS = {
 # Environment variable -> config key. New names are listed first; legacy v2
 # names keep working so existing MCP launch configs do not need editing.
 ENV_MAP = {
+    "DSH_MAX_HARNESS_JOBS": "max_harness_jobs",
+    "DEEPSEEK_MAX_HARNESS_JOBS": "max_harness_jobs",
+    "DSH_RESERVE_RESUME_SLOT": "reserve_resume_slot",
+    "DEEPSEEK_RESERVE_RESUME_SLOT": "reserve_resume_slot",
     "DEEPSEEK_MCP_LOG_DIR": "log_dir",
     "DEEPSEEK_MCP_JOBS_DIR": "jobs_dir",
     "DEEPSEEK_MCP_PID_FILE": "pid_file",
@@ -308,6 +328,12 @@ ENV_MAP = {
     "DEEPSEEK_QUALITY": "quality",
     "DSH_QUALITY_ROUNDS": "quality_max_rounds",
     "DEEPSEEK_QUALITY_ROUNDS": "quality_max_rounds",
+    "DSH_QUALITY_CONVERGENCE": "quality_convergence",
+    "DEEPSEEK_QUALITY_CONVERGENCE": "quality_convergence",
+    "DSH_REVIEW_TEST_SUITE": "review_test_suite",
+    "DEEPSEEK_REVIEW_TEST_SUITE": "review_test_suite",
+    "DSH_REVIEW_TEST_COMMAND": "review_test_command",
+    "DEEPSEEK_REVIEW_TEST_COMMAND": "review_test_command",
     "DSH_INDEPENDENT_REVIEW": "independent_review",
     "DEEPSEEK_INDEPENDENT_REVIEW": "independent_review",
     "DSH_DAILY_ALERT_USD": "daily_alert_usd",
@@ -391,8 +417,9 @@ BOOL_KEYS = {"quality", "independent_review", "child_progress",
              "auto_skills_allow_single_severe", "auto_skills_refresh",
              "auto_skills_store_evidence_text",
              "auto_skills_capture_explicit_none", "allow_writing_reviewer",
-             "health_gate", "allow_first_phase_overrun"}
-INT_KEYS = {"max_parallel", "default_subagents", "subagent_soft_cap",
+             "health_gate", "allow_first_phase_overrun",
+             "reserve_resume_slot"}
+INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
             "task_ttl", "max_explicit_subagents",
             "live_scaling_max_extra_waves", "retention_days", "keep_runs",
@@ -409,10 +436,13 @@ INT_KEYS = {"max_parallel", "default_subagents", "subagent_soft_cap",
             "auto_skills_refresh_after", "authority_ttl_seconds",
             "cost_reservation_ttl_seconds"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
-             "task_completion": ("job", "request")}
+             "task_completion": ("job", "request"),
+             "quality_convergence": ("observe", "auto")}
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "allowed_workspace_roots"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
+              "admission_heartbeat_seconds", "admission_lease_seconds",
+              "review_test_timeout_seconds",
               "daily_alert_usd", "daily_limit_usd", "render_probe_timeout",
               "stall_cap_grace_seconds", "stall_cap_extension_seconds",
               "stall_cap_hard_max_seconds",
@@ -427,7 +457,8 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "auto_skills_max_cost_usd",
               "auto_skills_cluster_cooldown_hours",
               "auto_skills_refresh_cooldown_days",
-              "retry_backoff_base_seconds", "retry_backoff_cap_seconds"}
+              "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
+              "review_context_max_chars"}
 PATH_KEYS = {"log_dir", "jobs_dir", "pid_file", "skills_dir", "harness_workspace",
              "dsh_sessions_dir", "state_dir", "chrome_bin"}
 

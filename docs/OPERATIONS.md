@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.8.1)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -57,6 +57,107 @@ cursor older than the retained window receives the retained events rather than
 an error. Terminal work is never collapsed into a cached result: a later
 identical request starts a new attempt under the same work id, including one
 selected by an explicit idempotency key, and the attempt history stays auditable.
+
+### Admission control (P3-1)
+
+`harness_deepseek` and `resume_deepseek` jobs pass through
+`deepseek_mcp/admission.py`. `ask_deepseek`, `consult_deepseek` and
+`swarm_deepseek` keep their pre-P3 direct-start behaviour, so the Harness cap
+never queues unrelated tools. The operator cap is `max_harness_jobs` (default
+**4**, `DSH_MAX_HARNESS_JOBS`); `0` means unlimited. A positive value is clamped to the Harness child capacity detected
+by `concurrency.detect`, so `max_harness_jobs=64` cannot exceed the installed
+Harness limit. Raising the cap above the detected limit only produces a run
+record note; the effective value is the lower one.
+
+Queue and lease state lives under `<state_dir>/queue/`:
+
+* `items/<run_id>.json` is the durable queue record (`priority`, `created`,
+  `spec_path`, `fencing_token`, `status`).
+* `leases/<run_id>.json` is the live lease (`pid`, `host`, `heartbeat`,
+  `lease_until`, `fencing_token`). A worker refreshes it from
+  `jobs.write_status` (throttled); the dispatcher reclaims a record when its
+  pid is dead or its lease expired after three missed heartbeat intervals.
+  Reclaiming bumps the fencing token, so a late heartbeat or an old worker
+  cannot re-take the slot.
+* Per-work lock files fail closed: if the lock cannot be acquired, admission
+  raises `AdmissionError` and the job is marked failed; the connector never
+  falls back to a direct spawn, so a broken queue cannot start an unbounded
+  job. A queue-wide `queue.lock` wraps the capacity check plus claim in one
+  interprocess critical section, so two server processes (or two controller
+  instances) admitting different run ids cannot both take the last slot. The
+  queue assumes a local filesystem; network-share lock semantics are not
+  guaranteed. Queue/lock failures are recorded in the job status and the P1
+  work item as a sanitized error.
+
+A P0 record is created for `resume_deepseek` (or a call carrying
+`resume_run_id`); every new build is P1. With `reserve_resume_slot` on (the
+default), a queued P0 keeps one slot free: a P1 may not take the last free
+slot while a resume waits. P0 may use the reserved slot. A **running** job is
+never suspended or cancelled to make room. Set `reserve_resume_slot=false` for
+a single-operator install that prefers plain priority/FIFO.
+
+`serve()` starts one lazy dispatcher thread; it starts the oldest eligible
+record, re-checks after every claim, and exits when the queue is empty. If the
+server exits, queued records stay on disk and the next server start drains
+them; already-running jobs remain detached and continue. `deepseek_job_status`
+adds `queue_position` (1-based among pending records, 0 once running),
+`priority`, `priority_label`, `holder` (worker pid) and `lease_until`.
+
+### Review convergence and cost controls (P3-2, R1-R3)
+
+`quality_convergence` is `observe` (default) or `auto`
+(`DSH_QUALITY_CONVERGENCE`). Review rounds are parsed into defect signatures
+(SHA-256 of normalized kind + file anchor + evidence type) and persisted with
+`first_seen_round`. If the same blocking signature repeats in **K=2**
+consecutive rounds, `auto` stops before buying another revision and emits one
+attention question with options `resume_with_scope`, `accept_below_gate` and
+`stop`; `observe` records `quality_convergence.action=observe_stop` and keeps
+the normal loop so the operator can see the would-stop decision first. A
+question is emitted at most once per work item. The stop is durable: the work
+item is held and `result.json` is written as `needs_input` before any terminal
+event, and `_finalize_work()` folds the same question into the terminal save,
+so the MCP task reports `input_required` with the question/options instead of
+completing. When every blocking finding is cosmetic and the score is within
+tolerance of the 8.5 gate, the loop stops after the first revision instead of
+polishing rounds indefinitely.
+
+A stop is not a dead end: `resume_deepseek run_id=<id> option="resume_with_scope"
+answer="<narrower scope>"` reopens exactly one revision at the stopped review
+round. The scope note is passed to that revision prompt, the two historical
+signature rounds do not stop that manual cycle before the revision runs, and
+the following review applies normal convergence again. `option="accept_below_gate"`
+accepts the current result below the gate, and `option="stop"` ends the work;
+both resolve the pending question, record `attention_resolution`, write a
+terminal `ok_below_gate` result and finish the work item so the MCP task
+completes instead of staying `input_required`.
+
+The connector reduces reviewer cost without lowering the gate:
+
+* **R1 (signed test evidence):** before each review the connector runs the full
+  suite on the exact reviewed tree (auto-detects `tests/` with `test_*.py`, or
+  use `review_test_command`; `review_test_suite=""` disables it). The reviewer
+  receives an HMAC-signed result with tree SHA-256, test/failure/error counts,
+  output SHA-256 and a bounded output tail. It trusts that evidence for the
+  named tree, reruns only new or defect-related tests, and may rerun everything
+  when suspicious. A tree hash that changes during the run invalidates the
+  evidence and is flagged. The HMAC key lives only in
+  `<state_dir>/review-evidence/keys/connector.key` (0600); the evidence names
+  `key_id=connector`, and `review_context.verify_evidence()` reloads that key
+  to verify the exact signed payload (tampering fails).
+* **R2 (diff first):** a bounded baseline is captured before the builder. The
+  reviewer starts from the unified diff and surrounding context instead of
+  reading the whole repository; the prompt says so explicitly.
+* **R3 (targeted re-review):** round 1 is a full review. The baseline is
+  recaptured immediately before each revision writes, so the next round
+  receives exactly that revision's new diff (not an empty diff and not the
+  cumulative diff since the original builder) plus the previously flagged
+  blocking defects and only the changed files' immediate context.
+
+`review_context_max_chars` bounds the diff text (default 60000).
+`review_test_timeout_seconds` (default 300) is the connector test hard timeout.
+The baseline copy is bounded (256 KiB per file, 400 files); larger or binary
+files are recorded in the manifest with an `excluded` reason and listed as
+changed/added/deleted with a metadata-only body.
 
 ## Safety and sandboxing
 

@@ -12,7 +12,11 @@ from tests.fakes import FakeDeepSeekServer, base_env
 
 class JobTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        base = os.environ.get("TMPDIR") or os.getcwd()
+        try:
+            self.tmp = tempfile.TemporaryDirectory(dir=base)
+        except OSError:
+            self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
@@ -29,6 +33,34 @@ class JobTests(unittest.TestCase):
         self.assertEqual(jobs.tool_status({"run_id": "test-run"}, cfg), "inline result")
         listing = jobs.tool_status({}, cfg)
         self.assertIn("test-run", listing)
+
+    def test_run_job_restores_worker_globals(self):
+        env = base_env(self.root)
+        cfg = load_config(config_path=self.root / "config.json", env=env)
+        job_dir = self.root / "jobs"
+        job_dir.mkdir()
+        spec = job_dir / "restore.job.json"
+        spec.write_text(json.dumps({"tool": "ask_deepseek",
+                                    "run_id": "restore-run",
+                                    "args": {"prompt": "hi"}}),
+                        encoding="utf-8")
+        sentinel_status = self.root / "sentinel.status.json"
+        sentinel_ctx = ("sentinel-work", None, "sentinel-run")
+        saved = (jobs._status_path, jobs._work_ctx, jobs._admission_store,
+                 jobs._admission_work_id, jobs._admission_token,
+                 jobs._admission_last_hb, jobs._admission_released)
+        self.addCleanup(lambda: setattr(jobs, "_status_path", saved[0]))
+        self.addCleanup(lambda: setattr(jobs, "_work_ctx", saved[1]))
+        jobs._status_path = sentinel_status
+        jobs._work_ctx = sentinel_ctx
+        with mock.patch.dict(os.environ,
+                             {"DEEPSEEK_NO_CAFFEINATE": "1"}, clear=False):
+            jobs.run_job(spec, {"ask_deepseek": lambda args: "inline result"},
+                         cfg)
+        self.assertEqual(jobs._status_path, sentinel_status)
+        self.assertEqual(jobs._work_ctx, sentinel_ctx)
+        self.assertFalse(sentinel_status.exists())
+        self.assertTrue((job_dir / "restore-run.status.json").exists())
 
     def test_worker_receives_the_spec_config(self):
         custom = self.root / "custom.json"

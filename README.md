@@ -1,6 +1,6 @@
 # CrewForeman
 You send a brief; CrewForeman sizes a team, builds in waves, has an independent reviewer score the result, and revises until it passes or runs out of tries.
-CrewForeman 3.8.1 is a local stdio MCP server. It runs DeepSeek Harness on your machine and saves a record of every run.
+CrewForeman 3.9.0 is a local stdio MCP server. It runs DeepSeek Harness on your machine and saves a record of every run.
 ## Roles
 | Role | Who | What it does |
 |---|---|---|
@@ -86,6 +86,7 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 ## Guarantees
 - It runs locally over standard input/output (stdio) using JSON-RPC. There is no hosted service, network listener or database. Tools include `consult_deepseek`, `harness_deepseek`, jobs and skills.
 - Team size and exact waves follow the limit on parallel helper agents. One whole-job budget covers time and estimated cost for every phase. An optional daily cap applies across jobs.
+- Harness jobs run through a bounded queue: `max_harness_jobs` (default `4`, `0` = unlimited) caps concurrent jobs and queues the rest in order.
 - Blocking review defects come with an ordered fix list before the next review.
 - Every Harness run is saved as Markdown and JSON with token usage, estimated cost and the review trail. Resume a killed run with `resume_deepseek`.
 

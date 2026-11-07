@@ -32,6 +32,7 @@ from . import observability
 from . import platforms
 from . import progress
 from . import render
+from . import review_context
 from . import safety
 from . import scaling
 from . import spend as spend_mod
@@ -40,8 +41,9 @@ from . import transport as transport_mod
 from . import work as work_mod
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
                       build_review_task, build_revision_task, choose_agents,
-                      extract_quality_score, parse_review, plan_escalation,
-                      quality_default, recurring_lessons)
+                      convergence_decision, extract_quality_score, parse_review,
+                      persist_signatures, plan_escalation, quality_default,
+                      recurring_lessons)
 from .skills import (append_lesson, detect_skill, detect_skill_legacy,
                      detect_skill_match, distill_lesson, lesson_signal,
                      load_skill)
@@ -1924,8 +1926,164 @@ def _is_no_balance(*executions):
     import re as _re
     text = " ".join(str(item.get("error") or "") + " " + str(item.get("stderr_tail") or "")
                     for item in executions if item)
-    return bool(_re.search(r"Insufficient Balance|\bQUOTA\b|HTTP\s*402|\b402 Payment",
-                           text, _re.IGNORECASE))
+    return bool(_re.search(
+        r"Insufficient Balance|exceeded_current_quota_error|insufficient_quota|"
+        r"quota_exceeded|\bQUOTA\b|HTTP\s*402|\b402 Payment",
+        text, _re.IGNORECASE))
+
+
+_KIMI_RE = re.compile(r"kimi|moonshot", re.IGNORECASE)
+_DEEPSEEK_RE = re.compile(r"deepseek", re.IGNORECASE)
+_OPENAI_RE = re.compile(r"\bopenai\b|\bgpt[-_ ]?[0-9a-z]", re.IGNORECASE)
+_ANTHROPIC_RE = re.compile(r"anthropic|\bclaude\b", re.IGNORECASE)
+_QUOTA_RE = re.compile(
+    r"exceeded_current_quota_error|insufficient\s+balance|\bQUOTA\b|"
+    r"HTTP\s*402|\b402\b|payment required", re.IGNORECASE)
+_RATE_LIMIT_RE = re.compile(
+    r"rate[\s_-]*limit|HTTP\s*429|\b429\b|too many requests", re.IGNORECASE)
+_AUTH_RE = re.compile(
+    r"HTTP\s*(?:401|403)|\b(?:401|403)\b|unauthori[sz]ed|forbidden|"
+    r"invalid\s+(?:api[\s_-]*)?key|authentication|permission denied",
+    re.IGNORECASE)
+
+
+def _provider_tokens(value):
+    """Flatten execution/config values into one lowercase signal string."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(_provider_tokens(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_provider_tokens(item) for item in value)
+    return str(value)
+
+
+def provider_family(text=None, cfg=None, execution=None):
+    """Classify the paid endpoint as deepseek/kimi/openai/anthropic/provider.
+
+    Hints are read in strict precedence order: the execution's endpoint/model
+    fields first, then the configured ``dsh_provider``/``dsh_model``/
+    ``providers``, then ``base_url``/``model`` defaults, and only then the free
+    error text. A config value must never override what the failed process
+    actually ran on; otherwise a DeepSeek execution with a stale Kimi setting
+    is reported as a Kimi quota problem (and vice versa). Within one tier Kimi
+    still wins over DeepSeek because a Kimi 429 must never be reported as a
+    DeepSeek balance problem.
+    """
+    execution = execution or {}
+
+    def first_match(haystack):
+        if _KIMI_RE.search(haystack):
+            return "kimi"
+        if _DEEPSEEK_RE.search(haystack):
+            return "deepseek"
+        if _ANTHROPIC_RE.search(haystack):
+            return "anthropic"
+        if _OPENAI_RE.search(haystack):
+            return "openai"
+        return None
+
+    def cfg_value(key):
+        try:
+            return cfg.get(key)
+        except Exception:
+            return getattr(cfg, key, None)
+
+    # Tier 1: what the failed execution actually ran. provider/model/models
+    # identify the endpoint; base_url is included in the same tier because a
+    # proxy URL still belongs to the process that failed.
+    if isinstance(execution, dict):
+        parts = []
+        for key in ("provider", "model", "models", "base_url",
+                    "dsh_provider", "dsh_model"):
+            if execution.get(key) is not None:
+                parts.append(_provider_tokens(execution.get(key)))
+        family = first_match(" ".join(parts))
+        if family:
+            return family
+    # Tier 2: explicit configuration hints, used only when the execution did
+    # not name a vendor.
+    if cfg is not None:
+        parts = []
+        for key in ("dsh_provider", "dsh_model", "providers"):
+            value = cfg_value(key)
+            if value:
+                parts.append(_provider_tokens(value))
+        family = first_match(" ".join(parts))
+        if family:
+            return family
+        # Tier 3: config defaults such as the built-in DeepSeek base_url.
+        parts = []
+        for key in ("base_url", "model"):
+            value = cfg_value(key)
+            if value:
+                parts.append(_provider_tokens(value))
+        family = first_match(" ".join(parts))
+        if family:
+            return family
+    # Tier 4: free error text, the weakest signal.
+    family = first_match(_provider_tokens(text))
+    if family:
+        return family
+    return "provider"
+
+
+def _provider_label(family):
+    return {"kimi": "Kimi (Moonshot)", "deepseek": "DeepSeek",
+            "openai": "OpenAI", "anthropic": "Anthropic"}.get(
+                family, "the configured provider")
+
+
+def provider_error_message(execution=None, cfg=None, role="reviewer"):
+    """Name the real vendor and cause for a paid reviewer/builder failure.
+
+    The text is redacted before it is returned and never claims DeepSeek when
+    the execution actually used another endpoint.
+    """
+    execution = execution or {}
+    error_text = ""
+    if isinstance(execution, dict):
+        error_text = " ".join(str(execution.get(key) or "") for key in
+                              ("error", "stderr_tail", "status_detail"))
+    family = provider_family(text=error_text, cfg=cfg, execution=execution)
+    label = _provider_label(family)
+    text = error_text
+
+    if _QUOTA_RE.search(text) or (
+            _RATE_LIMIT_RE.search(text) and re.search(r"quota|balance", text,
+                                                      re.IGNORECASE)):
+        if family == "kimi":
+            return ("Kimi (Moonshot) %s quota is exhausted: top up or raise "
+                    "the limit at platform.moonshot.cn (platform.moonshot.ai "
+                    "outside mainland China), then retry." % role)
+        if family == "deepseek":
+            return NO_BALANCE_MESSAGE
+        return ("%s %s quota is exhausted: check the provider plan and billing "
+                "in its console, then retry." % (label, role))
+
+    if _RATE_LIMIT_RE.search(text):
+        if family == "provider":
+            return ("The configured provider %s hit a rate limit (HTTP 429); "
+                    "wait and retry." % role)
+        return "%s %s hit a rate limit (HTTP 429); wait and retry." % (
+            label, role)
+
+    if _AUTH_RE.search(text):
+        keys = {"kimi": "MOONSHOT_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+                "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+        key = keys.get(family)
+        if key:
+            remedy = ("check %s or the %s console" % (key, label))
+        else:
+            remedy = "check the provider API key and console"
+        return "%s %s authentication failed: %s." % (label, role, remedy)
+
+    tail = api.redact_secrets(text.strip())
+    if len(tail) > 300:
+        tail = tail[:297] + "..."
+    if tail:
+        return "%s %s failed: %s" % (label, role, tail)
+    return "%s %s failed without a provider error message." % (label, role)
 
 
 _TRANSIENT_ERROR_RE = re.compile(
@@ -2200,6 +2358,24 @@ def _finalize_work(run, cfg):
     text = run.get("answer")
     if text is None:
         text = run.get("error") or ""
+    convergence_attention = run.get("convergence_attention")
+    if (log_obj is not None and events_mod.validate_attention(text) is None
+            and isinstance(convergence_attention, dict)
+            and convergence_attention.get("question")):
+        # P3-2: a convergence stop already appended its needs_input event in the
+        # review loop, but the request text is only fenced by the caller after
+        # this save. Without folding the question into *this* text, the
+        # terminal result below would clear the pending question and the MCP
+        # task would complete instead of asking the human. Serialise the exact
+        # payload (question + options + evidence) here so record_attention can
+        # dedupe to the already-emitted event and no terminal event is written.
+        try:
+            block = json.dumps(convergence_attention, ensure_ascii=False,
+                               sort_keys=True)
+            text = ((text or "").rstrip() + "\n\n```attention\n%s\n```\n"
+                    % block).lstrip()
+        except (TypeError, ValueError):
+            pass
     if log_obj is not None and text:
         question = events_mod.validate_attention(text)
         if question is not None:
@@ -2317,6 +2493,8 @@ def _prior_rounds(manifest):
                 "blocking_defects": int(data.get("blocking") or 0),
                 "defects": list(data.get("defects") or []),
                 "fixes": list(data.get("fixes") or []),
+                "signatures": list(data.get("signatures") or []),
+                "first_seen_round": dict(data.get("first_seen_round") or {}),
                 "visual_impact": data.get("visual_impact"),
                 "creative_cap": bool(data.get("creative_cap")),
                 "seconds": data.get("seconds"),
@@ -2777,6 +2955,24 @@ def _health_attention(run, cfg, component, entry):
     return _emit_run_event(
         run, cfg, "progress",
         health.structured_attention(component, entry, run_id=run.get("id")))
+
+
+def _emit_convergence_attention(run, cfg, payload):
+    """Append one needs_input convergence question (deduped on resume)."""
+    log_obj = _run_event_log(run, cfg)
+    if log_obj is None or not isinstance(payload, dict):
+        return None
+    question = payload.get("question")
+    try:
+        for event in reversed(log_obj.read_since(0)):
+            if event.get("type") != "needs_input":
+                continue
+            prior = event.get("payload") or {}
+            if prior.get("question") == question:
+                return event
+        return log_obj.append("needs_input", payload)
+    except Exception:
+        return None
 
 
 def _health_block_attention(run, cfg, board, component, message=None):
@@ -3251,6 +3447,54 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     overall_started = time.time()
     executions = []
     used_logs = set()
+    # R2: capture a bounded baseline before the builder writes, so the
+    # reviewer can start from the connector diff instead of the whole repo.
+    review_baseline = None
+    review_baseline_root = None
+    review_baseline_round = None
+    resumed_baseline = False
+    if independent:
+        try:
+            baseline_root = (Path(cfg.state_dir) / "review-baselines" / run["id"])
+            saved_baseline = args.get("_review_baseline_dir")
+            if saved_baseline:
+                # A resume starts from an already-revised workspace. Reload
+                # the pre-revision baseline captured before the original
+                # revision so the next review still sees that revision's diff.
+                candidate = os.path.abspath(os.path.expanduser(
+                    str(saved_baseline)))
+                allowed = os.path.abspath(os.path.join(
+                    str(cfg.state_dir), "review-baselines"))
+                if candidate == allowed or candidate.startswith(
+                        allowed + os.sep):
+                    loaded = review_context.load_baseline(candidate)
+                    if loaded is not None:
+                        review_baseline = loaded
+                        baseline_root = Path(candidate)
+                        resumed_baseline = True
+                        try:
+                            review_baseline_round = int(args.get(
+                                "_review_baseline_round"))
+                        except (TypeError, ValueError):
+                            review_baseline_round = None
+                    else:
+                        run["review_baseline_resume_error"] = (
+                            "saved baseline manifest missing or unreadable: %s"
+                            % api.redact_secrets(str(candidate)))
+            if review_baseline is None:
+                review_baseline = review_context.capture_baseline(
+                    workspace, baseline_root)
+            review_baseline_root = baseline_root
+            run["review_baseline"] = {
+                "dir": str(baseline_root),
+                "sha256": review_baseline.get("sha256"),
+                "files": len(review_baseline.get("files") or []),
+            }
+            if review_baseline_round is not None:
+                run["review_baseline"]["round"] = review_baseline_round
+        except Exception as exc:
+            run["review_baseline_error"] = api.redact_secrets(str(exc))
+            review_baseline = None
     if checkpoint:
         try:
             checkpoint.begin("builder")
@@ -3579,9 +3823,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         totals = _sum_executions(executions)
         run.update(totals)
         run["status"] = "no_balance"
-        run["error"] = NO_BALANCE_MESSAGE
+        run["error"] = provider_error_message(builder, cfg, role="builder")
         path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
-        raise RuntimeError("%s%s" % (NO_BALANCE_MESSAGE, _saved_note(run, path)))
+        raise RuntimeError("%s%s" % (run["error"], _saved_note(run, path)))
 
     if builder.get("status") != "ok":
         candidates = (_rescue_candidates(workspace, review_scope)
@@ -3790,7 +4034,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 run["output_files"] = sorted(primary_outputs)
                 if _is_no_balance(finisher):
                     run["status"] = "no_balance"
-                    run["error"] = NO_BALANCE_MESSAGE
+                    run["error"] = provider_error_message(
+                        finisher, cfg, role="builder")
                 else:
                     run["status"] = "error"
                     run["error"] = (
@@ -4189,6 +4434,29 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         }
         accepted_review = prior_reviews[number]
 
+    # A manual convergence answer reopens exactly one revision at the round
+    # whose review triggered the stop. The historical repeated signature is
+    # allowed to pass this one decision so the scoped revision can run; the
+    # following review still applies normal convergence.
+    scope_resume = args.get("_scope_resume")
+    scope_round = None
+    scope_note = ""
+    if isinstance(scope_resume, dict) and accepted_review is None:
+        try:
+            scope_round = int(scope_resume.get("round") or 0)
+        except (TypeError, ValueError):
+            scope_round = None
+        scope_note = str(scope_resume.get("note") or "").strip()
+    if scope_round is None or not scope_note:
+        scope_resume = None
+        scope_round = None
+        scope_note = ""
+    if scope_resume:
+        run["manual_scope_resume"] = {
+            "round": scope_round,
+            "note": api.redact_secrets(scope_note),
+        }
+
     if independent:
         # Reuse every finished phase. Rounds are a prefix: the first phase
         # that is not ``done`` is where this attempt starts.
@@ -4290,11 +4558,82 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     except Exception:
                         pass
                 _stash_old(workspace, "REVIEW.md", run["id"], round_no=round_no)
+                # R1: the connector, not the builder, runs the full suite on
+                # the exact tree and signs the result for the reviewer.
+                test_evidence = None
+                try:
+                    suite_mode = cfg.get("review_test_suite", "auto")
+                    disabled = (suite_mode is False or suite_mode is None
+                                or str(suite_mode).strip().lower() in ("", "off",
+                                                                       "none",
+                                                                       "false"))
+                    if not disabled:
+                        command = cfg.get("review_test_command") or None
+                        mode_text = str(suite_mode).strip().lower()
+                        if mode_text in ("auto", "true", "1", "on"):
+                            suite_arg = command
+                        elif isinstance(suite_mode, (list, tuple)):
+                            suite_arg = list(suite_mode)
+                        else:
+                            suite_arg = command or suite_mode
+                        suite_timeout = float(cfg.get(
+                            "review_test_timeout_seconds", 300.0) or 300.0)
+                        remaining = job_budget.remaining_seconds()
+                        if remaining is not None:
+                            suite_timeout = min(suite_timeout,
+                                                max(0.0, remaining))
+                        if suite_timeout <= 0:
+                            raise RuntimeError(
+                                "no whole-job time left for connector tests")
+                        test_evidence = review_context.run_test_suite(
+                            workspace, command=suite_arg,
+                            timeout=suite_timeout,
+                            key_store=str(cfg.state_dir),
+                            metadata={"round": round_no})
+                        # Keep the exact signed payload (including key_id) so a
+                        # later connector pass can verify the evidence it
+                        # handed to the reviewer; tampering must fail.
+                        evidence_record = dict(test_evidence)
+                        run.setdefault("review_test_evidence", []).append(
+                            evidence_record)
+                except Exception as exc:
+                    test_evidence = None
+                    run["review_test_error"] = api.redact_secrets(str(exc))
+                review_diff = ""
+                prior_defects = []
+                prior_signatures = []
+                if round_no > 1:
+                    prior_entry = next(
+                        (item for item in reversed(review_rounds)
+                         if item.get("kind") == "review"), None)
+                    if prior_entry:
+                        prior_defects = [str(item) for item in
+                                         (prior_entry.get("defects") or [])
+                                         if str(item).strip()]
+                        prior_signatures = [str(item) for item in
+                                            (prior_entry.get("signatures") or [])
+                                            if str(item).strip()]
+                if review_baseline is not None:
+                    try:
+                        review_diff = review_context.review_focus_text(
+                            review_baseline, workspace,
+                            prior_defects=prior_defects,
+                            prior_signatures=prior_signatures,
+                            max_chars=int(cfg.get("review_context_max_chars",
+                                                  60000) or 60000),
+                            round_no=round_no)
+                    except Exception as exc:
+                        run["review_context_error"] = api.redact_secrets(str(exc))
                 review_task = build_review_task(
                     prompt, deliverable_files, skill=skill,
                     quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
                     task_type=run.get("task_type"),
-                    browser_evidence=render.evidence_hint(browser_evidence))
+                    browser_evidence=render.evidence_hint(browser_evidence),
+                    review_context=review_diff,
+                    prior_defects=prior_defects,
+                    prior_signatures=prior_signatures,
+                    test_evidence=(review_context.format_test_evidence(
+                        test_evidence) if test_evidence else None))
                 _persist(run, cfg, "review-%d" % round_no)
                 if trace:
                     trace.event("review-%d" % round_no, "start",
@@ -4514,6 +4853,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                      and score >= DEFAULT_QUALITY_TARGET
                                      and blocking == 0),
                 }
+                try:
+                    persist_signatures(review_rounds, entry)
+                except Exception:
+                    entry.setdefault("signatures", [])
+                    entry.setdefault("first_seen_round", {})
                 review_rounds.append(entry)
                 if checkpoint and str(review.get("stop_reason")) != "budget":
                     try:
@@ -4523,6 +4867,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             score=score, blocking=blocking,
                             accepted=entry["accepted"],
                             defects=defects, fixes=fixes,
+                            signatures=entry.get("signatures"),
+                            first_seen_round=entry.get("first_seen_round"),
                             visual_impact=entry["visual_impact"],
                             creative_cap=entry["creative_cap"],
                             seconds=review.get("seconds"),
@@ -4545,8 +4891,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                           and int(item.get("round") or 0) == round_no), None)
             if review.get("status") != "ok":
                 review_status = "error"
-                review_error = (NO_BALANCE_MESSAGE if _is_no_balance(review)
-                                else review.get("error") or "reviewer run failed")
+                review_error = (
+                    provider_error_message(review, cfg, role="reviewer")
+                    if _is_no_balance(review) or review.get("error")
+                    else "reviewer run failed")
                 if str(review.get("stop_reason")) == "budget":
                     run["status"] = "budget_exceeded"
                     run["stop_reason"] = "budget"
@@ -4577,6 +4925,47 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 if entry is not None:
                     entry["accepted"] = True
                 break
+            # P3-2: stop buying the same fix. The decision is computed from
+            # blocking signatures; observe records it without enforcing.
+            convergence_mode = str(cfg.get("quality_convergence", "observe")
+                                   or "observe").strip().lower()
+            if convergence_mode not in ("observe", "auto"):
+                convergence_mode = "observe"
+            decision = convergence_decision(
+                review_rounds, mode=convergence_mode,
+                target=DEFAULT_QUALITY_TARGET)
+            run["quality_convergence"] = dict(decision, mode=convergence_mode)
+            if entry is not None:
+                entry["convergence"] = {
+                    "action": decision.get("action"),
+                    "reason": decision.get("reason"),
+                    "signatures": decision.get("signatures") or [],
+                    "first_seen_round": decision.get("first_seen_round"),
+                    "cosmetic_only": bool(decision.get("cosmetic_only")),
+                }
+            if decision.get("action") == "stop":
+                if scope_resume is not None and int(round_no) == scope_round:
+                    # One manual scoped cycle is allowed. Record that the
+                    # historical signature was intentionally overridden once.
+                    run["manual_scope_resume"]["suppressed_stop_round"] = (
+                        int(round_no))
+                else:
+                    run["convergence_stopped"] = True
+                    attention = {
+                        "question": decision.get("question"),
+                        "options": list(decision.get("options") or []),
+                        "evidence": list(decision.get("evidence") or []),
+                    }
+                    run["convergence_attention"] = attention
+                    try:
+                        _emit_convergence_attention(run, cfg, attention)
+                    except Exception:
+                        pass
+                    review_status = "stopped"
+                    review_error = None
+                    break
+            if decision.get("action") == "observe_stop":
+                run["convergence_observed"] = True
             if round_no >= rounds:
                 review_status = "stopped"
                 break
@@ -4595,10 +4984,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             if escalation:
                 escalations.append(escalation)
             _stash_old(workspace, "REVIEW.md", run["id"], round_no=round_no)
+            round_scope = (scope_note if (scope_resume is not None
+                                          and int(round_no) == scope_round)
+                           else None)
             revision_task = build_revision_task(
                 prompt, deliverable_files, fixes, defects, skill=skill,
                 quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
-                escalation=escalation, task_type=run.get("task_type"))
+                escalation=escalation, task_type=run.get("task_type"),
+                scope_note=round_scope)
             if checkpoint:
                 try:
                     checkpoint.begin("revision-%d" % round_no)
@@ -4661,6 +5054,36 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     if _guard.observe(usage, _model_from_event(event)):
                         return "budget"
                     return None
+            # R3: capture the tree *before* the revision writes, so the next
+            # review's connector diff is exactly what this revision changed.
+            # Capturing after it made the next diff empty and discarded the
+            # very fix the reviewer must inspect.
+            if (review_baseline_root is not None
+                    and not (resumed_baseline
+                             and review_baseline_round == round_no)):
+                try:
+                    review_baseline = review_context.capture_baseline(
+                        workspace, review_baseline_root)
+                    review_baseline_round = round_no
+                    run["review_baseline"] = {
+                        "dir": str(review_baseline_root),
+                        "sha256": review_baseline.get("sha256"),
+                        "files": len(review_baseline.get("files") or []),
+                        "round": round_no,
+                    }
+                    run.setdefault("review_baseline_refreshes", []).append(
+                        round_no)
+                    run.pop("review_baseline_refresh_error", None)
+                    # Make the current round's baseline durable *before* the
+                    # revision writes. A kill during the revision then leaves
+                    # a resume that can reuse this exact pre-revision tree
+                    # instead of recapturing the partially revised workspace.
+                    _persist(run, cfg, "revision-%d_baseline" % round_no)
+                except Exception as exc:
+                    # Keep the previous baseline: the next diff is then a
+                    # cumulative superset, never an empty one.
+                    run["review_baseline_refresh_error"] = (
+                        api.redact_secrets(str(exc)))
             revision = _execute_once(
                 cfg, workspace, revision_task,
                 limit=job_budget.phase_limit(limit),
@@ -4738,8 +5161,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             _persist(run, cfg, "revision-%d_done" % round_no)
             if revision.get("status") != "ok":
                 review_status = "error"
-                review_error = (NO_BALANCE_MESSAGE if _is_no_balance(revision)
-                                else revision.get("error") or "revision run failed")
+                review_error = (
+                    provider_error_message(revision, cfg, role="revision")
+                    if _is_no_balance(revision) or revision.get("error")
+                    else "revision run failed")
                 break
             deliverable_files = _deliverable_files(
                 workspace, _union_files(run.get("output_files"),
@@ -4929,6 +5354,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         except Exception:
             pass
     text = _result_text(run, path)
+    convergence_attention = run.get("convergence_attention")
+    if isinstance(convergence_attention, dict) and convergence_attention.get("question"):
+        text = text.rstrip() + "\n\n```attention\n%s\n```\n" % json.dumps(
+            convergence_attention, ensure_ascii=False, sort_keys=True)
     warnings = []
     if run.get("rescued"):
         warnings.append(_rescue_warning(run))
@@ -5014,7 +5443,45 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
             next_phase = str(name)
             break
 
-    if accepted_review is not None or next_phase is None:
+    # P3-2: a convergence stop finalized the run with the repeated defect
+    # signature unanswered. ``resume_with_scope`` must reopen one
+    # revision/review cycle before the "nothing left to execute" return;
+    # otherwise the advertised remedy is a no-op.
+    scope_option = str(args.get("option") or "").strip().lower()
+    scope_answer = str(args.get("answer") or "").strip()
+    last_review_round = max(
+        [int(item.get("round") or 0) for item in prior_rounds
+         if isinstance(item, dict) and item.get("kind") == "review"] or [0])
+    scope_resume = bool(
+        scope_option == "resume_with_scope"
+        and accepted_review is None
+        and last_review_round > 0
+        and (saved.get("convergence_attention")
+             or saved.get("convergence_stopped")))
+    scope_round = last_review_round if scope_resume else None
+    scope_note = ""
+    if scope_resume:
+        scope_note = scope_answer or (
+            "Address only the blocking defect(s) repeated in the last review; "
+            "keep the rest of the deliverable unchanged and verify the fix.")
+    if scope_resume:
+        resume_quality_rounds = int(
+            saved.get("quality_rounds") or spec.get("quality_rounds") or 1)
+        resume_quality_rounds = max(resume_quality_rounds,
+                                    last_review_round + 1)
+        saved["quality_rounds"] = resume_quality_rounds
+    # The convergence question advertises accept_below_gate and stop as
+    # terminal answers as well as resume_with_scope.  They must resolve the
+    # pending question instead of copying it into the no-op resume and letting
+    # _finalize_work hold the work as needs_input forever.
+    convergence_pending = bool(saved.get("convergence_attention")
+                               or saved.get("convergence_stopped"))
+    terminal_option = (
+        scope_option if (scope_option in ("accept_below_gate", "stop")
+                         and accepted_review is None and convergence_pending)
+        else "")
+    if not scope_resume and (accepted_review is not None or next_phase is None
+                             or terminal_option):
         # Nothing left to execute: the accepted review (or the last phase) is
         # the result. Never launch a DSH process just to re-print it.
         result = dict(saved)
@@ -5110,6 +5577,25 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
             result.setdefault(
                 "status_detail",
                 status_mod.STATUS_MEANING.get(result.get("status"), ""))
+        if terminal_option:
+            attention = result.get("convergence_attention")
+            question = ((attention or {}).get("question")
+                        if isinstance(attention, dict) else None)
+            result["attention_resolution"] = terminal_option
+            result["attention_question"] = (
+                api.redact_secrets(str(question))[:500] if question else None)
+            result["attention_resolved"] = True
+            result["accepted_below_gate"] = (
+                terminal_option == "accept_below_gate")
+            result["convergence_resolution"] = {
+                "option": terminal_option,
+                "resolved": True,
+            }
+            result["review_status"] = "stopped"
+            result["review_passed"] = False
+            # Clearing this is what lets _finalize_work record a terminal
+            # result and finish the work item instead of asking again.
+            result.pop("convergence_attention", None)
         result["status_vocabulary"] = "3.6"
         try:
             history_runs = load_runs(cfg)
@@ -5160,6 +5646,12 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
                 pass
         except Exception as exc:
             saved["work_error"] = api.redact_secrets(str(exc))
+    saved_baseline_dir = None
+    saved_baseline_round = None
+    saved_baseline = saved.get("review_baseline")
+    if isinstance(saved_baseline, dict) and saved_baseline.get("dir"):
+        saved_baseline_dir = str(saved_baseline["dir"])
+        saved_baseline_round = saved_baseline.get("round")
     resume_args = {
         "prompt": prompt,
         "workspace": workspace,
@@ -5187,6 +5679,16 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }
+    if saved_baseline_dir:
+        resume_args["_review_baseline_dir"] = saved_baseline_dir
+        if saved_baseline_round is not None:
+            resume_args["_review_baseline_round"] = saved_baseline_round
+    if scope_resume:
+        resume_args["quality_rounds"] = int(saved["quality_rounds"])
+        resume_args["_scope_resume"] = {
+            "round": int(scope_round),
+            "note": scope_note,
+        }
     if work_id:
         resume_args["_work_id"] = str(work_id)
         resume_args["_attempt_no"] = resume_attempt

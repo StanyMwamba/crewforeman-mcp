@@ -1931,7 +1931,8 @@ def dispatch(method, params=None, tool_mode="all", cfg=None, context=None):
                 "expose the DeepSeek and Harness tools.")
         else:
             instructions = (
-                "crewforeman-mcp 3.8: a generic MCP stdio server for DeepSeek "
+                f"crewforeman-mcp {SERVER_VERSION}: a generic MCP stdio server "
+                "for DeepSeek "
                 "text models and the separately installed DeepSeek Harness. Use "
                 "ask_deepseek for one cheap text call; consult_deepseek for "
                 "independent answers from configured OpenAI-compatible models; "
@@ -2074,6 +2075,11 @@ def handle(msg, tool_mode="all", cfg=None):
 
 def serve(tool_mode="all", cfg=None):
     cfg = _cfg(cfg)
+    try:
+        from . import jobs as _jobs
+        _jobs.resume_admission(cfg)
+    except Exception as exc:
+        log("admission dispatcher skipped: %s" % exc)
     log("crewforeman-mcp v%s started; model=%s; reasoning=%s; parallel=%s; "
         "runs=%s; tools=%s"
         % (SERVER_VERSION, cfg.model, cfg.reasoning, cfg.max_parallel, cfg.log_dir, tool_mode))

@@ -5,6 +5,7 @@ many subagents to use, writes unambiguous instructions into the task text and
 extracts the final quality score from the workspace afterwards.
 """
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -1322,8 +1323,15 @@ def build_finisher_task(prompt, candidate_files, stop_reason="stalled",
 
 def build_review_task(prompt, deliverable_files, skill=None,
                       quality_target=DEFAULT_QUALITY_TARGET, round_no=1,
-                      task_type=None, browser_evidence=None):
-    """Task text for the connector-owned, independent REVIEWER run."""
+                      task_type=None, browser_evidence=None,
+                      review_context=None, prior_defects=None,
+                      test_evidence=None, prior_signatures=None):
+    """Task text for the connector-owned, independent REVIEWER run.
+
+    ``review_context`` is the connector diff (R2), ``prior_defects`` the
+    previously flagged blocking defects (R3), and ``test_evidence`` the
+    signed connector test result for this exact tree (R1).
+    """
     files = list(deliverable_files or [])
     parts = [
         "You are the INDEPENDENT REVIEWER. You did not build these deliverables. A separate "
@@ -1353,9 +1361,40 @@ def build_review_task(prompt, deliverable_files, skill=None,
                      % str(browser_evidence).strip())
     if task_type == "creative":
         parts.append(_creative_review_contract())
+    if test_evidence:
+        parts.append("\n\n%s\n" % str(test_evidence).strip())
+    if review_context:
+        parts.append("\n\n## Connector review context\n\n%s\n"
+                     % str(review_context).strip())
+    if int(round_no) > 1:
+        defects = [str(item).strip() for item in (prior_defects or [])
+                   if str(item).strip()]
+        focused = (
+            "\n\n## Focused round %d\n"
+            "This is a targeted re-review, not another full review. Start from the "
+            "connector diff above and verify the previously flagged defects first. "
+            "Read surrounding context only for changed files; do not read the whole "
+            "repo. Re-run only new or defect-related tests, unless the signed evidence "
+            "looks suspicious.\n" % int(round_no)
+        )
+        if defects:
+            focused += "\nPreviously flagged defects to verify:\n\n%s\n" % (
+                "\n".join("- %s" % item for item in defects))
+        if prior_signatures and not review_context:
+            focused += ("\nP3-2 defect signatures from the prior round: %s\n"
+                        % ", ".join("`%s`" % str(item)[:12]
+                                    for item in prior_signatures
+                                    if str(item).strip()))
+        parts.append(focused)
     parts.append(
         "\n\n## Review method\n"
-        "1. Open every listed file. For images, PDFs and visual output, render or convert as "
+        "0. Start from the connector diff and the signed test evidence when provided. "
+        "Trust the signed result for the exact tree hash it names; rerun only new or "
+        "defect-related tests, or rerun everything if the evidence looks suspicious. "
+        "Round 1 is a full review; later rounds focus on the flagged defects and "
+        "the new diff. Do not read the whole repository when a diff is provided.\n"
+        "1. Open the listed deliverable files and the files named in the connector diff. "
+        "Do not read the whole repository when a diff is provided. For images, PDFs and visual output, render or convert as "
         "needed and inspect with `read_image` at the target size; check overflow, clipping, "
         "overlap, minimum type size, empty areas, required facts and QR codes. For code, run "
         "the build/tests and inspect the entry point. For documents, check completeness, facts, "
@@ -1388,8 +1427,14 @@ def build_review_task(prompt, deliverable_files, skill=None,
 
 def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
                         skill=None, quality_target=DEFAULT_QUALITY_TARGET,
-                        round_no=1, escalation=None, task_type=None):
-    """Task text for a connector-owned REVISION run after a failed review."""
+                        round_no=1, escalation=None, task_type=None,
+                        scope_note=None):
+    """Task text for a connector-owned REVISION run after a failed review.
+
+    ``scope_note`` is the operator's manual ``resume_with_scope`` note after a
+    P3-2 convergence stop; it narrows the resumed revision instead of letting
+    the same historical defect signature stop the cycle before it starts.
+    """
     files = list(deliverable_files or [])
     parts = [
         "You are the REVISION agent. An independent reviewer (not you) inspected the "
@@ -1410,10 +1455,32 @@ def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
             % ("\n".join("- %s" % item for item in blocking_defects))
         )
     if fix_list:
+        # Suppress fixes that belong only to non-blocking findings. Keep the
+        # full list when no fix can be matched (never drop the actionable
+        # list merely because the reviewer phrased it differently).
+        selected = list(fix_list)
+        if blocking_defects:
+            anchors = []
+            for defect in blocking_defects:
+                anchor = _file_anchor(defect)
+                if anchor:
+                    anchors.append(anchor)
+            if anchors:
+                matched = [fix for fix in selected
+                           if any(anchor in str(fix) for anchor in anchors)]
+                if matched:
+                    selected = matched
         parts.append(
             "\n\n## Fix list (address in order)\n\n%s\n"
             % ("\n".join("%d. %s" % (index, item)
-                         for index, item in enumerate(fix_list, 1)))
+                         for index, item in enumerate(selected, 1)))
+        )
+    if scope_note:
+        parts.append(
+            "\n\n## Manual resume scope (operator)\n\n"
+            "This revision was requested manually after a convergence stop. "
+            "Keep the work inside this scope while fixing the blocking "
+            "defects above:\n\n%s\n" % str(scope_note).strip()
         )
     if files:
         parts.append(
@@ -1688,3 +1755,302 @@ def quality_verdict(score, blocking_defects=0, round_no=1, max_rounds=DEFAULT_QU
     if int(round_no) >= int(max_rounds):
         return "stop"
     return "revise"
+
+
+# -- P3-2: review convergence and one-question handoff ----------------------
+# Pure helpers used by the Lead's review loop.  Signatures are deliberately
+# coarse (kind + basename/line + evidence type) so the same defect carried
+# across rounds converges without making cosmetic polish look substantive.
+_COSMETIC_RE = re.compile(
+    r"\b(?:cosmetic|polish|aesthetic|spacing|alignment|colour palette|"
+    r"color palette|palette|wording)\b", re.IGNORECASE)
+_SUBSTANTIVE_RE = re.compile(
+    r"\b(?:font[\s-]?size|contrast|accessib\w*|missing|fact|crash\w*|"
+    r"tests?|broken|qr|overflow\w*)\b", re.IGNORECASE)
+_EVIDENCE_TEST_RE = re.compile(
+    r"\b(?:tests?|pytest|unittest|assert\w*|build (?:failed|fails)|"
+    r"failing test)\b", re.IGNORECASE)
+_EVIDENCE_SHOT_RE = re.compile(
+    r"\b(?:screenshots?|screen shots?|images?|png|jpe?g|render\w*|visual)\b",
+    re.IGNORECASE)
+_EVIDENCE_LOG_RE = re.compile(
+    r"\b(?:logs?|traceback|stderr|stdout|console|error output)\b", re.IGNORECASE)
+_EVIDENCE_CODE_RE = re.compile(
+    r"\b(?:code|function|module|import|syntax|api|class|variable)\b",
+    re.IGNORECASE)
+_PATH_TOKEN_RE = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/])?(?:[.~\w-]+[\\/])*"
+    r"[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,9}(?::\d+)?", re.IGNORECASE)
+
+
+def normalise_defect(text):
+    """Lowercase and flatten a defect sentence for conservative comparison."""
+    value = str(text or "").lower()
+    value = re.sub(r"(?m)^\s*(?:[-*\u2022\u00b7]+|\d+[.)])\s*", " ", value)
+    value = value.replace("\u2010", "-").replace("\u2011", "-")
+    value = value.replace("\u2012", "-").replace("\u2013", "-")
+    value = value.replace("\u2014", "-").replace("\u2015", "-")
+    value = value.replace("colour", "color").replace("centre", "center")
+    value = re.sub(r"[^a-z0-9./:_-]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .,;:-")
+    return value
+
+
+def _file_anchor(text):
+    """First path-like token as basename[:line]; never an absolute path."""
+    for match in _PATH_TOKEN_RE.finditer(str(text or "")):
+        token = match.group(0).replace("\\", "/").rstrip(".,;:)")
+        line = ""
+        if ":" in token:
+            base, maybe_line = token.rsplit(":", 1)
+            if maybe_line.isdigit():
+                token, line = base, ":" + maybe_line
+        name = token.rsplit("/", 1)[-1]
+        if not name or name in (".", "..") or ".." in name:
+            continue
+        if name.rsplit(".", 1)[-1].isdigit():
+            continue
+        return name + line
+    return ""
+
+
+def _evidence_type(text):
+    value = str(text or "")
+    if _EVIDENCE_TEST_RE.search(value):
+        return "test"
+    if _EVIDENCE_SHOT_RE.search(value):
+        return "screenshot"
+    if _EVIDENCE_LOG_RE.search(value):
+        return "log"
+    if _EVIDENCE_CODE_RE.search(value):
+        return "code"
+    return "text"
+
+
+def defect_signature(text):
+    """Stable 64-hex SHA-256 of kind | file anchor | evidence type."""
+    kind = defect_kind(text)
+    anchor = _file_anchor(text)
+    evidence = _evidence_type(text)
+    seed = "%s|%s|%s" % (kind, anchor, evidence)
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def defect_signatures(defects):
+    """Sorted unique signatures for a list of defect strings."""
+    return sorted({defect_signature(item) for item in (defects or [])
+                   if str(item).strip()})
+
+
+def defect_class(text):
+    """Return ``cosmetic`` only for explicitly cosmetic/polish wording."""
+    value = normalise_defect(text)
+    if not value:
+        return "substantive"
+    if _SUBSTANTIVE_RE.search(value):
+        return "substantive"
+    if _COSMETIC_RE.search(value):
+        return "cosmetic"
+    return "substantive"
+
+
+def _round_no(entry, index):
+    try:
+        value = int(entry.get("round"))
+        return value if value > 0 else index + 1
+    except (AttributeError, TypeError, ValueError):
+        return index + 1
+
+
+def _blocking_signatures(entry):
+    """Signature list saved with a review entry, else derived from defects."""
+    saved = entry.get("signatures")
+    if isinstance(saved, list):
+        return sorted({str(item) for item in saved if str(item).strip()})
+    try:
+        blocking = int(entry.get("blocking_defects") or 0)
+    except (TypeError, ValueError):
+        blocking = 0
+    if blocking <= 0:
+        return []
+    return defect_signatures(entry.get("defects") or [])
+
+
+def _review_entries(review_rounds):
+    entries = []
+    for index, entry in enumerate(review_rounds or []):
+        if not isinstance(entry, dict) or entry.get("kind") == "revision":
+            continue
+        entries.append((index, entry))
+    return entries
+
+
+def _first_seen(review_rounds):
+    seen = {}
+    for index, entry in _review_entries(review_rounds):
+        round_no = _round_no(entry, index)
+        for sig in _blocking_signatures(entry):
+            if sig not in seen:
+                seen[sig] = round_no
+    return seen
+
+
+def repeated_signatures(review_rounds, k=2):
+    """Blocking signatures present in each of the last ``k`` review rounds."""
+    reviews = _review_entries(review_rounds)
+    try:
+        k = int(k)
+    except (TypeError, ValueError):
+        k = 2
+    if k < 1 or len(reviews) < k:
+        return {}
+    recent = reviews[-k:]
+    common = set(_blocking_signatures(recent[0][1]))
+    for _index, entry in recent[1:]:
+        common &= set(_blocking_signatures(entry))
+    first = _first_seen(review_rounds)
+    result = {}
+    for sig in sorted(common):
+        history = []
+        defect = ""
+        for index, entry in _review_entries(review_rounds):
+            if sig in _blocking_signatures(entry):
+                round_no = _round_no(entry, index)
+                if round_no not in history:
+                    history.append(round_no)
+                if not defect:
+                    for item in entry.get("defects") or []:
+                        if str(item).strip() and defect_signature(item) == sig:
+                            defect = str(item).strip()
+                            break
+                    if not defect and entry.get("defect"):
+                        defect = str(entry["defect"]).strip()
+        result[sig] = {
+            "first_seen_round": first.get(sig, history[0] if history else None),
+            "rounds": sorted(history),
+            "defect": defect,
+        }
+    return result
+
+
+def _signature_label(info, sig):
+    raw = str(info.get("defect") or "").replace("?", "").strip()
+    if raw:
+        anchor = _file_anchor(raw)
+        kind = defect_kind(raw)
+        return "%s in %s" % (kind, anchor) if anchor else kind
+    return "signature " + sig[:12]
+
+
+def _stop_action(mode):
+    return "stop" if str(mode or "").strip().lower() == "auto" else "observe_stop"
+
+
+def _base_decision(**overrides):
+    decision = {
+        "action": "continue",
+        "reason": "No repeated blocking signature in the last review rounds.",
+        "signatures": [],
+        "question": "",
+        "evidence": [],
+        "options": [],
+        "first_seen_round": None,
+        "cosmetic_only": False,
+    }
+    decision.update(overrides)
+    return decision
+
+
+def convergence_decision(review_rounds, mode="observe", target=8.5, k=2,
+                         tolerance=0.5):
+    """Decide continue/stop from repeated blocking signatures or polish."""
+    rounds = list(review_rounds or [])
+    reviews = _review_entries(rounds)
+    if not reviews:
+        return _base_decision(reason="No review round is available yet.")
+    index, current = reviews[-1]
+    current_round = _round_no(current, index)
+    defects = [str(item).strip() for item in current.get("defects") or []
+               if str(item).strip()]
+    try:
+        blocking = int(current.get("blocking_defects") or 0)
+    except (TypeError, ValueError):
+        blocking = 0
+    classes = [defect_class(item) for item in defects]
+    cosmetic_only = bool(defects) and blocking > 0 and all(
+        item == "cosmetic" for item in classes)
+    try:
+        score = float(current.get("score"))
+    except (TypeError, ValueError):
+        score = None
+    prior_revision = any(isinstance(item, dict) and item.get("kind") == "revision"
+                         for item in rounds)
+    repeated = repeated_signatures(rounds, k=k)
+
+    if repeated:
+        sig = sorted(repeated)[0]
+        info = repeated[sig]
+        label = _signature_label(info, sig)
+        history = info.get("rounds") or [current_round]
+        reason = ("Blocking defect repeated across review rounds %s (%s)."
+                  % (", ".join(str(item) for item in history), sig[:12]))
+        question = (
+            "Round %s repeated the same blocking defect (%s). Resume with a "
+            "narrower fix scope, accept below the gate, or stop?"
+            % (current_round, label))
+        return _base_decision(
+            action=_stop_action(mode),
+            reason=reason,
+            signatures=sorted(repeated),
+            question=question,
+            evidence=["round %s: %s" % (item, label) for item in history],
+            options=["resume_with_scope", "accept_below_gate", "stop"],
+            first_seen_round=info.get("first_seen_round"),
+            cosmetic_only=cosmetic_only,
+        )
+
+    if (cosmetic_only and score is not None
+            and score >= float(target) - float(tolerance) and prior_revision):
+        sigs = defect_signatures(defects)
+        first = _first_seen(rounds)
+        label = _signature_label({"defect": defects[0]}, sigs[0] if sigs else "")
+        question = (
+            "Round %s was cosmetic-only (%s) at %s against the %s gate after "
+            "one revision. Resume with a narrower polish scope, accept below "
+            "the gate, or stop?"
+            % (current_round, label, score, float(target)))
+        return _base_decision(
+            action=_stop_action(mode),
+            reason=("Cosmetic-only review at %s meets the %s gate after a "
+                    "prior revision." % (score, float(target) - float(tolerance))),
+            signatures=sigs,
+            question=question,
+            evidence=["round %s: cosmetic-only defect (%s)"
+                      % (current_round, label),
+                      "score %s >= %s" % (score, float(target) - float(tolerance))],
+            options=["resume_with_scope", "accept_below_gate", "stop"],
+            first_seen_round=min((first.get(sig, current_round) for sig in sigs),
+                                 default=current_round),
+            cosmetic_only=True,
+        )
+
+    return _base_decision(
+        reason=("No blocking signature repeated in the last %s review rounds; "
+                "the normal review loop should continue." % k),
+        cosmetic_only=cosmetic_only,
+    )
+
+
+def persist_signatures(review_rounds, entry):
+    """Annotate a review entry with signatures and sig -> first round."""
+    if not isinstance(entry, dict):
+        return entry
+    sigs = _blocking_signatures(entry)
+    entry["signatures"] = sigs
+    first = _first_seen([item for item in (review_rounds or [])
+                         if item is not entry])
+    index = len(list(review_rounds or []))
+    current_round = _round_no(entry, index)
+    entry["first_seen_round"] = {
+        sig: first.get(sig, current_round) for sig in sigs}
+    return entry

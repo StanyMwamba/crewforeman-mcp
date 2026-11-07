@@ -1,4 +1,4 @@
-# Installing crewforeman-mcp 3.8.1
+# Installing crewforeman-mcp 3.9.0
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime
 dependencies**. It ships a local MCP stdio server and five skill checklists
@@ -129,7 +129,7 @@ then builds and inspects the sdist. It removes its own `venv/`, `sdist/`,
 
 On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
-Expected results: the version prints `3.8.1`, each `--help` exits 0, and the
+Expected results: the version prints `3.9.0`, each `--help` exits 0, and the
 file listing shows the five `.md` skill data files under
 `share/crewforeman-mcp/skills`. If the files are present but a run says
 skills are missing, set `DSH_SKILLS_DIR` to that directory (see docs/OPERATIONS.md).
@@ -160,3 +160,25 @@ is left untouched. Delete `DSH_SKILLS_DIR` if you set it by hand.
 - If `crewforeman-mcp` is "not found", the scripts directory is not on
   `PATH`: use `python -m deepseek_mcp` inside the venv, or run
   `pipx ensurepath` and open a new shell.
+
+## Live end-to-end smoke
+
+`scripts/smoke_live.py` is an **opt-in paid run**. It starts one real Harness
+builder and its independent reviewer with a tiny prompt, then verifies that the
+builder finished `ok`, the reviewer returned a `quality_score`, the review
+status is `accepted`/`stopped`, and the running version matches the package
+version. It is never part of the normal test suite and makes no network call
+without `--yes`.
+
+```bash
+# from the source checkout, with the operator's real config/key
+python3 scripts/smoke_live.py --yes --json
+```
+
+Useful options: `--workspace DIR` (otherwise a fresh directory under `TMPDIR`,
+with a workspace fallback), `--config PATH`, and `--timeout SECONDS` (default
+300). Without `--yes` the script exits 2 and prints the cost warning. The JSON
+summary has `ok`, `version`, `builder_status`, `quality_score`,
+`review_status`, `workspace` and `error`; exit code 0 means every check passed.
+This costs real credit, so run it manually after install or upgrade, never in
+CI. The same evidence is summarised in `docs/OPERATIONS.md`.

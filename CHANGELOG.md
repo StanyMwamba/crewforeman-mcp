@@ -5,6 +5,104 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.0
+
+### Added
+
+- P3-1 bounded, fair admission: `deepseek_mcp/admission.py` adds a persistent
+  queue under `<state_dir>/queue/`, one lease per running job
+  (`pid`, `host`, `heartbeat`, `lease_until`, `fencing_token`), a lazy
+  dispatcher started by `serve()`, P0 resume priority and `reserve_resume_slot`
+  (default on). `max_harness_jobs` defaults to **4**; `0` means unlimited. A
+  positive cap is clamped to the detected Harness child capacity. Queued work
+  survives a server restart; running workers keep their detached process and
+  heartbeat their lease from `jobs.write_status`. Dead-pid and three-missed-
+  heartbeat leases are reclaimed, and a late heartbeat with an old fencing
+  token is ignored. `deepseek_job_status` reports `queue_position`, `priority`,
+  `priority_label`, `holder` and `lease_until`.
+- P3-2 review convergence: `defect_signature()` hashes the normalized defect
+  kind, file anchor and evidence type. Signatures and `first_seen_round` are
+  persisted in `review_rounds` and checkpoints. When the same blocking
+  signature repeats in `K=2` consecutive review rounds, `quality_convergence`
+  can stop auto-revision and emit exactly one attention question with options
+  `resume_with_scope`, `accept_below_gate`, `stop`. Cosmetic-only blocking
+  findings stop after one revision when the score is within tolerance.
+  `quality_convergence` is `observe|auto` and defaults to **observe**.
+- Reviewer cost reductions: the connector now captures a workspace baseline,
+  runs the full test suite on the exact reviewed tree before each review and
+  passes the reviewer an HMAC-signed result (tree hash, counts, output digest).
+  Review round 1 is a full review; later rounds start from the connector diff
+  and the previously flagged defects. Reviewers are told to trust the signed
+  evidence for that exact tree, rerun only new/defect-related tests, and may
+  rerun everything when suspicious.
+- `scripts/smoke_live.py`: opt-in, paid end-to-end smoke (tiny builder +
+  independent reviewer + version check). Requires `--yes`; documented in
+  `docs/INSTALL.md`.
+
+### Changed
+
+- Admission is scoped to `harness_deepseek` and `resume_deepseek`; ask,
+  consult and swarm jobs keep their previous direct-start behaviour.
+- The review baseline is captured immediately before each revision (and once
+  before the builder), so a later round's diff is exactly the preceding
+  revision's changes instead of an empty diff. Binary/oversized files are
+  recorded in the baseline manifest (with an `excluded` reason) and reported
+  as metadata-only changed/added/deleted entries.
+- New config keys: `max_harness_jobs` (4), `reserve_resume_slot` (true),
+  `admission_heartbeat_seconds` (30), `admission_lease_seconds` (90),
+  `quality_convergence` (`observe`), `review_test_suite` (`auto`),
+  `review_test_command` (empty), `review_test_timeout_seconds` (300),
+  `review_context_max_chars` (60000). Environment aliases use the documented
+  `DSH_*` / `DEEPSEEK_*` pattern.
+- `docs/OPERATIONS.md` documents admission, convergence and review-evidence
+  operation; `docs/INSTALL.md` documents the live smoke.
+
+### Fixed
+
+- The MCP `initialize` instructions header now derives its version from
+  `SERVER_VERSION`, and the four release tests derive the same prefix from the
+  constant, so the header cannot drift from `serverInfo.version` again.
+- Admission reclaim re-reads and revalidates the lease under the per-work
+  lock (identity, fencing token, expiry and PID) before queueing an item, so
+  a heartbeat that renews the lease between the stale expiry check and the
+  lock can no longer be fenced and duplicated by a second worker.
+- `accept_below_gate` and `stop` now resolve the pending convergence question:
+  the attention payload is cleared, the chosen option is recorded, a terminal
+  `ok_below_gate` result is written, the work item is finished and the MCP
+  task completes instead of remaining `input_required`.
+- A terminal job reports `queue_position: 0` even when its older status file
+  still carries a non-zero position, and `jobs.run_job()` restores the
+  process-wide worker globals in `finally` so an in-process caller cannot
+  leave progress/heartbeat writes aimed at a stale status file.
+- A queued MCP task now receives its `job_id` before `start_job` returns, so
+  it stays `working` while the job is queued and completes only from the
+  terminal job/journal state instead of the queue marker.
+- Admission state/lock failures fail closed: the job and its work item are
+  marked failed with a sanitized error and no worker is spawned, preserving
+  `max_harness_jobs` when the queue is unavailable.
+- `resume_with_scope` is a working convergence remedy. A manual resume reopens
+  one revision/review cycle, passes the scope note to the revision and lets
+  the historical repeated signature pass that one decision.
+- Connector evidence uses a persistent HMAC key (bytes) in connector state,
+  referenced by `key_id`; `verify_evidence()` verifies the exact payload and
+  rejects tampering.
+- Provider/reviewer errors now name the actual vendor and cause. A Kimi
+  (Moonshot) HTTP 429 `exceeded_current_quota_error` or insufficient-balance
+  failure reports the Kimi/Moonshot remedy instead of claiming the DeepSeek
+  account balance is empty; DeepSeek, rate-limit and authentication cases keep
+  their own remedies. The failed execution's provider/model/model-list fields
+  have strict precedence over configured `dsh_*` hints, so conflicting config
+  cannot rename the vendor; configuration is only a fallback and free error
+  text is used last.
+- A convergence stop stays pending through terminal finalization:
+  `_finalize_work()` writes the durable result as `needs_input`, holds the work
+  item and does not append a terminal `result` event, so the MCP task is
+  `input_required` with exactly one question/options payload.
+- The admission capacity check and claim share a queue-wide interprocess
+  `queue.lock`, so independent controllers or server processes admitting
+  different run ids cannot exceed `max_harness_jobs` by both observing the
+  last free slot.
+
 ## 3.8.1 — P2 authority, health and cost controls
 
 ### Added

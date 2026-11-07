@@ -214,7 +214,8 @@ if mode == "plain":
 
 if "INDEPENDENT REVIEWER" in task:
     if os.environ.get("FAKE_DSH_FAIL_REVIEW"):
-        emit({"type": "error", "message": "fake reviewer failure"})
+        emit({"type": "error", "message": os.environ.get(
+            "FAKE_DSH_REVIEW_ERROR_MESSAGE", "fake reviewer failure")})
         sys.exit(1)
     raw_scores = os.environ.get("FAKE_DSH_REVIEW_SCORES", "")
     scores = [item.strip() for item in raw_scores.split(",") if item.strip()]

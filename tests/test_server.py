@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from deepseek_mcp import server
-from deepseek_mcp.config import load_config
+from deepseek_mcp.config import SERVER_VERSION, load_config
 from tests.fakes import FakeDeepSeekServer, base_env
 
 REPO_SKILLS = Path(__file__).resolve().parent.parent / "skills"
@@ -32,11 +32,11 @@ class ServerProtocolTests(unittest.TestCase):
         response = server.dispatch("initialize", {"protocolVersion": "2025-06-18"}, cfg=self.cfg())
         self.assertEqual(response["result"]["serverInfo"]["name"],
                          "crewforeman-mcp")
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.8.1")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.9.0")
         instructions = response["result"]["instructions"]
         self.assertIn("checkpoints every phase", instructions)
         self.assertIn("ok_below_gate", instructions)
-        self.assertTrue(instructions.startswith("crewforeman-mcp 3.8"))
+        self.assertTrue(instructions.startswith(f"crewforeman-mcp {SERVER_VERSION}:"))
         self.assertNotIn("v3.1", instructions)
         unsupported = server.dispatch("initialize", {"protocolVersion": "1999-01-01"},
                                       cfg=self.cfg())

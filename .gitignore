@@ -38,6 +38,10 @@ skills/.skill-write-probe
 # Local configuration (never commit real settings or keys)
 config.json
 
+# Review-evidence signing keys and captured evidence state (never commit)
+review-evidence/
+*.key
+
 # Generated reports and dry-run benchmark output
 REVIEW.md
 REVIEW_*.md
@@ -72,3 +76,6 @@ test-results/
 .vscode/
 *.swp
 *~
+
+# Test-run temp artifacts (TMPDIR may point inside the repo)
+.tmp-tests/
