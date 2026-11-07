@@ -33,6 +33,7 @@ from . import platforms
 from . import progress
 from . import render
 from . import review_context
+from . import review_progress as review_progress_mod
 from . import safety
 from . import scaling
 from . import spend as spend_mod
@@ -616,6 +617,131 @@ def _quality_defects(workspace):
     return "\n".join(lines[:12]) or None
 
 
+def _review_round_usage(record, cfg):
+    """Normalise per-round reviewer usage and price it from reviewer_prices.
+
+    Every review/revision entry keeps input (uncached), cache read, output and
+    total tokens, the per-model buckets, cost and cost_known. Cost is reported
+    only when every model resolves; otherwise ``cost`` stays None and
+    ``cost_known`` is False so callers can say why.
+    """
+    record = record if isinstance(record, dict) else {}
+    usage = dict(record.get("usage") or {})
+    tokens_in = record.get("tokens_in")
+    cache = record.get("cache_read_tokens")
+    out = record.get("tokens_out")
+    total = record.get("total_tokens")
+    if tokens_in is None:
+        tokens_in = usage.get("input_tokens")
+    if cache is None:
+        cache = usage.get("cache_read_tokens")
+    if out is None:
+        out = usage.get("output_tokens")
+    if total is None:
+        total = usage.get("total_tokens")
+    tokens_in, cache, out = int(tokens_in or 0), int(cache or 0), int(out or 0)
+    total = int(total if total is not None else tokens_in + cache + out)
+    models = dict(record.get("models") or {})
+    model = str(record.get("model") or getattr(cfg, "dsh_model", None)
+                or "deepseek-flash")
+    if not models:
+        models = {model: {"input": tokens_in, "cache_read": cache,
+                          "output": out}}
+    cost = record.get("cost")
+    known = record.get("cost_known")
+    if cost is None or known is False:
+        priced = 0.0
+        resolvable = True
+        for name, bucket in models.items():
+            bucket = bucket if isinstance(bucket, dict) else {}
+            rates, _hit = _prices_for(
+                name, getattr(cfg, "reviewer_prices", None))
+            if rates is None:
+                resolvable = False
+                break
+            priced += (int(bucket.get("input") or 0) * rates["miss"]
+                       + int(bucket.get("cache_read") or 0) * rates["hit"]
+                       + int(bucket.get("output") or 0) * rates["out"]) / 1000000.0
+        if resolvable:
+            cost = round(priced, 6)
+            known = True
+    if cost is None:
+        known = False
+    return {
+        "tokens_in": tokens_in,
+        "cache_read_tokens": cache,
+        "tokens_out": out,
+        "total_tokens": total,
+        "usage": dict(usage, input_tokens=tokens_in,
+                      cache_read_tokens=cache, output_tokens=out,
+                      total_tokens=total),
+        "models": models,
+        "model": model,
+        "cost": cost,
+        "cost_known": bool(known),
+    }
+
+
+def _merge_preflight_usage(record, preflight, cfg):
+    """Fold pre-flight reviewer usage into the paid review round record.
+
+    Pre-flight is a near-free call through the same reviewer path, but it is
+    still a reviewer call: its tokens/cost must appear in the round entry and
+    therefore in ``reviewer_usage`` too.
+    """
+    merged = dict(record or {})
+    preflight_record = dict(preflight or {})
+    if ("cost" not in preflight_record
+            and "estimated_cost_usd" in preflight_record):
+        preflight_record["cost"] = preflight_record.get("estimated_cost_usd")
+    usage = _review_round_usage(preflight_record, cfg)
+    if not usage.get("tokens_in") and not usage.get("tokens_out"):
+        # A failed/empty pre-flight still gets an explicit zero record so the
+        # round can say it was charged/checked.
+        pass
+    merged["preflight_usage"] = usage
+    if not any(int(usage.get(field) or 0) for field in
+               ("tokens_in", "cache_read_tokens", "tokens_out",
+                "total_tokens")):
+        # A ping with no readable usage must not perturb the paid round's
+        # totals or make a known review cost unknown by adding a zero model.
+        return merged
+    for field in ("tokens_in", "cache_read_tokens", "tokens_out",
+                  "total_tokens"):
+        merged[field] = (int(merged.get(field) or 0)
+                         + int(usage.get(field) or 0))
+    models = dict(merged.get("models") or {})
+    for model, bucket in (usage.get("models") or {}).items():
+        if not isinstance(bucket, dict):
+            continue
+        target = models.setdefault(
+            model, {"input": 0, "cache_read": 0, "output": 0})
+        for field in ("input", "cache_read", "output"):
+            target[field] = int(target.get(field) or 0) + int(
+                bucket.get(field) or 0)
+    merged["models"] = models
+    base_usage = dict(merged.get("usage") or {})
+    base_usage.update({
+        "input_tokens": merged["tokens_in"],
+        "cache_read_tokens": merged["cache_read_tokens"],
+        "output_tokens": merged["tokens_out"],
+        "total_tokens": merged["total_tokens"],
+    })
+    merged["usage"] = base_usage
+    if (merged.get("cost_known") and usage.get("cost_known")
+            and merged.get("cost") is not None
+            and usage.get("cost") is not None):
+        merged["cost"] = round(
+            float(merged["cost"]) + float(usage["cost"]), 6)
+        merged["cost_known"] = True
+    else:
+        # Let _review_round_usage try to reprice the combined model buckets;
+        # otherwise the combined cost remains explicitly unknown.
+        merged["cost"] = None
+        merged["cost_known"] = False
+    return merged
+
+
 def _result_text(run, path):
     tools = run.get("tools_used") or {}
     tool_text = ", ".join("%s x%d" % (name, count)
@@ -676,10 +802,15 @@ def _result_text(run, path):
                 bit += ", %d blocking defect(s)" % int(entry.get("blocking_defects") or 0)
             if entry.get("status") and entry.get("status") != "ok":
                 bit += ", %s" % entry.get("status")
+            bit += ", input %s (uncached) / cache read %s / output %s / total %s" % (
+                entry.get("tokens_in", "?"), entry.get("cache_read_tokens", "?"),
+                entry.get("tokens_out", "?"), entry.get("total_tokens", "?"))
+            if entry.get("preflight_usage"):
+                bit += " (incl. pre-flight)"
             if entry.get("cost") is not None:
                 bit += ", $%s" % api.fmt_cost(entry["cost"])
             else:
-                bit += ", cost unknown"
+                bit += ", cost unknown (reviewer_prices not configured)"
             head += "\n" + bit
     text = head + "\n\n" + (run.get("answer") or "")
     warning = _log_fallback_warning(run)
@@ -721,8 +852,10 @@ def _noise_output(rel):
 
 def _deliverable_files(workspace, output_files):
     """Filter builder/revision outputs down to reviewable deliverables."""
-    excluded_names = {"quality_report.md", "review.md"}
-    excluded_prefixes = ("quality_report.previous-", "review.previous-", ".fake",
+    excluded_names = {"quality_report.md", "review.md", "review.partial.md",
+                      "review.partial.json"}
+    excluded_prefixes = ("quality_report.previous-", "review.previous-",
+                         "review.partial", ".fake",
                          ".git/", "__pycache__/", ".ds_store")
     files = []
     for raw in output_files or []:
@@ -1821,6 +1954,15 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
             watch.touch("assistant", "assistant message")
             if parsed["text"]:
                 final = parsed["text"] if final is None else final
+                # The reviewer's structured checkpoints arrive as assistant
+                # text.  Forward only those marker lines (not ordinary prose)
+                # so the phase callback can persist them without spamming the
+                # human progress stream.
+                if progress_cb:
+                    for progress_line in parsed["text"].splitlines():
+                        if progress_line.lstrip().startswith(
+                                review_progress_mod.PROGRESS_PREFIX):
+                            progress_cb(progress_line.strip())
         elif parsed["kind"] == "child":
             # Only this run's advertised children may count as progress.
             if activity is not None:
@@ -2606,7 +2748,8 @@ def _job_spec_for_checkpoint(run, args, workspace):
             "independent_review", "quality_rounds", "skill", "sandbox",
             "reviewer_sandbox", "transport", "add_dirs", "max_seconds",
             "job_max_seconds", "job_max_cost_usd", "live_scaling",
-            "live_scaling_threshold", "live_scaling_max_extra_waves")
+            "live_scaling_threshold", "live_scaling_max_extra_waves",
+            "review_preflight", "review_preflight_timeout")
     spec = {}
     for key in keys:
         if key in args:
@@ -2667,6 +2810,15 @@ def _prior_rounds(manifest):
                 "creative_cap": bool(data.get("creative_cap")),
                 "seconds": data.get("seconds"),
                 "cost": data.get("cost"),
+                "tokens_in": data.get("tokens_in"),
+                "cache_read_tokens": data.get("cache_read_tokens"),
+                "tokens_out": data.get("tokens_out"),
+                "total_tokens": data.get("total_tokens"),
+                "usage": data.get("usage"),
+                "models": data.get("models"),
+                "cost_known": data.get("cost_known"),
+                "preflight": data.get("preflight"),
+                "preflight_usage": data.get("preflight_usage"),
                 "status": "ok",
                 "error": None,
                 "stalled": False,
@@ -2691,6 +2843,13 @@ def _prior_rounds(manifest):
                 "fixes": list(data.get("fixes") or []),
                 "seconds": data.get("seconds"),
                 "cost": data.get("cost"),
+                "tokens_in": data.get("tokens_in"),
+                "cache_read_tokens": data.get("cache_read_tokens"),
+                "tokens_out": data.get("tokens_out"),
+                "total_tokens": data.get("total_tokens"),
+                "usage": data.get("usage"),
+                "models": data.get("models"),
+                "cost_known": data.get("cost_known"),
                 "status": data.get("status") or "ok",
                 "error": data.get("error"),
                 "stalled": False,
@@ -4726,6 +4885,91 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     except Exception:
                         pass
                 _stash_old(workspace, "REVIEW.md", run["id"], round_no=round_no)
+                partial_arg = args.get("_review_partial")
+                if not isinstance(partial_arg, dict):
+                    partial_arg = None
+                # A resume is a new run record id but the same logical job.  A
+                # partial checkpoint is written under the id of the attempt
+                # that was interrupted, so accept either identity.
+                partial_ids = {str(run["id"])}
+                if args.get("_resume_from"):
+                    partial_ids.add(str(args.get("_resume_from")))
+                if partial_arg is not None:
+                    try:
+                        if (str(partial_arg.get("run_id") or "") not in partial_ids
+                                or int(partial_arg.get("round") or 0) != int(round_no)):
+                            partial_arg = None
+                    except (TypeError, ValueError):
+                        partial_arg = None
+                if partial_arg is None:
+                    try:
+                        saved_partial = review_progress_mod.load(workspace)
+                        if (isinstance(saved_partial, dict)
+                                and str(saved_partial.get("run_id") or "") in partial_ids
+                                and int(saved_partial.get("round") or 0) == int(round_no)):
+                            partial_arg = saved_partial
+                    except Exception:
+                        pass
+                review_areas = [
+                    {"key": "brief",
+                     "label": "Original brief and acceptance criteria",
+                     "status": "pending"},
+                    {"key": "deliverables",
+                     "label": "Deliverable files and artifacts",
+                     "status": "pending"},
+                    {"key": "correctness",
+                     "label": "Correctness, required facts and calculations",
+                     "status": "pending"},
+                    {"key": "tests",
+                     "label": "Tests, build and signed evidence",
+                     "status": "pending"},
+                    {"key": "safety",
+                     "label": "Safety, secrets and policy",
+                     "status": "pending"},
+                ]
+                if not deliverable_files:
+                    review_areas.append(
+                        {"key": "answer",
+                         "label": "Chat-only answer (no deliverable files)",
+                         "status": "pending"})
+                review_progress = review_progress_mod.ReviewProgress(
+                    workspace, run_id=run["id"], round_no=round_no,
+                    areas=review_areas, partial=partial_arg)
+                try:
+                    review_progress.start()
+                    run["review_partial"] = review_progress.snapshot()
+                    if checkpoint:
+                        checkpoint.begin("review-%d" % round_no,
+                                         partial=review_progress.snapshot())
+                except Exception:
+                    pass
+
+                def _reviewer_progress_cb(message, _rp=review_progress):
+                    try:
+                        text = str(message)
+                        # _handle_line forwards one complete marker line at a
+                        # time (without its newline); terminate it so the
+                        # checkpoint is durable immediately, not only when the
+                        # next chunk happens to include a newline.
+                        if text.lstrip().startswith(
+                                review_progress_mod.PROGRESS_PREFIX):
+                            text += "\n"
+                        _rp.feed_progress(text)
+                    except Exception:
+                        pass
+                    try:
+                        _rp.heartbeat(note=str(message))
+                        match = re.search(r"last:\s*([A-Za-z0-9_.-]+)",
+                                          str(message))
+                        if match:
+                            _rp.note_tool(match.group(1))
+                    except Exception:
+                        pass
+                    if progress_cb:
+                        try:
+                            progress_cb(message)
+                        except Exception:
+                            pass
                 # R1: the connector, not the builder, runs the full suite on
                 # the exact tree and signs the result for the reviewer.
                 test_evidence = None
@@ -4764,9 +5008,27 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         evidence_record = dict(test_evidence)
                         run.setdefault("review_test_evidence", []).append(
                             evidence_record)
+                        try:
+                            review_progress.add_test(
+                                evidence_record.get("command")
+                                or "connector test suite",
+                                status=str(evidence_record.get("status")
+                                           or "unknown"),
+                                seconds=evidence_record.get("seconds"))
+                            review_progress.note_area(
+                                "tests",
+                                "checked" if evidence_record.get("status") == "ok"
+                                else "in_progress")
+                        except Exception:
+                            pass
                 except Exception as exc:
                     test_evidence = None
                     run["review_test_error"] = api.redact_secrets(str(exc))
+                    try:
+                        review_progress.add_test("connector test suite",
+                                                 status="error")
+                    except Exception:
+                        pass
                 review_diff = ""
                 prior_defects = []
                 prior_signatures = []
@@ -4801,8 +5063,104 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     review_context=review_diff,
                     prior_defects=prior_defects,
                     prior_signatures=prior_signatures,
+                    partial=partial_arg,
                     test_evidence=(review_context.format_test_evidence(
                         test_evidence) if test_evidence else None))
+                # P3-2: near-free pre-flight through the SAME reviewer path.
+                # A provider that cannot answer a one-word prompt must not be
+                # handed the paid review.
+                review_preflight_record = None
+                _preflight_requested = args.get("review_preflight")
+                if _preflight_requested is None:
+                    _preflight_requested = cfg.get("review_preflight", True)
+                if bool(_preflight_requested):
+                    preflight_limit = float(cfg.get("review_preflight_timeout",
+                                                   45.0) or 45.0)
+                    _remaining = job_budget.remaining_seconds()
+                    if _remaining is not None:
+                        preflight_limit = max(1.0, min(preflight_limit,
+                                                       float(_remaining)))
+                    preflight = _execute_once(
+                        cfg, workspace,
+                        ("Reply with exactly READY and nothing else. Do not use "
+                         "tools, do not read or write files, do not run commands."),
+                        limit=preflight_limit, progress_cb=progress_cb,
+                        label="reviewer preflight %d" % round_no,
+                        exclude_logs=used_logs, policy=reviewer_policy,
+                        add_dirs=run["add_dirs"],
+                        transport_name=run["transport"],
+                        cancel_check=cancel_check)
+                    reviewer_executions.append(preflight)
+                    used_logs.update(preflight.get("session_logs") or [])
+                    _preflight_text = " ".join(
+                        str(preflight.get(key) or "")
+                        for key in ("error", "stderr_tail", "status_detail"))
+                    # A vendor name in the failed process's own output is
+                    # stronger evidence than a default config model.  This is
+                    # what makes a Kimi/Moonshot quota error say Moonshot even
+                    # when dsh_model still names the DeepSeek default.
+                    if _KIMI_RE.search(_preflight_text):
+                        _family = "kimi"
+                        _family_execution = dict(preflight, provider="kimi")
+                    elif _ANTHROPIC_RE.search(_preflight_text):
+                        _family = "anthropic"
+                        _family_execution = dict(preflight, provider="anthropic")
+                    elif _OPENAI_RE.search(_preflight_text):
+                        _family = "openai"
+                        _family_execution = dict(preflight, provider="openai")
+                    else:
+                        _family = provider_family(execution=preflight, cfg=cfg)
+                        _family_execution = preflight
+                    _answered = (
+                        preflight.get("status") == "ok"
+                        and not preflight.get("stalled")
+                        and not preflight.get("timed_out")
+                        and "READY" in str(preflight.get("answer") or "").upper())
+                    if not _answered:
+                        _message = provider_error_message(
+                            _family_execution, cfg, role="reviewer")
+                        _raw = api.redact_secrets(
+                            str(preflight.get("error") or ""))[:500]
+                        run["reviewer_preflight"] = {
+                            "status": "error",
+                            "error": _raw or "pre-flight did not answer READY",
+                            "message": _message,
+                            "vendor": _provider_label(_family),
+                            "seconds": preflight.get("seconds"),
+                        }
+                        run["review_error"] = _message
+                        review_status = "error"
+                        review_error = _message
+                        run["review_in_flight"] = False
+                        try:
+                            review_progress.interrupt(
+                                "reviewer pre-flight failed: %s" % _message)
+                            run["review_partial"] = review_progress.snapshot()
+                            if checkpoint:
+                                checkpoint.finish(
+                                    "review-%d" % round_no,
+                                    status="interrupted",
+                                    partial=review_progress.snapshot())
+                        except Exception:
+                            pass
+                        _persist(run, cfg, "review-%d_preflight" % round_no)
+                        review = preflight
+                        break
+                    review_preflight_record = preflight
+                    run["reviewer_preflight"] = {
+                        "status": "ok",
+                        "seconds": preflight.get("seconds"),
+                        "model": getattr(cfg, "dsh_model", None),
+                        "checked_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "tokens_in": preflight.get("tokens_in"),
+                        "cache_read_tokens": preflight.get("cache_read_tokens"),
+                        "tokens_out": preflight.get("tokens_out"),
+                        "total_tokens": preflight.get("total_tokens"),
+                        "cost": preflight.get("estimated_cost_usd"),
+                        "cost_known": preflight.get("cost_known"),
+                    }
+                    _persist(run, cfg, "review-%d_preflight_ok" % round_no)
                 # Durable in-flight marker: the detached job wrapper reads
                 # this record after the handler returns and refuses to close
                 # the job while the paid review phase is still running.
@@ -4885,7 +5243,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     review = _execute_once(
                         cfg, workspace, review_task,
                         limit=job_budget.phase_limit(limit),
-                        progress_cb=progress_cb,
+                        progress_cb=_reviewer_progress_cb,
                         label="reviewer round %d" % round_no,
                         exclude_logs=used_logs, policy=reviewer_policy,
                         add_dirs=run["add_dirs"],
@@ -4894,6 +5252,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         live_usage_cb=review_live_cb)
                     reviewer_executions.append(review)
                     used_logs.update(review.get("session_logs") or [])
+                    _review_answer_text = str(review.get("answer") or "")
+                    if _review_answer_text:
+                        try:
+                            review_progress.feed_progress(
+                                _review_answer_text, final=True)
+                        except Exception:
+                            pass
+                        review["answer"] = (
+                            review_progress_mod.strip_progress_lines(
+                                _review_answer_text))
                     if review.get("child_sessions_in_flight"):
                         # A reviewer process that exited while a background
                         # child session was still writing has not completed
@@ -4916,13 +5284,24 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 checkpoint.interrupted(
                                     "live cost usage crossed the whole-job "
                                     "ceiling during the reviewer")
+                                try:
+                                    review_progress.interrupt(
+                                        "whole-job budget stopped the reviewer")
+                                    run["review_partial"] = review_progress.snapshot()
+                                    checkpoint.finish(
+                                        "review-%d" % round_no,
+                                        status="interrupted",
+                                        partial=review_progress.snapshot())
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                     review_after = safety.snapshot_workspace(workspace)
                     violations = safety.diff_workspace(
                         review_before, review_after,
-                        allowed=("REVIEW.md", ".browser-evidence/",
-                                 "EVIDENCE.json"))
+                        allowed=("REVIEW.md", "REVIEW.partial.md",
+                                 "REVIEW.partial.json",
+                                 ".browser-evidence/", "EVIDENCE.json"))
                     if violations:
                         review["status"] = "error"
                         review["error"] = (
@@ -4998,12 +5377,92 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               "cost_known": False, "session_logs": []}
                 _materialize_review(workspace, review)
                 review["write_violations"] = violations
+                if review.get("status") != "ok":
+                    try:
+                        interrupted_text, _ = _read_review(workspace)
+                    except Exception:
+                        interrupted_text = ""
+                    interrupted_combined = "\n".join(
+                        part for part in (interrupted_text or "",
+                                          str(review.get("answer") or ""))
+                        if part)
+                    try:
+                        # Flush any final protocol line, then harvest the
+                        # interrupted report with its section severity intact.
+                        review_progress.feed_progress(
+                            interrupted_combined, final=True)
+                        for interrupted_defect in (
+                                review_progress_mod.extract_defect_records(
+                                    interrupted_combined)):
+                            review_progress.add_defect(
+                                interrupted_defect["text"],
+                                evidence=(interrupted_defect.get("evidence")
+                                          or "interrupted reviewer output"),
+                                severity=interrupted_defect.get("severity")
+                                or "blocking",
+                                carried_over=True)
+                        review_progress.interrupt(
+                            str(review.get("error") or "review interrupted"))
+                        run["review_partial"] = review_progress.snapshot()
+                    except Exception:
+                        pass
                 report_text, report_path = _read_review(workspace)
+                carried_defects = []
+                if partial_arg:
+                    try:
+                        merged_text, carried_defects = review_progress_mod.merge_review(
+                            report_text, partial_arg)
+                        if merged_text and merged_text != report_text:
+                            review_progress_mod.write_atomic(
+                                Path(workspace) / "REVIEW.md", merged_text)
+                            report_text = merged_text
+                            report_path = str(Path(workspace) / "REVIEW.md")
+                    except Exception:
+                        carried_defects = []
                 parsed = parse_review(report_text, review.get("answer") or "",
-                                      task_type=run.get("task_type"))
+                                      task_type=run.get("task_type"),
+                                      prefer_sections=bool(carried_defects))
                 score = parsed.get("score")
                 blocking = int(parsed.get("blocking_defects") or 0)
                 defects = list(parsed.get("defects") or [])
+                if carried_defects:
+                    # ``merge_review`` writes carried findings into the new
+                    # report, so parse_review already counted them.  Match on
+                    # (normalised text, severity group): a finding repeated
+                    # under the wrong heading must not be silently suppressed.
+                    known = set()
+                    for parsed_defect in (
+                            review_progress_mod.extract_defect_records(
+                                report_text or "")):
+                        parsed_key = review_progress_mod.normalise_text(
+                            parsed_defect.get("text"))
+                        if parsed_key:
+                            # The actual heading decides placement; an inline
+                            # tag must not hide a wrong-heading repeat.
+                            known.add((parsed_key,
+                                       review_progress_mod.severity_group(
+                                           parsed_defect.get("section")
+                                           or parsed_defect.get("severity"))))
+                    for carried_item in carried_defects:
+                        carried_text = (carried_item.get("text")
+                                        if isinstance(carried_item, dict)
+                                        else str(carried_item))
+                        carried_key = review_progress_mod.normalise_text(
+                            carried_text)
+                        carried_severity = (
+                            carried_item.get("severity")
+                            if isinstance(carried_item, dict) else None
+                        ) or "blocking"
+                        carried_group = review_progress_mod.severity_group(
+                            carried_severity)
+                        if not carried_key:
+                            continue
+                        if (carried_key, carried_group) in known:
+                            continue
+                        defects.append(carried_text)
+                        known.add((carried_key, carried_group))
+                        if carried_group == "blocking":
+                            blocking += 1
                 fixes = list(parsed.get("fixes") or [])
                 if score is None and review.get("status") == "ok":
                     score = 0.0
@@ -5045,6 +5504,21 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                      and score >= DEFAULT_QUALITY_TARGET
                                      and blocking == 0),
                 }
+                if review_preflight_record is not None:
+                    entry = _merge_preflight_usage(
+                        entry, review_preflight_record, cfg)
+                    entry["preflight"] = {
+                        "status": "ok",
+                        "seconds": review_preflight_record.get("seconds"),
+                        "tokens_in": entry["preflight_usage"]["tokens_in"],
+                        "cache_read_tokens": entry["preflight_usage"][
+                            "cache_read_tokens"],
+                        "tokens_out": entry["preflight_usage"]["tokens_out"],
+                        "total_tokens": entry["preflight_usage"]["total_tokens"],
+                        "cost": entry["preflight_usage"]["cost"],
+                        "cost_known": entry["preflight_usage"]["cost_known"],
+                    }
+                entry.update(_review_round_usage(entry, cfg))
                 try:
                     persist_signatures(review_rounds, entry)
                 except Exception:
@@ -5055,6 +5529,26 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     run["review_in_flight"] = False
                 run["reviewer_usage"] = _reviewer_usage_aggregate(review_rounds)
                 run["reviewer_cost_known"] = run["reviewer_usage"]["cost_known"]
+                try:
+                    if review.get("status") == "ok":
+                        # Only a completed reviewer may close the checkpoint.
+                        # An error/timeout must leave the partial interrupted so
+                        # the next resume can hand its findings to a new
+                        # reviewer instead of treating them as finished.
+                        completed_defects = (
+                            review_progress_mod.extract_defect_records(
+                                report_text or review.get("answer") or ""))
+                        if not completed_defects and defects:
+                            completed_defects = [
+                                {"text": item,
+                                 "severity": ("blocking" if index < blocking
+                                              else "non-blocking")}
+                                for index, item in enumerate(defects)]
+                        review_progress.complete(
+                            report_text, defects=completed_defects)
+                    run["review_partial"] = review_progress.snapshot()
+                except Exception:
+                    pass
                 if checkpoint and str(review.get("stop_reason")) != "budget":
                     try:
                         checkpoint.finish(
@@ -5069,8 +5563,18 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             creative_cap=entry["creative_cap"],
                             seconds=review.get("seconds"),
                             cost=review.get("estimated_cost_usd"),
+                            tokens_in=entry.get("tokens_in"),
+                            cache_read_tokens=entry.get("cache_read_tokens"),
+                            tokens_out=entry.get("tokens_out"),
+                            total_tokens=entry.get("total_tokens"),
+                            usage=entry.get("usage"),
+                            models=entry.get("models"),
+                            cost_known=entry.get("cost_known"),
+                            preflight=entry.get("preflight"),
+                            preflight_usage=entry.get("preflight_usage"),
                             report=report_path,
                             report_text=report_text,
+                            partial=review_progress.snapshot(),
                             session_id=review.get("transport_session_id"),
                             write_violations=violations,
                         )
@@ -5311,10 +5815,18 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 "error": revision.get("error"),
                 "stalled": bool(revision.get("stalled")),
                 "stalled_step": revision.get("stalled_step"),
+                "tokens_in": revision.get("tokens_in"),
+                "cache_read_tokens": revision.get("cache_read_tokens"),
+                "tokens_out": revision.get("tokens_out"),
+                "total_tokens": revision.get("total_tokens"),
+                "usage": revision.get("usage"),
+                "models": revision.get("models"),
+                "cost_known": revision.get("cost_known"),
                 "files": revision.get("output_files") or [],
                 "session_logs": revision.get("session_logs") or [],
                 "escalation": escalation,
             }
+            rev_entry.update(_review_round_usage(rev_entry, cfg))
             review_rounds.append(rev_entry)
             if (str(revision.get("stop_reason")) == "budget"
                     or (revision_guard is not None and revision_guard.exceeded)):
@@ -5376,8 +5888,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             if item.get("kind") == "review"), None)
         run["quality_score"] = last_review.get("score") if last_review else None
         run["review_status"] = review_status
-        run["review_error"] = review_error
+        # A pre-flight failure carries the vendor-correct remedy and must not
+        # be replaced by the generic "no review round recorded" text.
+        if not ((run.get("reviewer_preflight") or {}).get("status") == "error"
+                and run.get("review_error")):
+            run["review_error"] = review_error
         run["review_rounds"] = review_rounds
+        run["reviewer_usage"] = _reviewer_usage_aggregate(review_rounds)
+        run["reviewer_cost_known"] = run["reviewer_usage"]["cost_known"]
         _report_text, report_path = _read_review(workspace)
         if report_path:
             run["review_report"] = report_path
@@ -5452,7 +5970,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             # marked in flight.  ``ok_unreviewed`` is for a *recorded*
             # reviewer failure; an unrecorded review is a run error.
             review_status = "error"
-            if in_flight:
+            preflight_error = run.get("reviewer_preflight") or {}
+            if (isinstance(preflight_error, dict)
+                    and preflight_error.get("status") == "error"
+                    and str(preflight_error.get("message") or "").strip()):
+                # Fail fast with the vendor-correct remedy from the pre-flight.
+                # The generic "no round recorded" message would hide whether
+                # the account has credit and what the operator must do.
+                review_error = str(preflight_error["message"]).strip()
+            elif in_flight:
                 review_error = (
                     "independent review phase was still in flight when the "
                     "run tried to finish; no terminal review round was recorded")
@@ -5664,6 +6190,62 @@ def _resume_final_status(result, prior_rounds, spec=None,
     return result
 
 
+def _resume_review_partial(saved, manifest, prior_rounds, workspace, run_id):
+    """Return the freshest usable partial review for ``run_id``, or None.
+
+    A hard kill leaves the run record at the last explicit persist, while the
+    workspace JSON is rewritten on every heartbeat.  Pick the newest snapshot
+    by ``updated`` instead of trusting list order, so a resumed reviewer gets
+    the findings recorded closest to the interruption.
+    """
+    candidates = [saved.get("review_partial")]
+    for item in reversed(prior_rounds or []):
+        if isinstance(item, dict):
+            candidates.append(item.get("partial"))
+    for name in sorted((manifest or {}).get("phases") or {}):
+        if not str(name).startswith("review-"):
+            continue
+        entry = ((manifest.get("phases") or {}).get(name) or {})
+        candidates.append((entry.get("data") or {}).get("partial"))
+    try:
+        candidates.append(review_progress_mod.load(workspace))
+    except Exception:
+        pass
+    usable = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("run_id") or run_id) != str(run_id):
+            continue
+        try:
+            number = int(candidate.get("round") or 0)
+        except (TypeError, ValueError):
+            continue
+        if number < 1:
+            continue
+        if candidate.get("status") == "completed":
+            recorded = False
+            for item in prior_rounds or []:
+                if not isinstance(item, dict) or item.get("kind") != "review":
+                    continue
+                try:
+                    recorded = int(item.get("round") or 0) == number
+                except (TypeError, ValueError):
+                    recorded = False
+                if recorded:
+                    break
+            if recorded:
+                # That round is already durably recorded; do not replay it.
+                continue
+        stamp = str(candidate.get("updated") or candidate.get("heartbeat_at")
+                    or candidate.get("started") or "")
+        usable.append((stamp, number, candidate))
+    if not usable:
+        return None
+    usable.sort(key=lambda item: (item[0], item[1]))
+    return dict(usable[-1][2])
+
+
 def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
     """Resume a checkpointed run from its last finished phase.
 
@@ -5733,6 +6315,8 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
     if not prompt:
         raise RuntimeError("Saved run %r has no prompt to resume" % run_id)
     prior_rounds, accepted_review = _prior_rounds(manifest)
+    saved_review_partial = _resume_review_partial(
+        saved, manifest, prior_rounds, workspace, run_id)
     next_phase = None
     for name in manifest.get("plan") or []:
         if ((manifest.get("phases") or {}).get(str(name)) or {}).get("status") != "done":
@@ -5939,6 +6523,10 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "reviewer_sandbox": authority.reviewer_policy_for(
             effective_authority, cfg),
         "transport": saved.get("transport"),
+        "review_preflight": saved.get(
+            "review_preflight", spec.get("review_preflight")),
+        "review_preflight_timeout": saved.get(
+            "review_preflight_timeout", spec.get("review_preflight_timeout")),
         "add_dirs": list(saved.get("add_dirs") or []),
         "job_max_seconds": effective_authority.job_max_seconds,
         "job_max_cost_usd": effective_authority.job_max_cost_usd,
@@ -5953,6 +6541,8 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }
+    if saved_review_partial:
+        resume_args["_review_partial"] = saved_review_partial
     if saved_baseline_dir:
         resume_args["_review_baseline_dir"] = saved_baseline_dir
         if saved_baseline_round is not None:

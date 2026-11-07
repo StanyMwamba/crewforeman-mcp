@@ -19,7 +19,7 @@ add it to the `env` object shown below.
 
 ## Native command
 
-Version 3.9.1 installs the `crewforeman-mcp` command and registers the MCP
+Version 3.9.2 installs the `crewforeman-mcp` command and registers the MCP
 server name `crewforeman-mcp`. Use this form for a new configuration:
 
 ```json
@@ -211,8 +211,12 @@ test a different interpreter or entry point.
 
 `clients.restart_client_app` can quit and reopen a named application:
 `osascript` + `open -a` on macOS, `taskkill` + `start` on Windows, and
-`pkill` + command lookup/`xdg-open` on Linux. It validates the application
-name (max 60 characters) and wait time (0–60 seconds) and returns an
-`unsupported: ...` sentence instead of raising when the platform or
-application cannot be handled. Browser-based clients may need a page reload
+exact-name `pkill -x`/`pgrep -x` + command lookup/`xdg-open` on Linux. The
+detached helper owns the close, reopen and verification so the reopen
+survives the client exiting. On Linux, verification also checks the
+reopened process's executable path, so a same-named helper or unrelated
+process cannot make the restart look successful. The call validates the
+application name (max 60 characters) and wait time (0–60 seconds) and
+returns an `unsupported: ...` sentence instead of raising when the
+platform or application cannot be handled. Browser-based clients may need a page reload
 even after the process restarts.

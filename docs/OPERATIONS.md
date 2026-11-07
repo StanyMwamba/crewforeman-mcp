@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.1)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.2)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -242,6 +242,63 @@ headless session logs resolve each observed model, and the SDK transport prices
 its reviewer usage through this table (built-in DeepSeek rates remain the
 fallback).
 
+### Incremental review checkpoints and resumable reviews (P3.2)
+
+While the independent reviewer runs, the connector writes two workspace files:
+`REVIEW.partial.json` (schema v1) and a human-readable `REVIEW.partial.md`.
+They are rewritten atomically by a heartbeat (default every 5 seconds) and
+record the review round, elapsed time, coarse areas (brief, deliverables,
+correctness, tests, safety) with `pending`/`in_progress`/`checked` state, any
+findings with evidence, and connector test reruns. Neither file is a delivered
+artifact; both are excluded from `deliverable_files` and the reviewer write
+guard allows the connector to keep them current.
+
+If the reviewer is interrupted (credit/quota error, crash, timeout, restart,
+stream drop), the partial is left as `interrupted`; it is never deleted or
+promoted to `completed`. `resume_deepseek run_id=<id>` finds the newest partial
+from the run record, the checkpoint, or `REVIEW.partial.json` (matching the
+run/attempt identity and round), gives it to the new reviewer, and asks that
+reviewer to check only the areas still marked `pending`/`in_progress` while
+re-verifying the carried findings. The new report and the carried findings are
+merged into one `REVIEW.md`; a carried blocking defect still counts toward the
+acceptance gate, so a high new score cannot silently drop it.
+
+### Reviewer pre-flight (P3.2)
+
+Before each paid review round, `review_preflight` (default `true`,
+`DSH_REVIEW_PREFLIGHT`; `review_preflight_timeout` default 45 s) sends a tiny
+`READY` prompt through the same reviewer path, reviewer policy and private
+`DSH_HOME` wrapper. It does not use tools and costs a few tokens. If the
+reviewer cannot answer because the account has no credit/quota, the key is
+rejected, or the endpoint is unreachable, the paid review is **not started**.
+The run records `reviewer_preflight` and a vendor-correct `review_error`, for
+example: Kimi/Moonshot quota -> top up at `platform.moonshot.cn` (`.ai`
+outside mainland China); DeepSeek balance -> `platform.deepseek.com`. Set
+`review_preflight=false` (or `DSH_REVIEW_PREFLIGHT=0`) only when the operator
+has another way to know the reviewer is healthy.
+
+Reviewer token usage is written to each `review_rounds` entry
+(`tokens_in`, `cache_read_tokens`, `tokens_out`, `total_tokens`, `usage`,
+`models`) and aggregated in `reviewer_usage`. The run `.json` keeps the
+structured fields, the run `.md` shows one usage line per round, the job result
+text shows the same, and `deepseek_job_status run_id=<id> events_since=0`
+returns `reviewer_usage` plus a compact `review_rounds` view. Cost is included
+when `reviewer_prices` resolves every observed model; otherwise the record says
+`cost unknown (reviewer_prices not configured)`.
+
+### Detached client restart status (P3.2)
+
+`restart_client_app` writes a small JSON status file before returning
+(`restart_status_path`, default `<state_dir>/restart-status.json`) and starts a
+detached helper in a new session. The helper owns the close/wait/reopen loop:
+it closes the app, waits `wait_seconds`, opens it, verifies it is running, and
+retries `restart_helper_attempts` times (default 3) with
+`restart_helper_retry_seconds` (default 2). Because it is detached, it survives
+the client exit that the restart itself may trigger. Read the status file after
+the app comes back: `state` is `scheduled`, `waiting`, `reopened` or `failed`,
+with `attempts`, `attempts_detail`, timestamps, `helper_pid`, and `error`.
+`restart_client_app` returns the status path; no secret is written there.
+
 The baseline copy is bounded (256 KiB per file, 400 files); larger or binary
 files are recorded in the manifest with an `excluded` reason and listed as
 changed/added/deleted with a metadata-only body.
@@ -272,6 +329,52 @@ job. The child environment is scrubbed: only `DEEPSEEK_API_KEY` and the key
 variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
+
+## Release safety: the builder never pushes, tags or publishes
+
+**The builder agent must never run `git push`, `git tag`, `gh release`, a
+package publish, or any other network side effect.** A build/review job runs
+with no network side effects: it produces a commit and an independent review,
+and then stops. Release is a separate, human-approved step.
+
+Run the build/review job first. Confirm the run record reports
+`review_status=accepted` and `review_passed=true`, then run a **separate
+post-acceptance step** from the checkout. That step must push exactly the
+reviewed commit, never "whatever HEAD happens to be":
+
+```sh
+set -eu
+REVIEWED_SHA="${REVIEWED_SHA:?set to the exact commit the reviewer accepted}"
+RUN_RECORD="${RUN_RECORD:?set to the run record, e.g. ~/DeepSeek-MCP/runs/<run_id>.json}"
+test -f "$RUN_RECORD"
+test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"   # HEAD unchanged since review
+test -z "$(git status --porcelain)"              # clean working tree
+python3 - "$RUN_RECORD" <<'CHECK'
+import json, sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+status = report.get("review_status") or report.get("status")
+assert status == "accepted", status
+assert report.get("review_passed") is True, report.get("review_passed")
+CHECK
+git push origin "$REVIEWED_SHA:refs/heads/main"
+# Tag/publish only the exact reviewed commit, never a moving branch:
+git tag -a "vX.Y.Z" "$REVIEWED_SHA" -m "Reviewed release vX.Y.Z"
+git push origin "refs/tags/vX.Y.Z"
+```
+
+Before the push, check that HEAD is the commit that was reviewed, the working
+tree is clean, and the review report path exists with
+`review_status=accepted` and `review_passed=true`. If any check fails, stop.
+The reviewer must be independent; a builder self-report is not acceptance.
+
+A same-job guard is **not implemented**. DSH runs connector commands in a
+child sandbox that has no reliable git or network interception point: the
+sandbox is a file-write boundary, not a network fence, and wrapping child
+commands would be bypassable by another child process. The guard therefore
+remains an operator/release-process responsibility. The optional future flag
+`forbid_network_side_effects_until_accepted` (default `false`, not implemented
+in 3.9.x) is reserved for a future release that can enforce this at the
+sandbox or proxy layer.
 
 ## Authority envelope (P2-1)
 
@@ -464,7 +567,7 @@ the trace summary and the local files remain.
 | Permissions | `0600`/`0700` | `0600`/`0700` | inherited ACLs (no POSIX mode) |
 | Keep awake | `caffeinate` | `systemd-inhibit` | `SetThreadExecutionState` |
 | OS sandbox | Seatbelt | Harness preset only | Harness preset only |
-| Restart helper | `osascript` + `open -a` | `pkill` + command/`xdg-open` | `taskkill` + `start` |
+| Restart helper | `osascript` + `open -a` | exact `pkill -x`/`pgrep -x` + command/`xdg-open` | `taskkill` + `start` |
 
 Every helper returns a clear `unsupported: ...` sentence instead of raising
 when the platform or the application cannot be handled.
@@ -592,3 +695,26 @@ treated as free.
 as configured by the service account. Retention itself is cross-platform; path
 refusal also applies on Windows, and long paths should be avoided in state
 directories.
+
+### Test temp directories in root/read-only sandboxes
+
+The test package probes `DSH_TEST_TMPDIR`, `DSH_TMPDIR`, `TMPDIR`, `TMP` and
+`TEMP` only when the path already exists; it never creates an explicit
+`TMPDIR`.  This matters under uid 0, where a path such as `/no/such` would
+otherwise be created and mask the sandbox misconfiguration.  If no explicit
+candidate is usable, it creates and verifies a fallback under `<repo>/.tmp`,
+`<repo-parent>/.tmp`, `$PWD/.tmp`, or the user cache before trying tmpfs and
+the system temp root.  Set `TMPDIR` (or `DSH_TEST_TMPDIR`) to an existing
+writable directory to choose the location.  `tests.tempdir()` returns a
+verified directory and raises `unittest.SkipTest` with an environment-only
+reason when nothing is writable; `tests.make_tempdir()` creates a fresh child
+directory.  In tests, prefer a regular-file blocker (`regular-file/tmp`) over
+`/no/such/...`, because root can create arbitrary absolute paths while
+`ENOTDIR` under a file fails for every uid.
+
+## Durable work
+
+- `harness_deepseek` accepts `idempotency_key`. Retries with the same key share one work item. After that work ends, a new request starts a new attempt. `dedupe_active` (default `true`, `DSH_DEDUPE_ACTIVE`) merges identical requests only while they are active.
+- Work files live under `<state_dir>/work/<work_id>/`: `attempts.jsonl`, `events.jsonl` and `result.json`.
+- To follow a run, call `deepseek_job_status` with `run_id` and `events_since=0`, then pass the returned `next_seq` back as `events_since`. The reply adds new events, `stage`, `attention`, any pending `question` and `options`, `next_action`, `terminal` and `result`. An older `events_since` value receives retained events, not an error.
+- `task_completion="job"` (default) keeps the MCP task `working` until a final journal state. A pending question in one fenced `attention` JSON block (`question`, `options`, optional `evidence`) makes it `input_required`. `task_completion="request"` completes when the call returns.

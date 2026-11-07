@@ -504,14 +504,16 @@ class HealthRegressionTests(Base):
 
 class TempDirTests(unittest.TestCase):
     def test_tempdir_is_usable(self):
-        handle, name = tempfile.mkstemp(prefix="p2-tmp-")
+        import tests
+        handle, name = tempfile.mkstemp(prefix="p2-tmp-",
+                                        dir=tests.tempdir())
         os.close(handle)
         self.addCleanup(lambda: os.path.exists(name) and os.unlink(name))
         self.assertTrue(os.path.isdir(tempfile.gettempdir()))
 
     def test_usable_tmpdir_is_honoured(self):
         import tests
-        with tempfile.TemporaryDirectory() as usable:
+        with tempfile.TemporaryDirectory(dir=tests.tempdir()) as usable:
             with mock.patch.dict(os.environ, {
                     "TMPDIR": usable, "DSH_TEST_TMPDIR": "",
                     "DSH_TMPDIR": ""}, clear=False):
@@ -520,22 +522,33 @@ class TempDirTests(unittest.TestCase):
 
     def test_explicit_dsh_test_tmpdir_override_is_honoured(self):
         import tests
-        with tempfile.TemporaryDirectory() as usable:
+        with tempfile.TemporaryDirectory(dir=tests.tempdir()) as usable:
+            blocker = Path(usable) / "regular-file"
+            blocker.write_text("not a directory\n", "utf-8")
+            blocked = blocker / "tmp"
             with mock.patch.dict(os.environ, {
                     "DSH_TEST_TMPDIR": usable,
-                    "TMPDIR": "/no/such/tmpdir-for-review"}, clear=False):
+                    "TMPDIR": str(blocked)}, clear=False):
                 selected = tests._select_tempdir()
             self.assertEqual(selected, Path(usable).resolve())
+            self.assertFalse(blocked.exists())
 
     def test_unusable_tmpdir_falls_back_into_the_workspace(self):
         import tests
         repo = Path(__file__).resolve().parent.parent
+        tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
+        self.addCleanup(tmp.cleanup)
+        blocker = Path(tmp.name) / "regular-file"
+        blocker.write_text("not a directory\n", "utf-8")
+        blocked = blocker / "tmp"
         with mock.patch.dict(os.environ, {
-                "TMPDIR": "/no/such/tmpdir-for-review",
-                "TMP": "/no/such/tmp-for-review",
-                "TEMP": "/no/such/temp-for-review",
+                "TMPDIR": str(blocked),
+                "TMP": str(blocked / "tmp"),
+                "TEMP": str(blocked / "temp"),
                 "DSH_TEST_TMPDIR": "", "DSH_TMPDIR": ""}, clear=False):
             selected = tests._select_tempdir()
+        self.assertFalse(blocked.exists(),
+                         "an explicit TMPDIR under a regular file was created")
         if selected is None:  # fully read-only sandbox: nothing can be probed
             self.skipTest("no writable temp candidate is available")
         self.assertTrue(tests._usable(selected))

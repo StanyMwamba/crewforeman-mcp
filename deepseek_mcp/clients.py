@@ -13,7 +13,7 @@ client application using the platform's normal tools:
 
 * macOS   - ``osascript`` quit, wait, ``open -a``
 * Windows - ``taskkill`` (ignored if the app is absent), wait, ``start``
-* Linux   - ``pkill -f``, wait, command lookup, else ``xdg-open``
+* Linux   - exact ``pkill -x`` on the app's process name, wait, command lookup, else ``xdg-open``
 
 It intentionally never raises for an unsupported platform or an application
 that cannot be launched: callers get a plain ``"unsupported: ..."`` sentence
@@ -26,11 +26,14 @@ returning a ``subprocess.CompletedProcess``-like object with ``returncode``
 and ``stderr``.  ``which`` is injectable as well for Linux command lookup.
 """
 
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+
+from . import restart_helper
 
 __all__ = ["restart_client_app", "client_config_snippets",
            "DEFAULT_APP_NAME", "MAX_APP_NAME", "MAX_WAIT_SECONDS"]
@@ -163,17 +166,55 @@ def _linux_candidates(name):
 
 # --------------------------------------------------------------------- API
 
+
+def _restart_status_path(args, cfg):
+    value = args.get("restart_status_path") if isinstance(args, dict) else None
+    if value in (None, ""):
+        value = _cfg_value(cfg, "restart_status_path")
+    if value in (None, ""):
+        state_dir = _cfg_value(cfg, "state_dir")
+        if not state_dir:
+            state_dir = os.path.join(os.path.expanduser("~"), ".deepseek-mcp",
+                                     "state")
+        value = os.path.join(str(state_dir), "restart-status.json")
+    return os.path.expanduser(str(value))
+
+
+def _restart_number(args, cfg, key, default, low, high, integer=False):
+    value = args.get(key) if isinstance(args, dict) else None
+    if value is None:
+        value = _cfg_value(cfg, key)
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError("%s must be a number between %s and %s" % (key, low, high))
+    try:
+        number = int(value) if integer else float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number between %s and %s" % (key, low, high))
+    if number != number or number < low or number > high:
+        raise ValueError("%s must be a number between %s and %s" % (key, low, high))
+    return number
+
+
 def restart_client_app(args, cfg=None, system=None, runner=None, which=None):
     """Quit and reopen a named MCP client app and return a clear message.
 
-    ``args`` accepts ``app_name`` (default ``"Claude"``) and ``wait_seconds``
-    (default 5, clamped to 0..60; values outside that range are rejected).
-    ``cfg`` may provide ``client_app_name`` / ``app_name`` and
-    ``client_wait_seconds`` defaults.  ``system`` defaults to ``sys.platform``;
-    ``runner`` and ``which`` are injectable for tests.
+    The close is best-effort and runs in the detached helper together with the
+    reopen and verification (see :mod:`deepseek_mcp.restart_helper`), so it
+    survives the client exiting.  Progress is written to
+    ``restart_status_path`` (default ``<state_dir>/restart-status.json``).
 
-    Raises ``ValueError`` for invalid arguments.  For every environment or
-    platform failure it returns ``"unsupported: ..."`` instead of raising.
+    ``args`` accepts ``app_name`` (default ``"Claude"``), ``wait_seconds``
+    (default 5, clamped to 0..60), ``restart_status_path``,
+    ``restart_helper_attempts`` and ``restart_helper_retry_seconds``.  For
+    tests, ``close_command``/``open_command``/``verify_command`` override the
+    platform commands.  ``cfg`` may provide the matching defaults.  ``system``
+    defaults to ``sys.platform``; ``runner`` and ``which`` are injectable.
+
+    Raises ``ValueError`` for invalid arguments.  For environment, platform or
+    status-file failures it returns a plain explanatory sentence instead of
+    raising.
     """
     if args is None:
         args = {}
@@ -185,53 +226,95 @@ def restart_client_app(args, cfg=None, system=None, runner=None, which=None):
     if not family:
         return _unsupported(system, name)
 
-    if family == "macos":
-        _run(runner, ["osascript", "-e",
-                      'tell application "%s" to quit' % name])
-        if wait:
-            time.sleep(wait)
-        code, detail = _run(runner, ["open", "-a", name])
-        if code != 0:
-            return _launch_failed(name, "macOS", detail)
-        return ("%s was asked to quit and reopened on macOS. Reconnect the "
-                "MCP client if the server does not reappear." % name)
+    status_path = _restart_status_path(args, cfg)
+    attempts = _restart_number(args, cfg, "restart_helper_attempts", 3, 1, 10,
+                               integer=True)
+    retry_seconds = _restart_number(args, cfg, "restart_helper_retry_seconds",
+                                    2.0, 0.0, 60.0)
+    overrides = {}
+    for key in ("close", "open", "verify"):
+        value = args.get(key + "_command")
+        if value is not None:
+            overrides[key] = value
+    try:
+        commands = restart_helper.resolve_commands(family, name, overrides,
+                                                   which=which)
+    except Exception as exc:
+        return _unsupported(system, name, _short(exc))
 
-    if family == "windows":
-        # taskkill is expected to fail when the app is not running; ignore it.
-        _run(runner, ["taskkill", "/IM", name + ".exe", "/F"])
-        if wait:
-            time.sleep(wait)
-        code, detail = _run(runner, ["cmd", "/c", "start", "", name])
-        if code != 0:
-            return _launch_failed(name, "Windows", detail)
-        return ("%s was asked to close and start again on Windows. Reconnect "
-                "the MCP client if the server does not reappear." % name)
+    # Spawn the detached helper BEFORE closing the app.  Closing can quit the
+    # client and take this process with it; the helper is already in its own
+    # session, so it still waits, reopens and verifies.  The helper performs
+    # the best-effort close itself (the app may already be gone).
+    now = restart_helper.utc_now()
+    record = {
+        "state": "scheduled",
+        "app_name": name,
+        "platform": family,
+        "helper_pid": None,
+        "status_path": status_path,
+        "attempts": 0,
+        "max_attempts": attempts,
+        "retry_seconds": retry_seconds,
+        "started_at": now,
+        "updated_at": now,
+        "error": "",
+        "message": ("Restart scheduled; the detached helper will reopen and "
+                    "verify %s." % name),
+    }
+    try:
+        restart_helper.write_status(status_path, record)
+    except Exception as exc:
+        return ("restart could not be scheduled for %s: the status file %s is "
+                "not writable (%s)." % (name, status_path, _short(exc)))
 
-    # Linux: stop the process, then start a command if one is installed,
-    # otherwise hand the application name to xdg-open.
-    _run(runner, ["pkill", "-f", name])
-    if wait:
-        time.sleep(wait)
-    lookup = which or shutil.which
-    command = None
-    for candidate in _linux_candidates(name):
+    helper_args = {
+        "app_name": name,
+        "system": family,
+        "attempts": attempts,
+        "retry_seconds": retry_seconds,
+        "initial_delay": wait,
+        "status_path": status_path,
+        "timeout": 15.0,
+        "close": commands["close"],
+        "open": commands["open"],
+        "verify": commands["verify"],
+    }
+    if commands.get("expected_executable"):
+        helper_args["expected_exe"] = commands["expected_executable"]
+    try:
+        pid = restart_helper.spawn_restart_helper(helper_args)
+    except Exception as exc:
+        record["state"] = "failed"
+        record["error"] = _short(exc)
+        record["updated_at"] = restart_helper.utc_now()
+        record["message"] = "Could not start the detached restart helper."
         try:
-            found = lookup(candidate)
+            restart_helper.write_status(status_path, record)
         except Exception:
-            found = None
-        if found:
-            command = found
-            break
-    if command:
-        code, detail = _run(runner, [command])
-        how = "via %s" % command
-    else:
-        code, detail = _run(runner, ["xdg-open", name])
-        how = "via xdg-open"
-    if code != 0:
-        return _launch_failed(name, "Linux", detail)
-    return ("%s was asked to close and start again on Linux (%s). Reconnect "
-            "the MCP client if the server does not reappear." % (name, how))
+            pass
+        return ("restart failed for %s: could not start the detached helper "
+                "(%s). Status file: %s" % (name, _short(exc), status_path))
+
+    record["helper_pid"] = pid
+    record["updated_at"] = restart_helper.utc_now()
+    try:
+        current = restart_helper.read_status(status_path)
+        state = str(current.get("state") or "")
+        if state in ("", "scheduled"):
+            merged = dict(current or {})
+            merged.update(record)
+            restart_helper.write_status(status_path, merged)
+        elif state == "waiting":
+            current["helper_pid"] = pid
+            current["updated_at"] = record["updated_at"]
+            restart_helper.write_status(status_path, current)
+    except Exception:
+        pass
+    return ("%s restart scheduled via a detached helper (pid %s). It will "
+            "reopen and verify the app, retrying up to %d time(s). Status "
+            "file: %s. Reconnect the MCP client if the app does not reappear."
+            % (name, pid, attempts, status_path))
 
 
 # ---------------------------------------------------------------- snippets

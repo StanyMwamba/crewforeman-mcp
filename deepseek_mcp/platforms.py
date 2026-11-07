@@ -301,7 +301,11 @@ def restart_client_command(system=None, app_name="Claude"):
         exe = name if name.lower().endswith(".exe") else name + ".exe"
         return {"quit": ["taskkill", "/IM", exe, "/F"],
                 "open": ["cmd", "/c", "start", "", name]}
-    return {"quit": ["pkill", "-f", name],
+    # Match the exact process name, never the full command line: the
+    # detached restart helper's own argv contains the app name and a
+    # ``-f`` match would terminate the helper instead of the app.
+    process_name = name.lower().replace(" ", "-")[:15]
+    return {"quit": ["pkill", "-x", process_name],
             "open": ["gtk-launch", name.lower().replace(" ", "-")]}
 
 

@@ -1374,6 +1374,30 @@ def _structured_status(args, state, run_id, cfg):
     payload["cost"] = (run or {}).get("cost_ledger")
     if (run or {}).get("admission_overrun"):
         payload["admission_overrun"] = run.get("admission_overrun")
+    # P3-2: reviewer token usage and per-round cost are part of the structured
+    # status contract, so callers need not parse the run record.
+    run = run or {}
+    rounds_view = []
+    for item in run.get("review_rounds") or []:
+        if not isinstance(item, dict):
+            continue
+        rounds_view.append({
+            "round": item.get("round"),
+            "kind": item.get("kind"),
+            "tokens_in": item.get("tokens_in"),
+            "cache_read_tokens": item.get("cache_read_tokens"),
+            "tokens_out": item.get("tokens_out"),
+            "total_tokens": item.get("total_tokens"),
+            "usage": item.get("usage"),
+            "models": item.get("models"),
+            "cost": item.get("cost"),
+            "cost_known": item.get("cost_known"),
+            "status": item.get("status"),
+        })
+    payload["reviewer_usage"] = run.get("reviewer_usage") or {}
+    payload["review_rounds"] = rounds_view
+    if run.get("reviewer_preflight"):
+        payload["reviewer_preflight"] = run.get("reviewer_preflight")
     try:
         from . import health as health_mod
         board = health_mod.HealthBoard(cfg.state_dir)

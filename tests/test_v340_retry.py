@@ -9,6 +9,7 @@ from unittest import mock
 
 from deepseek_mcp import harness
 from deepseek_mcp.config import load_config
+import tests
 from tests.fakes import base_env, write_fake_dsh
 
 
@@ -60,7 +61,7 @@ class RetryPolicyTests(unittest.TestCase):
 
 class RetryIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.workspace = self.root / "workspace"

@@ -29,6 +29,7 @@ from deepseek_mcp import harness  # noqa: E402
 from deepseek_mcp import health  # noqa: E402
 from deepseek_mcp import safety  # noqa: E402
 from deepseek_mcp.config import load_config  # noqa: E402
+import tests  # noqa: E402
 from tests.fakes import base_env, write_fake_dsh  # noqa: E402
 
 FC = health.FailureClass
@@ -475,7 +476,7 @@ class BuilderSideEffectGuardIntegrationTests(unittest.TestCase):
     """A writing builder that changed files is not retried."""
 
     def test_partial_write_blocks_the_transient_retry(self):
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name).resolve()
         workspace = root / "workspace"

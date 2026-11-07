@@ -1325,7 +1325,8 @@ def build_review_task(prompt, deliverable_files, skill=None,
                       quality_target=DEFAULT_QUALITY_TARGET, round_no=1,
                       task_type=None, browser_evidence=None,
                       review_context=None, prior_defects=None,
-                      test_evidence=None, prior_signatures=None):
+                      test_evidence=None, prior_signatures=None,
+                      partial=None):
     """Task text for the connector-owned, independent REVIEWER run.
 
     ``review_context`` is the connector diff (R2), ``prior_defects`` the
@@ -1366,6 +1367,57 @@ def build_review_task(prompt, deliverable_files, skill=None,
     if review_context:
         parts.append("\n\n## Connector review context\n\n%s\n"
                      % str(review_context).strip())
+    if isinstance(partial, dict):
+        areas = [item for item in (partial.get("areas") or [])
+                 if isinstance(item, dict)]
+        remaining = [item for item in areas
+                     if str(item.get("status") or "pending") != "checked"]
+        checked = [item for item in areas
+                   if str(item.get("status") or "pending") == "checked"]
+        carried = [item for item in (partial.get("defects") or [])
+                   if isinstance(item, dict)
+                   and str(item.get("text") or "").strip()]
+        completed = str(partial.get("status") or "") == "completed"
+        if completed:
+            resumed = (
+                "\n\n## Resumed review checkpoint\n\n"
+                "A previous reviewer finished round %d but its result was not "
+                "durably recorded. Do not discard its findings. Verify the "
+                "report and the carried-over findings below, check anything "
+                "still uncertain, and return ONE complete `REVIEW.md` that "
+                "keeps every carried finding (with its evidence) and adds any "
+                "new defects.\n" % int(round_no))
+        else:
+            resumed = (
+                "\n\n## Resumed review checkpoint\n\n"
+                "You are resuming review round %d after the connector "
+                "interrupted the previous reviewer. Do not restart a full "
+                "review and do not redo areas already checked. Re-verify the "
+                "carried-over findings, finish the remaining areas, and return "
+                "ONE complete `REVIEW.md` that keeps every carried finding "
+                "(with its evidence) and adds any new defects.\n" % int(round_no))
+        if remaining:
+            resumed += "\nRemaining areas to check:\n\n%s\n" % "\n".join(
+                "- `%s`" % (item.get("label") or item.get("key") or "area")
+                for item in remaining)
+        if checked:
+            resumed += "\nAlready checked (do not redo): %s\n" % ", ".join(
+                "`%s`" % (item.get("label") or item.get("key") or "area")
+                for item in checked)
+        if carried:
+            resumed += (
+                "\nEvery carried finding must stay under its original severity "
+                "heading: `[blocking]` findings under `## Blocking defects` and "
+                "`[non-blocking]` findings under `## Non-blocking defects`. Do not "
+                "move a carried finding to the other heading.\n")
+            resumed += "\nCarried-over findings to keep and re-verify:\n\n%s\n" % (
+                "\n".join("- [%s] %s%s" % (
+                    str(item.get("severity") or "blocking").strip(),
+                    str(item.get("text")).strip(),
+                    (" (evidence: %s)" % item["evidence"])
+                    if item.get("evidence") else "")
+                    for item in carried))
+        parts.append(resumed)
     if int(round_no) > 1:
         defects = [str(item).strip() for item in (prior_defects or [])
                    if str(item).strip()]
@@ -1424,10 +1476,25 @@ def build_review_task(prompt, deliverable_files, skill=None,
             "changed files and immediate dependencies when a diff is provided. "
         )
     parts.append(
+        "\n\n## Live progress checkpoint (connector-owned)\n\n"
+        "While you work, print one progress line per event on its own line so the "
+        "connector can save incremental evidence even if this review is killed:\n\n"
+        "`@@REVIEW_PROGRESS@@ area=<key> | status=<checked|in_progress>`\n\n"
+        "`@@REVIEW_PROGRESS@@ defect=<blocking|non-blocking> | area=<key> | "
+        "text=<one-line finding> | evidence=<file:line or concrete evidence>`\n\n"
+        "`@@REVIEW_PROGRESS@@ test=<command> | status=<ok|failed> | seconds=<number>`\n\n"
+        "Area keys: `brief`, `deliverables`, `correctness`, `tests`, `safety`, "
+        "and `answer` (chat-only answers). Emit `area=<key> | status=checked` "
+        "immediately after you finish an area, and emit a defect line as soon as "
+        "you find it. These marker lines are checkpoint data, not part of "
+        "`REVIEW.md`: do not include them in the final report.\n\n"
+    )
+    parts.append(
         "\n\n## Review method\n"
         + test_step + "\n"
         "1. Open the listed deliverable files and the files named in the connector diff. "
-        "Do not read the whole repository when a diff is provided. For images, PDFs and visual output, render or convert as "
+        "Do not read the whole repository when a diff is provided. "
+        "For images, PDFs and visual output, render or convert as "
         "needed and inspect with `read_image` at the target size; check overflow, clipping, "
         "overlap, minimum type size, empty areas, required facts and QR codes. For code, run "
         "the build/tests and inspect the entry point. For documents, check completeness, facts, "
@@ -1712,13 +1779,18 @@ def visual_impact_score(text):
         text or "", skip_targets=True)
 
 
-def parse_review(report_text="", final_text="", task_type=None):
+def parse_review(report_text="", final_text="", task_type=None,
+                 prefer_sections=False):
     """Parse an independent REVIEW.md/final answer.
 
     Returns ``{"score", "blocking_defects", "defects", "fixes"}`` plus the
     visual-impact sub-score and whether the creative cap was applied.  The
     count is explicit when reported, otherwise the number of bullets under the
-    "Blocking defects" heading.
+    "Blocking defects" heading.  On a resumed review the caller passes
+    ``prefer_sections=True``: the merged report's heading bullets are then
+    authoritative over the reviewer's summary count, so a carried finding the
+    merge moved back under its original heading cannot be hidden by a stale
+    ``Blocking defects: 0`` line (or promoted by a stale ``1``).
 
     The prompt asks a creative reviewer to cap an accurate-but-plain result at
     7.5, but a model can ignore that instruction.  The connector therefore
@@ -1746,7 +1818,13 @@ def parse_review(report_text="", final_text="", task_type=None):
             except ValueError:
                 pass
     blocking_lines = _section_bullets(combined, ("blocking defect", "blocking"))
-    if blocking is None:
+    if prefer_sections:
+        # The merged report is authoritative on resume.  The reviewer's
+        # trailing "Blocking defects: N" summary may still reflect the
+        # pre-merge headings (for example 0 after repeating a carried blocking
+        # finding under Non-blocking), so do not let it override the sections.
+        blocking = len(blocking_lines)
+    elif blocking is None:
         blocking = len(blocking_lines)
     defects = blocking_lines or _section_bullets(combined, ("defect", "issues"))
     fixes = _section_bullets(combined, ("fix list", "fixes", "required changes"))

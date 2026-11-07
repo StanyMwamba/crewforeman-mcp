@@ -307,6 +307,13 @@ def base_env(root, fake_dsh=None, sessions=None, base_url=None):
         # Tests must never launch a real browser; visual tests opt in with a
         # fake chrome binary and DSH_RENDER_PROBE=1.
         "DSH_RENDER_PROBE": "0",
+        # P3-2: existing suites are not charged/perturbed by the reviewer
+        # pre-flight; tests that exercise it opt in explicitly.
+        "DSH_REVIEW_PREFLIGHT": "0",
+        # The fake DSH writes session/marker files outside its workspace.  The
+        # unit suite is not a sandbox test, so keep the OS wrapper off here as
+        # well as in tests/__init__.py; sandbox tests opt in explicitly.
+        "DSH_OS_SANDBOX": "0",
     }
     if fake_dsh:
         env["DSH_BIN"] = str(fake_dsh)

@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.9.1"
+SERVER_VERSION = "3.9.2"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -149,6 +149,10 @@ DEFAULTS = {
     "review_test_suite": "auto",
     "review_test_command": "",
     "review_test_timeout_seconds": 300.0,
+    # P3-2: a tiny reviewer pre-flight (same reviewer path, short timeout)
+    # must answer READY before the connector starts the paid review.
+    "review_preflight": True,
+    "review_preflight_timeout": 45.0,
     "review_context_max_chars": 60000,
     "daily_alert_usd": None,
     "daily_limit_usd": None,
@@ -215,6 +219,11 @@ DEFAULTS = {
     # Restart helper: configurable client application name ("" means ask the
     # caller; the tool accepts app_name per call).
     "client_app_name": "Claude",
+    # P3.2 detached restart helper. Empty restart_status_path means
+    # <state_dir>/restart-status.json.
+    "restart_status_path": "",
+    "restart_helper_attempts": 3,
+    "restart_helper_retry_seconds": 2.0,
     # Automatic skill building (v3.7.0). Thresholds are read defensively by
     # callers, so a bare Config({}) or SimpleNamespace still works.
     "auto_skills": "auto",
@@ -338,6 +347,8 @@ ENV_MAP = {
     "DEEPSEEK_REVIEW_TEST_SUITE": "review_test_suite",
     "DSH_REVIEW_TEST_COMMAND": "review_test_command",
     "DEEPSEEK_REVIEW_TEST_COMMAND": "review_test_command",
+    "DSH_REVIEW_PREFLIGHT": "review_preflight",
+    "DSH_REVIEW_PREFLIGHT_TIMEOUT": "review_preflight_timeout",
     "DSH_INDEPENDENT_REVIEW": "independent_review",
     "DEEPSEEK_INDEPENDENT_REVIEW": "independent_review",
     "DSH_DAILY_ALERT_USD": "daily_alert_usd",
@@ -402,6 +413,12 @@ ENV_MAP = {
     "DEEPSEEK_KEEP_JOBS": "keep_jobs",
     "DSH_CLIENT_APP_NAME": "client_app_name",
     "DEEPSEEK_CLIENT_APP_NAME": "client_app_name",
+    "DSH_RESTART_STATUS_PATH": "restart_status_path",
+    "DEEPSEEK_MCP_RESTART_STATUS_PATH": "restart_status_path",
+    "DSH_RESTART_HELPER_ATTEMPTS": "restart_helper_attempts",
+    "DEEPSEEK_MCP_RESTART_HELPER_ATTEMPTS": "restart_helper_attempts",
+    "DSH_RESTART_HELPER_RETRY_SECONDS": "restart_helper_retry_seconds",
+    "DEEPSEEK_MCP_RESTART_HELPER_RETRY_SECONDS": "restart_helper_retry_seconds",
     # Newer DSH_* first; only the aliases frozen in the v3.7.0 contract table
     # exist (no invented per-threshold legacy names).
     "DSH_AUTO_SKILLS": "auto_skills",
@@ -422,8 +439,9 @@ BOOL_KEYS = {"quality", "independent_review", "child_progress",
              "auto_skills_store_evidence_text",
              "auto_skills_capture_explicit_none", "allow_writing_reviewer",
              "health_gate", "allow_first_phase_overrun",
-             "reserve_resume_slot"}
+             "reserve_resume_slot", "review_preflight"}
 INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
+             "restart_helper_attempts",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
             "task_ttl", "max_explicit_subagents",
             "live_scaling_max_extra_waves", "retention_days", "keep_runs",
@@ -462,9 +480,10 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "auto_skills_cluster_cooldown_hours",
               "auto_skills_refresh_cooldown_days",
               "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
-              "review_context_max_chars"}
+              "review_context_max_chars", "review_preflight_timeout",
+              "restart_helper_retry_seconds"}
 PATH_KEYS = {"log_dir", "jobs_dir", "pid_file", "skills_dir", "harness_workspace",
-             "dsh_sessions_dir", "state_dir", "chrome_bin"}
+             "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path"}
 
 
 class Config:

@@ -203,7 +203,7 @@ class HelperCommandTests(unittest.TestCase):
         self.assertEqual(win["open"], ["cmd", "/c", "start", "", "Claude Desktop"])
 
         linux = platforms.restart_client_command(system="Linux", app_name="Claude Desktop")
-        self.assertEqual(linux["quit"], ["pkill", "-f", "Claude Desktop"])
+        self.assertEqual(linux["quit"], ["pkill", "-x", "claude-desktop"])
         self.assertEqual(linux["open"], ["gtk-launch", "claude-desktop"])
         self.assertIsNone(platforms.restart_client_command(system="Linux", app_name=" "))
 

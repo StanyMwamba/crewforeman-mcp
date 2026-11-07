@@ -175,6 +175,11 @@ TOOLS = [
                                  "enum": ["read-only", "workspace-write", "danger-full-access"],
                                  "description": ("Permission preset for the independent reviewer "
                                                  "(default read-only; the builder cannot widen it).")},
+            "review_preflight": {"type": "boolean",
+                                 "description": ("Run a near-free READY ping through the same "
+                                                 "reviewer path before each paid review (default "
+                                                 "true; a quota/auth/unreachable failure stops "
+                                                 "the review with a vendor-correct remedy).")},
             "approval": {"type": "string", "enum": ["ask", "never"],
                          "description": "Approval policy passed to the resolved DSH permission preset."},
             "transport": {"type": "string", "enum": ["headless", "sdk", "auto"],
@@ -361,7 +366,10 @@ TOOLS = [
                         "or application cannot be restarted automatically; restart it manually then."),
         "inputSchema": {"type": "object", "properties": {
             "app_name": {"type": "string", "description": "Application name, for example Cursor or Claude."},
-            "wait_seconds": {"type": "number", "description": "Seconds to wait before reopening (default 5)."}}},
+            "wait_seconds": {"type": "number", "description": "Seconds to wait before reopening (default 5)."},
+            "restart_status_path": {"type": "string",
+                                    "description": ("Optional JSON status file for the detached "
+                                                    "restart helper (default <state_dir>/restart-status.json).")}}},
     },
     {
         "name": "deepseek_maintenance",

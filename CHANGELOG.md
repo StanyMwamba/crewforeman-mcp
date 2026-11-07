@@ -5,6 +5,76 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.2
+
+### Added
+
+- Detached client-restart helper (`deepseek_mcp/restart_helper.py`):
+  `restart_client_app` now closes the client, schedules a helper that
+  survives the client exit (POSIX `start_new_session`, Windows
+  `DETACHED_PROCESS`), waits, reopens, verifies with `osascript`/exact
+  `pgrep -x`/`tasklist`, retries a few times, and records JSON status at
+  `restart-status.json` (`restart_status_path`, `restart_helper_attempts`,
+  `restart_helper_retry_seconds`). No version bump.
+- Release-safety guidance in `docs/OPERATIONS.md`: the builder never pushes,
+  tags or publishes; a separate post-acceptance step pushes exactly the
+  reviewed commit after `review_status=accepted` and `review_passed=true`,
+  checking HEAD, clean status and the review report. The optional future flag
+  `forbid_network_side_effects_until_accepted` is documented as not yet
+  implemented because DSH has no reliable same-job git/network interception
+  point.
+- P3.2 resumable reviews: the connector writes `REVIEW.partial.md` and
+  `REVIEW.partial.json` with areas checked, findings/evidence and tests rerun,
+  refreshed by a heartbeat while the reviewer runs. The reviewer emits
+  structured `@@REVIEW_PROGRESS@@` checkpoint lines that the connector parses
+  and persists live, so a hard kill keeps the findings and completed areas.
+  An interrupted review is resumed from that checkpoint: the new reviewer
+  checks only the remaining areas, and carried findings are merged into one
+  `REVIEW.md` under their original blocking/non-blocking headings.
+- P3.2 reviewer pre-flight: a near-free `READY` ping through the same reviewer
+  path runs before the paid review. No credit/quota, auth failure or
+  unreachable reviewer stops the review with a vendor-correct remedy
+  (`review_preflight`, `review_preflight_timeout`, `DSH_REVIEW_PREFLIGHT`).
+- P3.2 reviewer usage visibility: per-review-round input, cache-read, output,
+  total tokens and (when `reviewer_prices` are configured) cost are shown in
+  the run `.json` and `.md`, the job result text and structured job status;
+  the pre-flight reviewer call is folded into the same round/aggregate counts.
+
+### Fixed
+
+- Test portability in root/read-only Linux sandboxes: `tests/__init__.py` no
+  longer creates nonexistent explicit `TMPDIR`/`TMP`/`TEMP` candidates; it
+  probes only existing explicit directories and still creates the deliberate
+  repository/workspace/cache fallbacks.  New `tests.tempdir()` and
+  `tests.make_tempdir()` helpers return a verified writable directory or raise
+  `unittest.SkipTest` with an environment-only reason.  The retry, health and
+  tempdir tests now use those helpers and a regular-file blocker instead of
+  `/no/such/...`, which uid 0 could create.  See `docs/OPERATIONS.md`.
+- Linux restart safety: the default helper now matches the app's exact
+  process name (`pkill -x`/`pgrep -x`) instead of the full command line, so
+  its own `--app-name` argv cannot kill or satisfy verification. Reopened
+  processes are checked against the expected executable path.
+- Resume severity: defect extraction now keeps `## Blocking defects` and
+  `## Non-blocking defects` distinct, and carried findings merge back under
+  their own heading instead of being promoted to blocking. A carried finding
+  that the resumed report repeats under the other heading is now moved back to
+  the checkpoint's original section (evidence preserved) instead of being
+  skipped; the connector matches carried findings by normalised text and
+  severity group, and on a resumed review treats the merged report's
+  blocking/non-blocking sections as authoritative over the trailing
+  `Blocking defects: N` summary, so a stale count cannot hide or promote a
+  moved finding. Relocation is decided from the actual Markdown heading, so
+  the prompt-rendered inline `[blocking]`/`[non-blocking]` tag cannot suppress
+  moving a repeat that sits under the wrong heading. This closes both the
+  false-accept and false-promotion cases.
+  See `tests/test_p32_review_resume.py` and
+  `tests/test_p32_resume_acceptance.py`.
+- Restart executable identity: `_same_executable` no longer accepts a bare
+  basename match. It requires both paths to exist and be the same real path or
+  the same inode (`os.path.samefile`), so a different executable with the same
+  name cannot satisfy restart verification. Symlink resolution is retained;
+  see `tests/test_p32_restart.py`.
+
 ## 3.9.1
 
 ### Added

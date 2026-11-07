@@ -214,6 +214,17 @@ def _md(run):
             if entry.get("kind") == "review":
                 detail += ", %s blocking defect(s)" % entry.get("blocking_defects", 0)
             lines.append(detail)
+            cost_text = ("$%s" % fmt_cost(entry.get("cost"))
+                         if entry.get("cost") is not None
+                         else "cost unknown (reviewer_prices not configured)")
+            lines.append("    - usage: input %s (uncached) / cache read %s / "
+                         "output %s / total %s / %s%s" % (
+                             entry.get("tokens_in", "?"),
+                             entry.get("cache_read_tokens", "?"),
+                             entry.get("tokens_out", "?"),
+                             entry.get("total_tokens", "?"), cost_text,
+                             " (incl. pre-flight)"
+                             if entry.get("preflight_usage") else ""))
     if run.get("skill"):
         lines.append("- **Skill:** %s" % run.get("skill"))
     if run.get("agent_choice_reason"):

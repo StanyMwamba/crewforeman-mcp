@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.9.1)
+# Known limitations and failure modes (3.9.2)
 
 Only limitations that remain in this version are listed here.
 
@@ -9,7 +9,7 @@ Only limitations that remain in this version are listed here.
 | Windows | Windows behaviour is exercised with fakes and the CI matrix; it has not had the same manual field use as macOS. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Report a failing case with the run id. |
 | Resume | Resume can only continue from a checkpoint boundary. Work done by a DSH process killed mid-tool-call is repeated. | Skeleton and checkpoints are written before each phase; finished revisions are reused. |
 | Live scaling | The candidate score is a deterministic heuristic, not a model review. It can misjudge unusually formatted output. | Threshold, max extra waves and the whole-job budget are configurable; set `live_scaling=false` to disable. |
-| Reviewer | The reviewer is a fresh Harness process but uses the same provider and model family as the builder. | Treat `REVIEW.md` as independent-in-process, not independent-in-model. |
+| Reviewer | By default the reviewer is a fresh Harness process that uses the same provider and model family as the builder. A separately configured reviewer wrapper can use another vendor (see `docs/REVIEWER.md`). | Treat the default `REVIEW.md` as independent-in-process, not independent-in-model. |
 | Traces | Export is optional and best effort. A broken OTLP/Langfuse endpoint is logged; it never fails the run. | Traces and timelines remain on disk under the state directory. |
 | Retention | Cleanup is off by default (`retention_days=0`) and never removes the newest `keep_runs`/`keep_jobs`. | Use `deepseek_maintenance` with `dry_run` first. |
 | Browser | `take_screenshot` needs an installed Chrome/Edge or an OS screenshot helper and, on macOS, Screen Recording permission. | Returns `unsupported` with the missing dependency; it does not install anything. |
