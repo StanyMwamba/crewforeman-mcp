@@ -24,8 +24,9 @@ import time
 from .api import redact_secrets
 
 ALGORITHM = "sha256"
-IGNORED_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
-IGNORED_NAMES = {"REVIEW.md"}
+IGNORED_DIRS = {".git", "__pycache__", ".pycache", ".mypy_cache",
+                ".pytest_cache", ".ruff_cache", ".tmp"}
+IGNORED_NAMES = {"REVIEW.md", ".DS_Store"}
 IGNORED_PREFIXES = (".dsh-tmp-",)
 STATE_DIRS = {"state", ".state", "state_dir"}
 _TEXT_LIMIT_DEFAULT = 60000
@@ -39,6 +40,8 @@ def _ignored(rel_path, ignore=None):
             return True
     name = parts[-1]
     if name in IGNORED_NAMES or name.startswith(IGNORED_PREFIXES):
+        return True
+    if name.endswith((".pyc", ".pyo")):
         return True
     if ignore:
         for pattern in ignore:
@@ -234,15 +237,38 @@ def _parse_counts(output):
     return tests, failures, errors
 
 
-def _auto_command(workspace):
-    tests_dir = os.path.join(workspace, "tests")
-    if not os.path.isdir(tests_dir):
-        return None
+def _detect_test_project(workspace):
+    """Return the project root that has tests/test_*.py, or None.
+
+    The workspace itself wins for backward compatibility. Otherwise inspect
+    direct child project directories, preferring ``repo`` and then
+    alphabetical order. This covers a workspace whose checkout lives in
+    ``<workspace>/repo`` while the connector still reviews the workspace.
+    """
+    candidates = [workspace]
     try:
-        entries = os.listdir(tests_dir)
+        children = [name for name in os.listdir(workspace)
+                    if name != "tests"
+                    and os.path.isdir(os.path.join(workspace, name))]
     except OSError:
-        return None
-    if not any(re.match(r"^test_.+\.py$", name) for name in entries):
+        children = []
+    children.sort(key=lambda name: (name.lower() != "repo", name.lower()))
+    candidates.extend(os.path.join(workspace, name) for name in children)
+    for candidate in candidates:
+        tests_dir = os.path.join(candidate, "tests")
+        if not os.path.isdir(tests_dir):
+            continue
+        try:
+            entries = os.listdir(tests_dir)
+        except OSError:
+            continue
+        if any(re.match(r"^test_.+\.py$", name) for name in entries):
+            return os.path.abspath(candidate)
+    return None
+
+
+def _auto_command(workspace):
+    if _detect_test_project(workspace) is None:
         return None
     return [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"]
 
@@ -289,12 +315,16 @@ def run_test_suite(workspace, command=None, timeout=300.0, env=None,
     before = tree_digest(workspace)
     spec = _normalize_command(command)
     auto = False
+    project_root = workspace
     if spec is None:
-        spec = _auto_command(workspace)
         auto = True
+        project_root = _detect_test_project(workspace)
+        if project_root is not None:
+            spec = _auto_command(workspace)
     if spec is None:
         skipped = {
             "status": "skipped", "command": None, "exit_code": None, "tests": 0,
+            "project_root": None,
             "failures": 0, "errors": 0, "output_digest": hashlib.sha256(b"").hexdigest(),
             "output_tail": "No explicit test command and no tests/ directory with "
                            "test_*.py files was found; suite skipped.",
@@ -315,7 +345,7 @@ def run_test_suite(workspace, command=None, timeout=300.0, env=None,
     proc = None
     try:
         kwargs = {
-            "cwd": workspace,
+            "cwd": project_root,
             "env": _safe_env(env),
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
@@ -378,6 +408,7 @@ def run_test_suite(workspace, command=None, timeout=300.0, env=None,
         "tree_changed": before["sha256"] != after["sha256"],
         "timed_out": timed_out,
         "auto_detected": auto,
+        "project_root": project_root,
         "algorithm": ALGORITHM,
         "signed": True,
         "key_id": key_id,
@@ -499,22 +530,74 @@ def _read_text(path):
     return raw.decode("utf-8", "replace")
 
 
+def _diff_priority(rel):
+    """Sort changed files so source/tests reach the reviewer before artifacts.
+
+    A from-scratch run has an empty baseline, so every file is "added".  The
+    old alphabetical walk spent the whole character budget on documentation
+    and the patch file before any implementation file appeared.  The reviewer
+    then had to read the whole repository, which is exactly the cost R2 is
+    meant to avoid.  Keep this ordering deterministic and simple.
+    """
+    path = str(rel or "").replace("\\", "/").lower()
+    name = path.rsplit("/", 1)[-1]
+    if name.endswith((".log", ".patch", ".diff", ".zip", ".tar", ".gz")):
+        return (8, path)
+    if "candidates/" in ("/" + path):
+        # Candidate trees duplicate the final deliverable; show them only
+        # after the real checkout and generated artifacts.
+        return (6, path)
+    if path.endswith((".md", ".rst", ".txt")):
+        return (7, path)
+    if path.startswith("repo/"):
+        if path.startswith("repo/deepseek_mcp/") or "/deepseek_mcp/" in path:
+            return (0, path)
+        if path.startswith("repo/tests/") or "/tests/" in ("/" + path) or name.startswith("test_"):
+            return (1, path)
+        if name.endswith(".py"):
+            return (2, path)
+        return (4, path)
+    if "/tests/" in ("/" + path) or name.startswith("test_"):
+        return (2, path)
+    if "deepseek_mcp/" in path:
+        return (2, path)
+    if name.endswith(".py"):
+        return (2, path)
+    if name in ("pyproject.toml", "setup.cfg", "setup.py") or name.startswith("config."):
+        return (4, path)
+    return (5, path)
+
+
 def diff_context(workspace, baseline, max_files=20, max_chars=60000,
-                 max_file_bytes=262144):
+                 max_file_bytes=262144, max_file_chars=8000,
+                 focus_paths=None):
     """Unified diffs for changed/added/deleted files against a baseline.
 
     Binary/oversized files yield a metadata-only entry (path + reason) instead
-    of disappearing from the changed-file list.
+    of disappearing from the changed-file list.  ``max_file_chars`` bounds each
+    individual body so one generated patch/log cannot consume the whole review
+    context before the source files are shown.
     """
     workspace = os.path.abspath(str(workspace))
+    focus = {str(item).replace("\\", "/").strip("/")
+             for item in (focus_paths or []) if str(item).strip()}
+
+    def _order(rel):
+        rel = str(rel or "").replace("\\", "/")
+        return (0 if rel in focus else 1, _diff_priority(rel))
+
     files = list((baseline or {}).get("files") or [])
+    files.sort(key=lambda entry: _order(
+        entry.get("path") if isinstance(entry, dict) else entry))
     base_dir = os.path.join(os.path.abspath(str((baseline or {}).get("dir") or "")), "files")
     stats = {"added": 0, "changed": 0, "deleted": 0}
     chunks = []
     changed_files = []
     truncated = False
+    omitted = 0
     limit = int(max_files)
     max_chars = int(max_chars)
+    max_file_chars = max(1000, int(max_file_chars))
     for entry in files:
         if len(changed_files) >= limit:
             truncated = True
@@ -578,8 +661,8 @@ def diff_context(workspace, baseline, max_files=20, max_chars=60000,
             diff = ["--- %s\n+++ %s\n[content changed but lines unavailable]\n"
                     % (fromfile, tofile)]
         body = "".join(diff)
-        if new_text is None and len(body) > 20000:
-            body = body[:20000] + "\n[diff truncated]\n"
+        if len(body) > max_file_chars:
+            body = body[:max_file_chars] + "\n[file diff truncated]\n"
             truncated = True
         chunks.append(body)
         current = "".join(chunks)
@@ -588,8 +671,14 @@ def diff_context(workspace, baseline, max_files=20, max_chars=60000,
             break
     seen = {entry.get("path") if isinstance(entry, dict) else str(entry) for entry in files}
     baseline_root = os.path.abspath(str((baseline or {}).get("dir") or "")) if baseline else ""
-    for rel, full in _iter_files(workspace):
-        if rel in seen or len(changed_files) >= limit:
+    added_files = sorted(_iter_files(workspace),
+                         key=lambda item: _order(item[0]))
+    for rel, full in added_files:
+        if rel in seen:
+            continue
+        if len(changed_files) >= limit:
+            omitted += 1
+            truncated = True
             continue
         if baseline_root and os.path.commonpath(
                 [os.path.abspath(full), baseline_root]) == baseline_root:
@@ -613,22 +702,30 @@ def diff_context(workspace, baseline, max_files=20, max_chars=60000,
             continue
         stats["added"] += 1
         changed_files.append(rel)
-        chunks.append("".join(
+        body = "".join(
             difflib.unified_diff([], text_new.splitlines(keepends=True),
-                                 fromfile="/dev/null", tofile="b/%s" % rel, n=3)))
+                                 fromfile="/dev/null", tofile="b/%s" % rel, n=3))
+        if len(body) > max_file_chars:
+            body = body[:max_file_chars] + "\n[file diff truncated]\n"
+            truncated = True
+        chunks.append(body)
         if len("".join(chunks)) > max_chars:
             truncated = True
             break
     text = "".join(chunks)
+    if omitted:
+        text += ("\n[%d changed file(s) omitted after the review context limit]\n"
+                 % omitted)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n[diff context truncated]\n"
         truncated = True
-    return {"text": text, "files": changed_files, "stats": stats, "truncated": truncated}
+    return {"text": text, "files": changed_files, "stats": stats,
+            "truncated": truncated, "omitted": omitted}
 
 
 def review_focus_text(baseline, workspace, prior_defects=None, max_chars=60000,
                       round_no=1, prior_signatures=None,
-                      max_file_bytes=262144):
+                      max_file_bytes=262144, focus_paths=None):
     """Bounded R2/R3 reviewer block: connector diff plus targeted-round guidance."""
     max_chars = int(max_chars)
     header = ("## Connector diff (start here)\n\n"
@@ -636,7 +733,8 @@ def review_focus_text(baseline, workspace, prior_defects=None, max_chars=60000,
               "context only for changed files; do not read the whole repo.\n\n")
     diff = diff_context(workspace, baseline,
                         max_chars=max(2000, max_chars - len(header) - 1500),
-                        max_file_bytes=max_file_bytes)
+                        max_file_bytes=max_file_bytes,
+                        focus_paths=focus_paths)
     body = header + (diff["text"] or "(No text changes were detected.)\n")
     defects = [str(item).strip() for item in (prior_defects or []) if str(item).strip()]
     if defects:
@@ -662,9 +760,29 @@ def format_test_evidence(result):
     command = result.get("command")
     if isinstance(command, (list, tuple)):
         command = " ".join(str(part) for part in command)
+    status = str(result.get("status") or "unknown")
+    tree_changed = bool(result.get("tree_changed"))
+    project_root = result.get("project_root") or "(not detected)"
+    if status == "ok" and not tree_changed:
+        guidance = (
+            "Trust this signed result for this exact tree; do not rerun the full suite. "
+            "Rerun only a new test or a test directly related to a suspected defect; if suspicious, rerun everything."
+        )
+    elif status == "skipped":
+        guidance = (
+            "Connector tests did not run (skipped). Do not treat this as passing "
+            "evidence; run only the relevant or new tests for the changed files."
+        )
+    else:
+        guidance = (
+            "This evidence is not a clean pass (status: %s%s). Do not trust it; "
+            "rerun only the affected tests and inspect the failure output."
+            % (status, ", tree changed" if tree_changed else "")
+        )
     return (
         "## Signed test evidence (connector-run)\n\n"
         "- Status: %s\n"
+        "- Project root: `%s`\n"
         "- Command: `%s`\n"
         "- Tree SHA-256: `%s`\n"
         "- Tests: %s (failures: %s, errors: %s)\n"
@@ -672,14 +790,11 @@ def format_test_evidence(result):
         "- Connector signature (HMAC-SHA256): `%s`\n"
         "- Key reference: `%s`\n"
         "- Tree changed while the suite ran: %s\n"
-        "- Output tail:\n\n```\n%s\n```\n\n"
-        "The reviewer may trust this evidence for this exact tree only. Do not trust it if "
-        "the tree hash changed. Rerun only the new or defect-related tests; you may rerun "
-        "everything if you are suspicious.\n"
-        % (result.get("status"), command or "(none)", result.get("tree_sha256"),
+        "- Output tail:\n\n```\n%s\n```\n\n%s\n"
+        % (status, project_root, command or "(none)", result.get("tree_sha256"),
            result.get("tests", 0), result.get("failures", 0), result.get("errors", 0),
            result.get("output_digest"), result.get("signature"),
            result.get("key_id") or "(in-memory test key)",
-           "YES (rerun the affected tests)" if result.get("tree_changed")
-           else "no", str(result.get("output_tail") or "")[:4000])
+           "YES (rerun the affected tests)" if tree_changed else "no",
+           str(result.get("output_tail") or "")[:4000], guidance)
     )

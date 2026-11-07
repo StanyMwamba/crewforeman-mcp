@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.9.0"
+SERVER_VERSION = "3.9.1"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -70,6 +70,10 @@ DEFAULTS = {
     "dsh_bin": _DSH_DEFAULT,
     "harness_workspace": os.path.join(BASE_DIR, "harness-workspace"),
     "dsh_sessions_dir": "~/.dsh/sessions",
+    # Optional per-model reviewer rates in USD per million tokens:
+    # {"model": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}. Empty means
+    # tokens are recorded but reviewer cost stays unknown.
+    "reviewer_prices": {},
     "state_dir": os.path.join(BASE_DIR, "state"),
     "zstd_bin": "zstd",
     "model": "deepseek-flash",

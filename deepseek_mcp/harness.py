@@ -87,25 +87,35 @@ def _filter_session_ids(paths, session_ids):
     return [path for path in paths if path.parent.name in session_ids]
 
 
-def find_session_logs(cfg, workspace, since=None, session_ids=None):
+def find_session_logs(cfg, workspace, since=None, session_ids=None, session_dirs=None):
     """Find session logs for a workspace, newest first.
 
     First looks in the encoded workspace directory. If that is missing, scans
     recent logs elsewhere under the sessions root and matches the ``cwd`` in the
     session header (reading ~/.dsh/sessions is explicitly allowed).
+    ``session_dirs`` adds extra session roots (for example a reviewer's private
+    DSH_HOME) without changing the default single-root behaviour.
     """
-    base = Path(cfg.dsh_sessions_dir)
-    if not base.is_dir():
+    bases = []
+    for root in [cfg.dsh_sessions_dir] + list(session_dirs or []):
+        try:
+            base = Path(root).expanduser()
+        except TypeError:
+            continue
+        if base.is_dir() and base not in bases:
+            bases.append(base)
+    if not bases:
         return []
     # A session log for this run is created/written after ``since``. Do not
     # include prior runs' logs from the same shared workspace.
     cutoff = (time.time() - 300) if since is None else (float(since) - 5)
-    encoded_dir = base / encode_workspace(workspace)
     found = []
-    search_dirs = [encoded_dir] if encoded_dir.is_dir() else []
-    for directory in search_dirs:
+    for base in bases:
+        encoded_dir = base / encode_workspace(workspace)
+        if not encoded_dir.is_dir():
+            continue
         for pattern in ("*.jsonl.zstd", "*.jsonl.zst", "*.jsonl"):
-            for path in directory.rglob(pattern):
+            for path in encoded_dir.rglob(pattern):
                 try:
                     if path.is_file() and path.stat().st_mtime >= cutoff:
                         found.append(path)
@@ -117,15 +127,18 @@ def find_session_logs(cfg, workspace, since=None, session_ids=None):
 
     # Fallback: other workspace folders. Only inspect recent, small-ish files.
     candidates = []
-    try:
-        for pattern in ("*.jsonl.zstd", "*.jsonl.zst", "*.jsonl"):
-            for path in base.rglob(pattern):
-                try:
-                    if path.is_file() and path.stat().st_mtime >= cutoff:
-                        candidates.append(path)
-                except OSError:
-                    continue
-    except OSError:
+    for base in bases:
+        try:
+            for pattern in ("*.jsonl.zstd", "*.jsonl.zst", "*.jsonl"):
+                for path in base.rglob(pattern):
+                    try:
+                        if path.is_file() and path.stat().st_mtime >= cutoff:
+                            candidates.append(path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    if not candidates:
         return []
     candidates.sort(key=_mtime, reverse=True)
     targets = {str(workspace), str(Path(workspace).resolve())}
@@ -216,16 +229,50 @@ def _usage_from_event(obj):
     return None
 
 
-def _prices_for(model):
+def _normalise_prices(entry):
+    """Normalise a configured price row to miss/hit/out per million tokens."""
+    if not isinstance(entry, dict):
+        return None
+    miss = entry.get("input", entry.get("miss"))
+    hit = entry.get("cache_read", entry.get("hit"))
+    out = entry.get("output", entry.get("out"))
+    # All three rates are required: turning a partial row into zero would
+    # fabricate a low cost and claim cost_known=true.
+    if miss is None or hit is None or out is None:
+        return None
+    try:
+        return {"miss": float(miss), "hit": float(hit), "out": float(out)}
+    except (TypeError, ValueError):
+        return None
+
+
+def _prices_for(model, prices=None):
+    """Resolve model prices, preferring configured reviewer prices.
+
+    Configured rows accept ``input``/``cache_read``/``output`` (or the legacy
+    ``miss``/``hit``/``out`` aliases). DeepSeek's built-in HARNESS_PRICES stay
+    authoritative whenever the configured table has no row for the model.
+    """
+    table = prices if isinstance(prices, dict) else {}
+    for known, entry in table.items():
+        if model == known:
+            resolved = _normalise_prices(entry)
+            if resolved is not None:
+                return resolved, known
+    for known, entry in table.items():
+        if model and str(model).startswith(str(known)):
+            resolved = _normalise_prices(entry)
+            if resolved is not None:
+                return resolved, known
     if model in api.HARNESS_PRICES:
         return api.HARNESS_PRICES[model], model
-    for known, prices in api.HARNESS_PRICES.items():
+    for known, known_prices in api.HARNESS_PRICES.items():
         if model and str(model).startswith(known):
-            return prices, known
+            return known_prices, known
     return None, model or "unknown"
 
 
-def parse_session_usage(text, default_model="deepseek-flash"):
+def parse_session_usage(text, default_model="deepseek-flash", prices=None):
     """Sum usage from decoded session JSONL.
 
     Deduplicates repeated usage attached to the same assistant message. Input
@@ -271,18 +318,18 @@ def parse_session_usage(text, default_model="deepseek-flash"):
         bucket["input"] += inp
         bucket["cache_read"] += cache
         bucket["output"] += out
-        if _prices_for(model)[0] is None and model not in unknown_models:
+        if _prices_for(model, prices)[0] is None and model not in unknown_models:
             unknown_models.append(model)
 
     total_cost = 0.0
     for model, bucket in models.items():
-        prices, _resolved = _prices_for(model)
-        if not prices:
+        resolved_prices, _resolved = _prices_for(model, prices)
+        if not resolved_prices:
             continue
         total_cost += (
-            bucket["input"] * prices["miss"]
-            + bucket["cache_read"] * prices["hit"]
-            + bucket["output"] * prices["out"]
+            bucket["input"] * resolved_prices["miss"]
+            + bucket["cache_read"] * resolved_prices["hit"]
+            + bucket["output"] * resolved_prices["out"]
         ) / 1000000.0
 
     cost_known = bool(messages) and not unknown_models
@@ -299,14 +346,18 @@ def parse_session_usage(text, default_model="deepseek-flash"):
     }
 
 
-def read_session_usage(cfg, workspace, since, session_ids=None, exclude_paths=None):
+def read_session_usage(cfg, workspace, since, session_ids=None, exclude_paths=None,
+                       session_dirs=None, prices=None, default_model="deepseek-flash"):
     """Aggregate usage for all session logs of a run. Returns ``(usage, paths, reason)``."""
-    paths = find_session_logs(cfg, workspace, since, session_ids=session_ids)
+    paths = find_session_logs(cfg, workspace, since, session_ids=session_ids,
+                              session_dirs=session_dirs)
     if exclude_paths:
         excluded = {str(path) for path in exclude_paths}
         paths = [path for path in paths if str(path) not in excluded]
     if not paths:
-        return None, [], "no session log found under %s" % cfg.dsh_sessions_dir
+        roots = [str(cfg.dsh_sessions_dir)]
+        roots += [str(Path(root).expanduser()) for root in (session_dirs or [])]
+        return None, [], "no session log found under %s" % ", ".join(roots)
     aggregate = {
         "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0,
         "total_tokens": 0, "messages": 0, "models": {}, "unknown_models": [],
@@ -331,7 +382,8 @@ def read_session_usage(cfg, workspace, since, session_ids=None, exclude_paths=No
             unreadable += 1
             continue
         readable.append(str(path))
-        parsed = parse_session_usage(text)
+        parsed = parse_session_usage(text, default_model=default_model,
+                                     prices=prices)
         for key in ("input_tokens", "cache_read_tokens", "output_tokens",
                     "total_tokens", "messages"):
             aggregate[key] += parsed[key]
@@ -356,12 +408,73 @@ def read_session_usage(cfg, workspace, since, session_ids=None, exclude_paths=No
     elif aggregate["unknown_models"] or aggregate["messages"] == 0:
         aggregate["cost_known"] = False
         aggregate["estimated_cost_usd"] = None
-        reason = "unrecognised model or no usage entries in session logs"
+        if (prices is not None and aggregate["unknown_models"]
+                and all(model == "unknown-reviewer-model"
+                        for model in aggregate["unknown_models"])):
+            reason = ("reviewer model name missing from session logs; no "
+                      "configured price can be applied")
+        elif prices is not None and aggregate["unknown_models"]:
+            reason = ("no configured reviewer price for %s"
+                      % ", ".join(aggregate["unknown_models"]))
+        else:
+            reason = "unrecognised model or no usage entries in session logs"
     else:
         aggregate["cost_known"] = True
         aggregate["estimated_cost_usd"] = round(aggregate["estimated_cost_usd"], 6)
         reason = None
     return aggregate, readable, reason
+
+
+def _reviewer_usage_aggregate(entries):
+    """Aggregate token usage and known cost across reviewer review entries."""
+    input_tokens = cached_tokens = output_tokens = total_tokens = 0
+    models = {}
+    known = True
+    cost = 0.0
+    seen = False
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("kind", "review") != "review":
+            continue
+        seen = True
+        usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+        inp = entry.get("tokens_in")
+        cached = entry.get("cache_read_tokens")
+        out = entry.get("tokens_out")
+        total = entry.get("total_tokens")
+        if inp is None:
+            inp = usage.get("input_tokens")
+        if cached is None:
+            cached = usage.get("cache_read_tokens")
+        if out is None:
+            out = usage.get("output_tokens")
+        if total is None:
+            total = usage.get("total_tokens")
+        inp, cached, out = int(inp or 0), int(cached or 0), int(out or 0)
+        total = int(total if total is not None else inp + cached + out)
+        input_tokens += inp
+        cached_tokens += cached
+        output_tokens += out
+        total_tokens += total
+        for model, bucket in (entry.get("models") or {}).items():
+            if not isinstance(bucket, dict):
+                continue
+            target = models.setdefault(model, {"input": 0, "cache_read": 0, "output": 0})
+            for field in ("input", "cache_read", "output"):
+                target[field] += int(bucket.get(field) or 0)
+        if entry.get("cost_known") and isinstance(entry.get("cost"), (int, float)):
+            cost += float(entry["cost"])
+        else:
+            known = False
+    known = bool(known and seen)
+    return {
+        "input": input_tokens,
+        "cached": cached_tokens,
+        "output": output_tokens,
+        "total": total_tokens,
+        "models": models,
+        "cost_known": known,
+        "estimated_cost_usd": round(cost, 6) if known else None,
+    }
 
 
 # ----------------------------------------------------------------- event parse
@@ -1110,8 +1223,14 @@ def _reviewer_home(cfg, workspace, policy, label):
         return None
 
 
-def _sdk_usage_cost(cfg, raw_usage):
-    """Normalise SDK usage and price it; ``(usage, cost_or_None)``."""
+def _sdk_usage_cost(cfg, raw_usage, label=None):
+    """Normalise SDK usage and price it; ``(usage, cost_or_None)``.
+
+    Reviewer phases price ``cfg.dsh_model`` through :func:`_prices_for` against
+    ``cfg.reviewer_prices``: a configured row wins, DeepSeek's built-in table
+    is the fallback, and an unresolvable/partial row leaves cost unknown.
+    Builder phases keep the historical built-in pricing.
+    """
     raw_usage = raw_usage if isinstance(raw_usage, dict) else {}
     usage = {
         "input_tokens": raw_usage.get("input_tokens"),
@@ -1120,7 +1239,21 @@ def _sdk_usage_cost(cfg, raw_usage):
     }
     if usage.get("input_tokens") is None:
         return usage, None
-    cost = api.estimate_cost(str(cfg.get("dsh_model") or "deepseek-flash"), {
+    model = str(cfg.get("dsh_model") or "deepseek-flash")
+    if _phase_kind(label) == "reviewer":
+        rates, _name = _prices_for(
+            model, getattr(cfg, "reviewer_prices", None))
+        if rates is None:
+            return usage, None
+        uncached = max(
+            (usage.get("input_tokens") or 0)
+            - (usage.get("cache_read_tokens") or 0), 0)
+        return usage, (
+            uncached * rates["miss"]
+            + (usage.get("cache_read_tokens") or 0) * rates["hit"]
+            + (usage.get("output_tokens") or 0) * rates["out"]
+        ) / 1_000_000
+    cost = api.estimate_cost(model, {
         "prompt_tokens": usage.get("input_tokens") or 0,
         "completion_tokens": usage.get("output_tokens") or 0,
         "prompt_cache_hit_tokens": usage.get("cache_read_tokens") or 0,
@@ -1131,9 +1264,9 @@ def _sdk_usage_cost(cfg, raw_usage):
 
 
 def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
-                          event_count, session_id):
+                          event_count, session_id, label=None):
     """Execution record for an SDK run stopped by the live cost ceiling."""
-    usage, cost = _sdk_usage_cost(cfg, raw_usage)
+    usage, cost = _sdk_usage_cost(cfg, raw_usage, label=label)
     return {
         "status": "error", "answer": None, "exit_code": None,
         "error": ("live cost usage crossed the whole-job ceiling; the "
@@ -1246,7 +1379,7 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
             cfg, policy, sandbox_meta, started,
             dict(getattr(client, "_usage", {}) or {}),
             len(getattr(client, "_events", []) or []),
-            client._session_id if client else None)
+            client._session_id if client else None, label=label)
     except transport_mod.Cancelled:
         return {
             "status": "cancelled", "answer": None, "exit_code": None,
@@ -1318,9 +1451,10 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                     cfg, policy, sandbox_meta, started, raw_usage,
                     len(result.get("events") or []),
                     result.get("session_id") or (
-                        client._session_id if client else None))
+                        client._session_id if client else None), label=label)
     answer = (result.get("answer") or "").strip()
-    usage, cost = _sdk_usage_cost(cfg, result.get("usage") or {})
+    usage, cost = _sdk_usage_cost(cfg, result.get("usage") or {},
+                                  label=label)
     try:
         outputs = sorted(
             str(path.relative_to(workspace))
@@ -1813,6 +1947,42 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
         elif reason == "stalled":
             errors.append(stall_state.get("error") or watch.error(
                 label, child_state.get("events", 0)))
+    # Read usage before the private reviewer home is removed: its session
+    # logs live under that DSH_HOME and are the only record of what the paid
+    # reviewer consumed.
+    # Refresh the child count now that the direct child is gone.  A nonzero
+    # "active" count can simply mean a session file is recent; for a reviewer,
+    # require actual post-exit growth before calling the phase in flight.  A
+    # reviewer that exited while a background child session was still writing
+    # has not finished and must not be recorded as a clean review.
+    child_sessions_in_flight = False
+    if activity is not None:
+        try:
+            activity.scan()
+            if _phase_kind(label) == "reviewer":
+                time.sleep(1.0)
+            final_activity = activity.scan()
+            child_state["active"] = int(final_activity.get("active") or 0)
+            child_sessions_in_flight = bool(final_activity.get("changed"))
+        except Exception:
+            pass
+    reviewer_session_dirs = None
+    if reviewer_home is not None:
+        reviewer_sessions = Path(reviewer_home) / "sessions"
+        if reviewer_sessions.is_dir():
+            reviewer_session_dirs = [reviewer_sessions]
+    reviewer_pricing = _phase_kind(label) == "reviewer"
+    try:
+        usage, session_logs, usage_reason = read_session_usage(
+            cfg, workspace, started, session_ids=session_ids or None,
+            exclude_paths=exclude_logs, session_dirs=reviewer_session_dirs,
+            prices=(getattr(cfg, "reviewer_prices", None) or {})
+            if reviewer_pricing else None,
+            default_model=("unknown-reviewer-model" if reviewer_pricing
+                           else "deepseek-flash"))
+    except Exception as exc:
+        usage, session_logs = None, []
+        usage_reason = "session usage read failed: %s" % exc
     if tmpdir:
         # The process tree is gone; browser temp files must not pollute the
         # output scan or the next run's workspace.
@@ -1844,9 +2014,6 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
     except Exception:
         outputs = []
 
-    usage, session_logs, usage_reason = read_session_usage(
-        cfg, workspace, started, session_ids=session_ids or None,
-        exclude_paths=exclude_logs)
     result = {
         "status": "ok" if code == 0 and final and not stalled else "error",
         "answer": final,
@@ -1888,6 +2055,7 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
         "stop_reason": stop_reason,
         "child_progress_events": child_state["events"],
         "child_sessions_active": child_state["active"],
+        "child_sessions_in_flight": child_sessions_in_flight,
         "tmpdir_isolated": bool(tmpdir),
         "reviewer_home_isolated": bool(reviewer_home),
         "sandbox": policy,
@@ -4621,7 +4789,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             prior_signatures=prior_signatures,
                             max_chars=int(cfg.get("review_context_max_chars",
                                                   60000) or 60000),
-                            round_no=round_no)
+                            round_no=round_no,
+                            focus_paths=deliverable_files)
                     except Exception as exc:
                         run["review_context_error"] = api.redact_secrets(str(exc))
                 review_task = build_review_task(
@@ -4634,6 +4803,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     prior_signatures=prior_signatures,
                     test_evidence=(review_context.format_test_evidence(
                         test_evidence) if test_evidence else None))
+                # Durable in-flight marker: the detached job wrapper reads
+                # this record after the handler returns and refuses to close
+                # the job while the paid review phase is still running.
+                run["review_in_flight"] = True
+                run["review_in_flight_round"] = int(round_no)
                 _persist(run, cfg, "review-%d" % round_no)
                 if trace:
                     trace.event("review-%d" % round_no, "start",
@@ -4720,6 +4894,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         live_usage_cb=review_live_cb)
                     reviewer_executions.append(review)
                     used_logs.update(review.get("session_logs") or [])
+                    if review.get("child_sessions_in_flight"):
+                        # A reviewer process that exited while a background
+                        # child session was still writing has not completed
+                        # the phase. Never let that review pass the gate.
+                        review["status"] = "error"
+                        review["error"] = (
+                            "reviewer child session was still writing when the "
+                            "reviewer process exited")
+                        review["review_phase_in_flight"] = True
+                        run["review_in_flight"] = True
                     _cost_settle(run, cost_ledger, "reviewer", review,
                                  job_budget,
                                  operation_id=(admission or {}).get(
@@ -4839,6 +5023,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "creative_cap": bool(parsed.get("creative_cap")),
                     "seconds": review.get("seconds"),
                     "cost": review.get("estimated_cost_usd"),
+                    "tokens_in": review.get("tokens_in"),
+                    "cache_read_tokens": review.get("cache_read_tokens"),
+                    "tokens_out": review.get("tokens_out"),
+                    "total_tokens": review.get("total_tokens"),
+                    "usage": review.get("usage"),
+                    "cost_known": review.get("cost_known"),
+                    "models": review.get("models"),
+                    "usage_unknown_reason": review.get("usage_unknown_reason"),
                     "status": review.get("status"),
                     "error": review.get("error"),
                     "stalled": bool(review.get("stalled")),
@@ -4859,6 +5051,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     entry.setdefault("signatures", [])
                     entry.setdefault("first_seen_round", {})
                 review_rounds.append(entry)
+                if not review.get("review_phase_in_flight"):
+                    run["review_in_flight"] = False
+                run["reviewer_usage"] = _reviewer_usage_aggregate(review_rounds)
+                run["reviewer_cost_known"] = run["reviewer_usage"]["cost_known"]
                 if checkpoint and str(review.get("stop_reason")) != "budget":
                     try:
                         checkpoint.finish(
@@ -5190,6 +5386,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         run["review_status"] = "disabled"
         run["review_rounds"] = []
         run["quality_rounds_used"] = 0
+        run["reviewer_usage"] = _reviewer_usage_aggregate([])
+        run["reviewer_cost_known"] = False
 
     run["deliverable_files"] = deliverable_files
     all_executions = executions + reviewer_executions
@@ -5240,7 +5438,36 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     current_status = run.get("status")
     hard_stop = current_status in ("cancelled", "deadline_exceeded",
                                    "budget_exceeded", "no_balance", "error")
-    if not hard_stop:
+    review_entries = [item for item in review_rounds
+                      if item.get("kind") == "review"]
+    review_recorded = bool(review_entries)
+    run["review_recorded"] = review_recorded if independent else None
+    forced_review_error = False
+    if independent and not hard_stop:
+        in_flight = bool(run.get("review_in_flight"))
+        unrecorded = (review_status != "disabled" and not review_recorded)
+        if in_flight or unrecorded:
+            # Never return a success-shaped status for a review that was
+            # requested but had no durable round, or whose phase was still
+            # marked in flight.  ``ok_unreviewed`` is for a *recorded*
+            # reviewer failure; an unrecorded review is a run error.
+            review_status = "error"
+            if in_flight:
+                review_error = (
+                    "independent review phase was still in flight when the "
+                    "run tried to finish; no terminal review round was recorded")
+            else:
+                review_error = (
+                    "independent review was requested but no review round was "
+                    "recorded")
+            run["status"] = "error"
+            run["status_detail"] = review_error
+            run["review_status"] = review_status
+            run["review_error"] = review_error
+            run["review_in_flight"] = False
+            run["review_passed"] = False
+            forced_review_error = True
+    if not hard_stop and not forced_review_error:
         run["status"], status_detail, review_passed = status_mod.final_status(
             builder_status="ok_rescued" if run.get("rescued") else "ok",
             review_status=review_status,
@@ -5249,7 +5476,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             target=float(run.get("quality_target") or DEFAULT_QUALITY_TARGET),
             rescued=bool(run.get("rescued")),
             cancelled=bool(run.get("cancelled")) or run.get("stop_reason") == "cancelled",
-            stop_reason=run.get("stop_reason"))
+            stop_reason=run.get("stop_reason"),
+            review_recorded=review_recorded if independent else True)
         run["status_detail"] = status_detail
         run["review_passed"] = review_passed
     if review_status == "error":
@@ -5366,6 +5594,74 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     if warnings:
         text = "".join("[WARNING] %s\n" % item for item in warnings) + text
     return text, run, path
+
+
+def _resume_final_status(result, prior_rounds, spec=None,
+                         accepted_review=None):
+    """Finalize a resumed run that has no phase left to execute.
+
+    A crash between checkpoint/review-finish and the final run-record write can
+    leave a record with no review round even though an independent review was
+    requested.  Such a record must not become ``ok`` on resume.  This pure
+    helper is also the regression point for that window.
+    """
+    result = result if isinstance(result, dict) else {}
+    entries = [item for item in (prior_rounds or [])
+               if isinstance(item, dict) and item.get("kind") == "review"]
+    expected = result.get("independent_review")
+    if expected is None:
+        expected = (spec or {}).get("independent_review")
+    expected = bool(expected)
+    saved_review_status = str(result.get("review_status") or "").lower()
+    phase = str(result.get("phase") or "")
+    in_flight = bool(
+        result.get("review_in_flight")
+        or result.get("review_phase_in_flight")
+        or (phase.startswith("review-") and not phase.endswith("_done"))
+        or saved_review_status in ("pending", "running", "in_progress"))
+    recorded = bool(entries) or accepted_review is not None
+    result["review_recorded"] = recorded if expected else None
+    if expected and (in_flight or not recorded):
+        result["status"] = "error"
+        result["review_status"] = "error"
+        result["review_error"] = (
+            "independent review phase was still in flight when the run was "
+            "resumed; no terminal review round was recorded"
+            if in_flight else
+            "independent review was requested but no review round was recorded")
+        result["review_passed"] = False
+        result["status_detail"] = result["review_error"]
+        result["review_rounds"] = list(prior_rounds or [])
+        return result
+    last_review = next(
+        (item for item in reversed(entries) if item.get("kind") == "review"),
+        None)
+    review_status = result.get("review_status")
+    if review_status in (None, "", "disabled") and recorded:
+        review_status = ("accepted" if accepted_review is not None
+                         else "stopped")
+    elif review_status in (None, ""):
+        review_status = "disabled"
+    score = (accepted_review or {}).get("score")
+    if score is None and last_review is not None:
+        score = last_review.get("score")
+    blocking = int((accepted_review or last_review or {}).get(
+        "blocking_defects") or 0)
+    result["quality_score"] = score
+    result["review_rounds"] = list(prior_rounds or [])
+    result["status"], status_detail, review_passed = status_mod.final_status(
+        builder_status="ok_rescued" if result.get("rescued") else "ok",
+        review_status=review_status,
+        score=score,
+        blocking_defects=blocking,
+        target=float(result.get("quality_target") or DEFAULT_QUALITY_TARGET),
+        rescued=bool(result.get("rescued")),
+        cancelled=bool(result.get("cancelled")),
+        stop_reason=result.get("stop_reason"),
+        review_recorded=recorded if expected else True)
+    result["status_detail"] = status_detail
+    result["review_passed"] = review_passed
+    return result
 
 
 def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
@@ -5549,30 +5845,8 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
                 result["attention_" + name] = api.redact_secrets(
                     str(args.get(name)))
         if result.get("status") in (None, "", "running"):
-            last_review = next(
-                (item for item in reversed(prior_rounds)
-                 if isinstance(item, dict) and item.get("kind") == "review"),
-                None)
-            review_status = result.get("review_status") or "disabled"
-            score = (accepted_review or {}).get("score")
-            if score is None and last_review is not None:
-                score = last_review.get("score")
-            blocking = int((accepted_review or last_review or {}).get(
-                "blocking_defects") or 0)
-            result["quality_score"] = score
-            result["review_rounds"] = prior_rounds
-            result["status"], status_detail, review_passed = status_mod.final_status(
-                builder_status="ok_rescued" if result.get("rescued") else "ok",
-                review_status=review_status,
-                score=score,
-                blocking_defects=blocking,
-                target=float(result.get("quality_target")
-                             or DEFAULT_QUALITY_TARGET),
-                rescued=bool(result.get("rescued")),
-                cancelled=bool(result.get("cancelled")),
-                stop_reason=result.get("stop_reason"))
-            result["status_detail"] = status_detail
-            result["review_passed"] = review_passed
+            _resume_final_status(result, prior_rounds, spec=spec,
+                                 accepted_review=accepted_review)
         else:
             result.setdefault(
                 "status_detail",

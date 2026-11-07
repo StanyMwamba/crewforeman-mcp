@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.1)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -103,6 +103,67 @@ them; already-running jobs remain detached and continue. `deepseek_job_status`
 adds `queue_position` (1-based among pending records, 0 once running),
 `priority`, `priority_label`, `holder` (worker pid) and `lease_until`.
 
+### Queue dependencies, urgent builds and the safety net (P3.1)
+
+`harness_deepseek` has two optional additive parameters:
+
+* `urgent` (boolean) orders a queued build after every P0 resume record and
+  ahead of ordinary queued builds. It is a flag, not a new numeric priority:
+  old queue records keep `priority: 1` / `P1 new build` and are unchanged.
+  Running jobs are never suspended to make room.
+* `depends_on` (run id string) makes the job wait until that run reaches a
+  successful terminal state. While waiting the record stays `queued`, has
+  `waiting_on` set, holds no lease and therefore no running slot. The
+  dependency record is expedited ahead of ordinary queued builds so the
+  dependent job cannot starve it. A `status: done` record with
+  `progress: needs_input` is still waiting, not successful; this holds even
+  when the queue record itself was already released as `done`, because the
+  `needs_input` hold takes precedence over terminal success. The prompt text is
+  never inspected for run ids; only the explicit parameter creates a
+  dependency.
+* Equal effective order is FIFO: a new urgent submission cannot self-claim
+  ahead of an older queued urgent or dependency record of the same tier.
+  `reserve_resume_slot=false` keeps only its documented exception for an
+  ordinary non-urgent P1 build taking the last slot from a waiting P0; urgent
+  and dependency jobs never use that bypass.
+
+Dependency validation happens before a worker starts. The queue record is
+consulted first, then `<jobs_dir>/<run_id>.status.json`, then the saved run
+record `<log_dir>/<run_id>.json` when the job status file was already cleaned:
+
+* an unknown run id is rejected with `Unknown dependency run_id ...`;
+* a dependency whose status is `error`/`failed`/`cancelled` is rejected with
+  `Dependency run_id ... finished with error: ...`;
+* a dependency cycle (including a self-dependency) is rejected with the chain,
+  e.g. `Dependency cycle detected: a -> b -> a`.
+
+If a dependency fails while a dependent job is already waiting, the dependent
+is failed with a dependency error instead of waiting forever. The dependency
+that is queued at the admission cap is admitted first when a slot frees; the
+dependent never takes a slot while it is still waiting. A dependency that
+already finished successfully lets the job start normally.
+
+`deepseek_job_status` (plain and `events_since` structured/status file) adds
+`urgent`, `depends_on`, `waiting_on`, `dependency_status`
+(`ready`/`waiting`/`unknown`/`error`) and the urgent-aware `priority_label`
+(`P0 resume`, `P1 urgent`, `P1 new build`). Old run records without these
+fields read as ordinary non-urgent builds with `waiting_on: null`.
+
+The dispatcher also runs a cheap safety net on its normal tick. It performs
+only local file reads and no model call. When the queue is non-empty, every
+occupied slot reports idle/waiting (job status `queued`/`waiting`/`idle`/
+`needs_input`/terminal, or a progress word such as `waiting`), and the active
+count is at or above the effective capacity (`max_harness_jobs` clamped to the
+detected Harness child limit), it admits exactly the next eligible queued job. Every such admission appends an `admission_safety_net` event to
+`<state_dir>/queue/events.jsonl` (and mirrors it into the P1 journal when the
+run has a work id). The safety net may exceed the soft capacity only up to the
+fixed hard ceiling `2 * effective capacity`; the ceiling is checked under the
+queue-wide lock before the claim, so repeated ticks cannot run away. It never
+claims dependency-waiting records. If a status file is missing or unreadable,
+the slot is treated as busy (fail closed). Queued records survive a restart;
+`serve()` restarts the dispatcher and the next tick re-evaluates dependencies
+and the safety net.
+
 ### Review convergence and cost controls (P3-2, R1-R3)
 
 `quality_convergence` is `observe` (default) or `auto`
@@ -134,8 +195,11 @@ completes instead of staying `input_required`.
 The connector reduces reviewer cost without lowering the gate:
 
 * **R1 (signed test evidence):** before each review the connector runs the full
-  suite on the exact reviewed tree (auto-detects `tests/` with `test_*.py`, or
-  use `review_test_command`; `review_test_suite=""` disables it). The reviewer
+  suite on the exact reviewed tree (auto-detects `tests/` with `test_*.py` at
+  the workspace root or in a direct child project such as `repo/`, preferring
+  `repo`; or use `review_test_command`; `review_test_suite=""` disables it).
+  The signed payload records the detected `project_root` and the command runs
+  with that root as its cwd. The reviewer
   receives an HMAC-signed result with tree SHA-256, test/failure/error counts,
   output SHA-256 and a bounded output tail. It trusts that evidence for the
   named tree, reruns only new or defect-related tests, and may rerun everything
@@ -153,8 +217,31 @@ The connector reduces reviewer cost without lowering the gate:
   cumulative diff since the original builder) plus the previously flagged
   blocking defects and only the changed files' immediate context.
 
-`review_context_max_chars` bounds the diff text (default 60000).
+The job wrapper also consults the durable run record after the handler
+returns. A requested review that is still in flight, was expected but never
+recorded, or belongs to a run whose terminal status is `error` closes the job
+as `error`, never `done/finished`. A superseded attempt applies the same gate
+to the canonical run. A recorded reviewer failure that produced
+`ok_unreviewed` is a successful job and is unchanged.
+
+`review_context_max_chars` bounds the diff text (default 60000). Within that
+budget, deliverable files named by the connector and core source files are
+shown before generated patches/logs/docs, and each file body is capped
+(8000 chars) so one artifact cannot consume the context. The prompt is
+evidence-aware: a clean signed suite says do not rerun the whole suite; a
+skipped suite says run only the relevant tests and never claim a pass.
+
 `review_test_timeout_seconds` (default 300) is the connector test hard timeout.
+`reviewer_prices` (default `{}`) is an optional per-model table of USD per
+million tokens for reviewer accounting:
+`{"kimi-k3.1-pro": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}`.
+With the empty default the reviewer's input/cached/output tokens are still
+recorded in each review round and in `reviewer_usage`, while cost stays
+explicitly unknown. No prices are shipped. Both transports use the same table:
+headless session logs resolve each observed model, and the SDK transport prices
+its reviewer usage through this table (built-in DeepSeek rates remain the
+fallback).
+
 The baseline copy is bounded (256 KiB per file, 400 files); larger or binary
 files are recorded in the manifest with an `excluded` reason and listed as
 changed/added/deleted with a metadata-only body.

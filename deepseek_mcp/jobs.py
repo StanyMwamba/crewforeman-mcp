@@ -38,7 +38,8 @@ def _admission_store_for(cfg):
     return admission_mod.AdmissionStore(
         root,
         heartbeat_seconds=float(_cfg_get(cfg, "admission_heartbeat_seconds", 30.0) or 30.0),
-        lease_seconds=float(_cfg_get(cfg, "admission_lease_seconds", 90.0) or 90.0))
+        lease_seconds=float(_cfg_get(cfg, "admission_lease_seconds", 90.0) or 90.0),
+        dependency_probe=admission_mod._status_probe(cfg))
 
 
 def _admission_controller(cfg):
@@ -48,7 +49,10 @@ def _admission_controller(cfg):
         controller = _admission_controllers.get(root)
         if controller is None:
             controller = admission_mod.AdmissionController(
-                cfg, store=_admission_store_for(cfg))
+                cfg, store=_admission_store_for(cfg),
+                idle_probe=admission_mod._idle_probe(cfg),
+                event_sink=_admission_event_sink(cfg),
+                fail_sink=_admission_fail_sink(cfg))
             _admission_controllers[root] = controller
         return controller
 
@@ -106,6 +110,45 @@ def _event(work_id, cfg, event_type, payload=None):
         return log_obj.append(event_type, payload or {})
     except Exception:
         return None
+
+
+def _admission_event_sink(cfg):
+    """Mirror admission events into the P1 work journal when an id is valid."""
+    def sink(event_type, payload=None):
+        data = dict(payload or {})
+        run_id = data.get("run_id") or data.get("work_id")
+        work_id = None
+        if run_id:
+            try:
+                status = json.loads((Path(cfg.jobs_dir) /
+                                     (str(run_id) + ".status.json"))
+                                    .read_text(encoding="utf-8"))
+                work_id = status.get("work_id")
+            except Exception:
+                work_id = None
+        work_id = work_id or data.get("work_id") or run_id
+        if work_id:
+            _event(str(work_id), cfg, event_type, data)
+    return sink
+
+
+def _admission_fail_sink(cfg):
+    """Write a terminal error for a queued job whose dependency failed."""
+    def sink(record, message):
+        run_id = record.get("run_id") or record.get("work_id")
+        if not run_id:
+            return
+        status_path = Path(cfg.jobs_dir) / (str(run_id) + ".status.json")
+        if status_path.exists():
+            write_status(status_path, status="error", progress="failed",
+                         error=str(message), waiting_on=None,
+                         dependency_status="error")
+        work_id = record.get("work_id")
+        if work_id:
+            _event(str(work_id), cfg, "failed", {
+                "run_id": run_id, "error": str(message),
+                "phase": "admission_dependency"})
+    return sink
 
 
 def _result(work_id, cfg, text, status, run_id=None):
@@ -397,6 +440,63 @@ def run_job(spec_path, handlers, cfg=None):
          _admission_token, _admission_last_hb, _admission_released) = saved
 
 
+def _review_gate_state(cfg, run_id):
+    """Return ``(in_flight, review_expected, recorded, run_status, run_error)``.
+
+    Best-effort read of the durable run record.  A missing, unreadable or
+    malformed record means "no gate applies" so old runs and ad-hoc specs keep
+    their previous terminal behaviour.
+    """
+    try:
+        from .store import find_run
+        run = find_run(run_id, cfg)[0]
+    except Exception:
+        return False, False, False, None, None
+    if not isinstance(run, dict):
+        return False, False, False, None, None
+    phase = str(run.get("phase") or "")
+    review_status = str(run.get("review_status") or "").lower()
+    rounds = run.get("review_rounds")
+    recorded = (
+        any(isinstance(item, dict) and item.get("kind") == "review"
+            for item in rounds)
+        if isinstance(rounds, list) else False)
+    in_flight = bool(
+        run.get("review_in_flight")
+        or run.get("review_phase_in_flight")
+        or (phase.startswith("review-") and not phase.endswith("_done"))
+        or review_status in ("pending", "running", "in_progress"))
+    review_expected = bool(run.get("independent_review"))
+    return (in_flight, review_expected, recorded, run.get("status"),
+            run.get("review_error") or run.get("status_detail")
+            or run.get("error"))
+
+
+def _review_gate_error(gate, canonical=False):
+    """Return the refusal message when *gate* must not close the job.
+
+    ``ok_unreviewed`` is a recorded reviewer failure, so it stays a successful
+    job; only a run that genuinely ended in ``error`` is propagated.
+    """
+    in_flight, review_expected, recorded, run_status, run_error = gate
+    if in_flight:
+        return ("review phase is still in flight; refusing a "
+                "terminal done status")
+    success_shaped = ("ok", "ok_rescued", "ok_unreviewed", "ok_below_gate")
+    if (review_expected and not recorded
+            and run_status in success_shaped):
+        return ("review was requested but no review round was recorded")
+    if review_expected and run_status == "error":
+        detail = str(run_error or "").strip()
+        subject = "the canonical run" if canonical else "the run"
+        message = ("independent review failed; %s ended with status "
+                   "'error'" % subject)
+        if detail:
+            message += ": " + detail
+        return message
+    return None
+
+
 def _run_job_impl(spec_path, handlers, cfg=None):
     """Implementation of :func:`run_job`; owns the worker globals."""
     global _status_path, _work_ctx
@@ -502,6 +602,14 @@ def _run_job_impl(spec_path, handlers, cfg=None):
         if work_id and canonical and canonical != run_id:
             # A resume/another attempt owns the journal and result.json. This
             # job wrapper only reflects the handler outcome in its own status.
+            # It must still honour the canonical run's terminal review gate:
+            # a stale attempt cannot advertise done while that run failed.
+            canonical_error = _review_gate_error(
+                _review_gate_state(cfg, canonical), canonical=True)
+            if canonical_error:
+                write_status(_status_path, status="error", progress="failed",
+                             error=canonical_error)
+                return _status_path
             log_obj = _event_log(work_id, cfg)
             journal = log_obj.read_since(0) if log_obj is not None else []
             pending = events_mod.pending_question(journal)
@@ -514,6 +622,23 @@ def _run_job_impl(spec_path, handlers, cfg=None):
                 write_status(_status_path, status="done",
                              progress="finished",
                              result=(stored or {}).get("result") or text)
+            return _status_path
+        # Durable review gate: the handler returning does not mean the
+        # independent review phase is done.  Poll briefly for finalization,
+        # then refuse to write a terminal "done" while a review is in flight,
+        # was expected but never recorded, or ended in a terminal run error.
+        gate = _review_gate_state(cfg, run_id)
+        gate_deadline = time.monotonic() + 2.0
+        while gate[0] and time.monotonic() < gate_deadline:
+            time.sleep(0.1)
+            gate = _review_gate_state(cfg, run_id)
+        message = _review_gate_error(gate)
+        if message:
+            if work_id:
+                _result(work_id, cfg, message, "error", run_id)
+                _finish_work(work_id, cfg, "error", run_id)
+            write_status(_status_path, status="error", progress="failed",
+                         error=message)
             return _status_path
         # A validated one-question ATTENTION block keeps the work open: the
         # job handler returned, but a human answer is still required.
@@ -746,7 +871,13 @@ def _dispatch_admitted(record, cfg):
     try:
         write_status(status, status="running", pid=child.pid, queue_position=0,
                      priority=record.get("priority"),
-                     priority_label=record.get("priority_label"))
+                     urgent=bool(record.get("urgent")),
+                     depends_on=record.get("depends_on"),
+                     waiting_on=None,
+                     priority_label=(record.get("priority_label") or
+                                     admission_mod.priority_label(
+                                         record.get("priority"),
+                                         bool(record.get("urgent")))))
     except Exception:
         pass
     return child
@@ -778,6 +909,16 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         pass
     from .store import new_id
     call_args = dict(args)
+    urgent = call_args.get("urgent", False)
+    if urgent is None:
+        urgent = False
+    if not isinstance(urgent, bool):
+        raise RuntimeError("urgent must be a boolean")
+    depends_on = call_args.get("depends_on")
+    if depends_on is not None:
+        if not isinstance(depends_on, str) or not _valid_run_id(depends_on.strip()):
+            raise RuntimeError("Invalid depends_on run id: %r" % (depends_on,))
+        depends_on = depends_on.strip()
     wait = float(call_args.pop("wait_seconds", cfg.wait_seconds if wait is None else wait) or 0)
     admission = None
     fingerprint = None
@@ -965,8 +1106,13 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                          queue_position=0,
                          admission_work_id=record_run_id,
                          priority=record.get("priority", priority),
-                         priority_label=admission_mod.priority_label(
-                             record.get("priority", priority)))
+                         urgent=bool(record.get("urgent")),
+                         depends_on=record.get("depends_on"),
+                         waiting_on=None,
+                         priority_label=(record.get("priority_label") or
+                                         admission_mod.priority_label(
+                                             record.get("priority", priority),
+                                             bool(record.get("urgent")))))
         except Exception:
             pass
         return child
@@ -995,7 +1141,14 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         try:
             submitted = controller.submit(
                 queue_work_id, priority=priority, run_id=run_id,
-                spec_path=str(spec), tool=tool, spawn=_spawn_record)
+                spec_path=str(spec), tool=tool, spawn=_spawn_record,
+                urgent=urgent, depends_on=depends_on)
+        except admission_mod.DependencyError as exc:
+            # A dependency rejection is caller-visible and must not be
+            # disguised as an admission/lock failure.
+            message = _fail_start(str(exc))
+            log(message)
+            raise RuntimeError(message)
         except Exception as exc:
             # Fail closed: if the queue or its lock cannot be acquired, do not
             # bypass max_harness_jobs with an unbounded direct spawn.
@@ -1034,9 +1187,18 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             position = submitted.get("position")
         if position is None:
             position = 1
-        label = submitted.get("priority_label") or admission_mod.priority_label(priority)
+        label = (submitted.get("priority_label")
+                 or admission_mod.priority_label(priority, urgent))
+        waiting_on = submitted.get("waiting_on") or fields.get("waiting_on")
+        dependency_status = (submitted.get("dependency_status")
+                             or fields.get("dependency_status"))
         write_status(status, status="queued", queue_position=position,
-                     priority=submitted.get("priority"), priority_label=label,
+                     priority=submitted.get("priority"),
+                     priority_label=label,
+                     urgent=bool(submitted.get("urgent", urgent)),
+                     depends_on=depends_on,
+                     waiting_on=waiting_on,
+                     dependency_status=dependency_status,
                      holder=fields.get("holder"),
                      lease_until=fields.get("lease_until"),
                      admission_work_id=queue_work_id)
@@ -1046,6 +1208,11 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             controller.start(spawn=_spawn_record)
         except Exception as exc:
             log("admission dispatcher start skipped: %s" % exc)
+        if waiting_on:
+            return ("[DeepSeek job ID %s queued at position %d (%s); waiting "
+                    "for run %s to finish before it can start. Check "
+                    "deepseek_job_status run_id=%s.]"
+                    % (run_id, position, label, waiting_on, run_id))
         return ("[DeepSeek job ID %s queued at position %d (%s); it will start "
                 "when a slot frees. Check deepseek_job_status run_id=%s.]"
                 % (run_id, position, label, run_id))
@@ -1133,10 +1300,20 @@ def _admission_status_fields(cfg, run_id, state):
     position = fields.get("queue_position")
     if position is None:
         position = state.get("queue_position") or 0
+    dependency_error = fields.get("dependency_error")
+    if not dependency_error and fields.get("status") in ("failed", "error"):
+        dependency_error = fields.get("error")
     return {
         "queue_position": position,
         "priority": fields.get("priority", state.get("priority")),
         "priority_label": fields.get("priority_label") or state.get("priority_label"),
+        "urgent": fields.get("urgent", state.get("urgent", False)),
+        "depends_on": fields.get("depends_on", state.get("depends_on")),
+        "waiting_on": fields.get("waiting_on", state.get("waiting_on")),
+        "dependency_status": fields.get("dependency_status",
+                                         state.get("dependency_status")),
+        "dependency_error": dependency_error or state.get("dependency_error"),
+        "admission_status": fields.get("status"),
         "holder": fields.get("holder"),
         "lease_until": fields.get("lease_until"),
     }
@@ -1235,7 +1412,16 @@ def tool_status(args, cfg=None):
         pass
     if "events_since" in args and args.get("events_since") is not None:
         return _structured_status(args, state, run_id, cfg)
+    if state.get("dependency_error"):
+        raise RuntimeError("Job %s failed: %s"
+                           % (run_id, state.get("dependency_error")))
     if state.get("status") == "queued":
+        if state.get("waiting_on"):
+            return ("[DeepSeek job ID %s queued at position %d (%s); waiting "
+                    "for run %s to finish.]"
+                    % (run_id, state.get("queue_position") or 0,
+                       state.get("priority_label") or "P1 new build",
+                       state.get("waiting_on")))
         return ("[DeepSeek job ID %s queued at position %d (%s); waiting for a "
                 "free slot.]" % (run_id, state.get("queue_position") or 0,
                                  state.get("priority_label") or "P1 new build"))

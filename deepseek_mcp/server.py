@@ -206,6 +206,14 @@ TOOLS = [
             "resume_run_id": {"type": "string", "description": (
                 "Resume a checkpointed run from its last finished phase instead of starting over. "
                 "The saved prompt, workspace, skill and policies are reused.")},
+            "urgent": {"type": "boolean", "description": (
+                "Queue this new build ahead of normal queued builds, below P0 resume "
+                "priority. Running jobs are never suspended.")},
+            "depends_on": {"type": "string", "description": (
+                "Run id that must finish before this job starts. While waiting the job "
+                "holds no running slot; the dependency is ordered ahead of normal "
+                "queued builds. Unknown, failed, cancelled or cyclic dependencies are "
+                "rejected. This is explicit only: the prompt text is never scanned.")},
         }, "required": ["prompt"]},
     },
     {

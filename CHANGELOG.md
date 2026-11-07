@@ -5,6 +5,58 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.1
+
+### Added
+
+- P3.1 queue dependencies: `harness_deepseek` accepts optional `urgent: true`
+  and `depends_on: <run_id>`. An urgent build is ordered after P0 resume and
+  before ordinary builds. A dependent job waits in `queued` state without
+  holding a lease or running slot, and its dependency is expedited ahead of
+  ordinary queued builds. Unknown, failed, cancelled and cyclic dependencies
+  are rejected before a worker starts; a dependency that fails while the
+  dependent is waiting fails that job instead of deadlocking the queue.
+  `deepseek_job_status` exposes `urgent`, `depends_on`, `waiting_on`,
+  `dependency_status` and the urgent-aware `priority_label`.
+- P3.1 idle-slot safety net: the dispatcher periodically checks (file reads
+  only, no model call) whether every occupied slot is idle/waiting while work
+  is queued. If so it admits exactly the next eligible queued job, records an
+  `admission_safety_net` queue event (mirrored to the P1 journal when
+  possible), and never exceeds the fixed `2 * capacity` hard ceiling.
+- Review-cost wiring: R1 now auto-detects a project in a direct child
+  directory (for example `<workspace>/repo/tests`) and runs the signed suite
+  from that project root; R2 prioritises focused/source files and caps each
+  diff body so generated artifacts cannot consume the whole context; the
+  reviewer prompt is evidence-aware (trust a clean signed suite, do not rerun
+  the whole suite). A job can no longer close as `done` while an independent
+  review phase is in flight or was never recorded.
+- Reviewer accounting: review rounds and the run record now carry the
+  reviewer's own input/cached/output tokens and a `reviewer_usage` aggregate
+  when readable Kimi/DSH session logs exist. A new `reviewer_prices` table
+  (default: `{}`, no prices shipped) makes reviewer cost explicit when the
+  operator supplies per-million-token rates.
+
+### Changed
+
+- Queue ordering is additive: records without `urgent`/`depends_on` keep their
+  pre-P3.1 order, and `PRIORITY_RESUME` / `PRIORITY_BUILD` numeric values are
+  unchanged. The 20 MCP tool names and the package version are unchanged.
+
+### Fixed
+
+- A dependency whose queue record is already `done` but whose job status is
+  `done/needs_input` now keeps the dependent `queued` with no lease; the
+  `needs_input` hold takes precedence over terminal success. A later
+  `finished` progress releases it.
+- A job whose independent-review run ended with a durable `status="error"`
+  (for example a reviewer child session still writing after exit) now closes
+  as `error`, not `done/finished`. The superseded-attempt path honours the
+  canonical run's review gate too, while a recorded reviewer failure
+  (`ok_unreviewed`) remains a successful job.
+- SDK-transport reviewer usage is priced through the configured
+  `reviewer_prices` table (built-in rates remain the fallback), matching the
+  headless session-log accounting.
+
 ## 3.9.0
 
 ### Added

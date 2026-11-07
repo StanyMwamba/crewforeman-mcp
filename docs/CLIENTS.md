@@ -19,7 +19,7 @@ add it to the `env` object shown below.
 
 ## Native command
 
-Version 3.9.0 installs the `crewforeman-mcp` command and registers the MCP
+Version 3.9.1 installs the `crewforeman-mcp` command and registers the MCP
 server name `crewforeman-mcp`. Use this form for a new configuration:
 
 ```json

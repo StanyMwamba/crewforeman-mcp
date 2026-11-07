@@ -22,19 +22,54 @@ except Exception:  # pragma: no cover - defensive
 PRIORITY_RESUME = 0
 PRIORITY_BUILD = 1
 
+# P3.1: urgency is a flag, not a new numeric priority.  Old records (which
+# only have PRIORITY_RESUME / PRIORITY_BUILD) keep their exact ordering, while
+# an urgent or depended-on build sorts ahead of ordinary builds at the same
+# numeric priority.  P0 resume remains unconditionally first.
 _PRIORITY_LABELS = {PRIORITY_RESUME: "P0 resume", PRIORITY_BUILD: "P1 new build"}
 _TERMINAL = ("done", "failed", "cancelled", "error")
+_ERROR_STATUSES = frozenset((
+    "error", "failed", "failure", "cancelled", "canceled", "no_balance",
+    "deadline_exceeded", "budget_exceeded", "timeout",
+    "time_budget_exceeded", "cost_budget_exceeded"))
+_SUCCESS_STATUSES = frozenset((
+    "done", "ok", "success", "succeeded", "complete", "completed",
+    "ok_unreviewed", "ok_below_gate", "ok_rescued"))
+_WAITING_STATUSES = frozenset((
+    "queued", "running", "waiting", "pending", "starting", "in_progress",
+    "needs_input"))
+
+def _progress_blocks_completion(record):
+    """True when a ``done`` status is still held for human input.
+
+    P3.1: a run whose status is ``done`` but whose progress is
+    ``needs_input`` is not finished work; dependents must keep waiting until
+    progress reports a terminal value such as ``finished``.
+    """
+    if not isinstance(record, dict):
+        return False
+    progress = str(record.get("progress") or "").strip().lower()
+    return progress in _WAITING_STATUSES
 
 
 class AdmissionError(RuntimeError):
     """Raised when admission state cannot be safely acquired or read."""
 
 
-def priority_label(priority):
+class DependencyError(ValueError):
+    """A dependency reference is unknown, failed, or cyclic."""
+
+
+def priority_label(priority, urgent=False):
     try:
-        return _PRIORITY_LABELS.get(int(priority), "P1 new build")
+        value = int(priority)
     except Exception:
-        return "P1 new build"
+        value = PRIORITY_BUILD
+    if value == PRIORITY_RESUME:
+        return "P0 resume"
+    if urgent:
+        return "P1 urgent"
+    return _PRIORITY_LABELS.get(value, "P1 new build")
 
 
 def _detected_capacity(cfg, allow_probe=False):
@@ -95,7 +130,7 @@ def _default_pid_alive(pid):
 
 class AdmissionStore:
     def __init__(self, root, heartbeat_seconds=30.0, lease_seconds=90.0,
-                 now=None, pid_alive=None):
+                 now=None, pid_alive=None, dependency_probe=None):
         self.root = os.path.abspath(str(root))
         self.items_dir = os.path.join(self.root, "items")
         self.leases_dir = os.path.join(self.root, "leases")
@@ -104,6 +139,11 @@ class AdmissionStore:
         self.lease_seconds = float(lease_seconds)
         self._now = now or time.time
         self._pid_alive = pid_alive or _default_pid_alive
+        # Callable ``probe(run_id) -> dict|None``.  It is only consulted for a
+        # dependency that has no queue record (or to detect an error recorded
+        # in the run status after the queue item finished).  File reads only:
+        # cheap and no model calls.
+        self.dependency_probe = dependency_probe
         self._lock = threading.RLock()
         self._thread_locks = {}
 
@@ -285,10 +325,208 @@ class AdmissionStore:
     def _is_terminal(record):
         return bool(record) and record.get("status") in _TERMINAL
 
+    # -- dependency helpers ------------------------------------------------
+    @staticmethod
+    def _identities(record):
+        values = set()
+        if isinstance(record, dict):
+            for key in ("work_id", "run_id"):
+                value = record.get(key)
+                if value:
+                    values.add(str(value))
+        return values
+
+    def _find_item_locked(self, ref):
+        """Find a queue item by work id or run id (caller holds the lock)."""
+        text = str(ref or "").strip()
+        if not text or "/" in text or "\\" in text or text in (".", ".."):
+            return None
+        try:
+            direct = self._load_item(text)
+        except AdmissionError:
+            direct = None
+        if direct:
+            return direct
+        try:
+            names = sorted(os.listdir(self.items_dir))
+        except OSError:
+            return None
+        for name in names:
+            if not name.endswith(".json") or name.startswith("."):
+                continue
+            try:
+                record = self._read_json(os.path.join(self.items_dir, name))
+            except AdmissionError:
+                continue
+            if record and text in self._identities(record):
+                return record
+        return None
+
+    def _probe_dependency(self, run_id):
+        probe = self.dependency_probe
+        if isinstance(probe, dict):
+            data = probe.get(str(run_id))
+        elif callable(probe):
+            try:
+                data = probe(run_id)
+            except Exception:
+                return None
+        else:
+            return None
+        if isinstance(data, str):
+            return {"status": data}
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _status_kind(status):
+        value = str(status or "").strip().lower()
+        if value in _ERROR_STATUSES:
+            return "error"
+        if value in _SUCCESS_STATUSES:
+            return "done"
+        if value in _WAITING_STATUSES:
+            return "waiting"
+        return ""
+
+    def _dependency_state_locked(self, record):
+        """Classify ``record['depends_on']`` (caller holds the lock).
+
+        Queue records are authoritative for queued/running ids, but a status
+        file is also consulted so a terminal error recorded by the worker is
+        visible even if the queue item has not been released yet.  Error wins,
+        then a done/needs_input hold, then success, then waiting, then unknown.
+        """
+        depends_on = record.get("depends_on") if isinstance(record, dict) else None
+        if not depends_on:
+            return {"state": "ready", "dependency": None, "detail": None}
+        dependency = str(depends_on)
+        if (not dependency or "/" in dependency or "\\" in dependency
+                or dependency in (".", "..")):
+            return {"state": "error", "dependency": dependency,
+                    "detail": "invalid dependency run id"}
+        item = self._find_item_locked(dependency)
+        probe = self._probe_dependency(dependency)
+        error = None
+        detail = None
+        done = False
+        waiting = False
+        held = False
+        if item:
+            kind = self._status_kind(item.get("status"))
+            if kind == "error":
+                error = str(item.get("status") or "error")
+                detail = item.get("error") or item.get("message")
+            elif kind == "done":
+                if _progress_blocks_completion(item):
+                    waiting = True
+                    held = True
+                else:
+                    done = True
+            elif kind == "waiting":
+                waiting = True
+        probe_seen = False
+        if probe:
+            probe_status = probe.get("status") or probe.get("state")
+            kind = self._status_kind(probe_status)
+            if kind:
+                probe_seen = True
+            if kind == "error":
+                error = str(probe_status or "error")
+                detail = probe.get("error") or probe.get("message") or detail
+            elif kind == "done":
+                if _progress_blocks_completion(probe):
+                    waiting = True
+                    held = True
+                else:
+                    done = True
+            elif kind == "waiting":
+                waiting = True
+        if error:
+            return {"state": "error", "dependency": dependency,
+                    "detail": detail or error}
+        if held:
+            return {"state": "waiting", "dependency": dependency,
+                    "detail": None}
+        if done:
+            return {"state": "ready", "dependency": dependency, "detail": None}
+        if waiting or item or probe_seen:
+            return {"state": "waiting", "dependency": dependency, "detail": None}
+        return {"state": "unknown", "dependency": dependency, "detail": None}
+
+    def dependency_state(self, record_or_work_id):
+        """Return ``{state, dependency, detail}`` for a record or work id.
+
+        ``state`` is one of ``ready``, ``waiting``, ``unknown`` or ``error``.
+        A record without ``depends_on`` is always ready.
+        """
+        if isinstance(record_or_work_id, dict):
+            record = record_or_work_id
+        else:
+            work_id = self._safe_id(record_or_work_id)
+            with self._lock:
+                record = self._load_item(work_id)
+        if not record:
+            return {"state": "unknown", "dependency": None,
+                    "detail": "unknown work id"}
+        # A dependent that failed because its dependency vanished/failed has
+        # a terminal admission error.  Report that rather than re-classifying
+        # the (now possibly stale) dependency as ready.
+        if (record.get("status") in _ERROR_STATUSES
+                and "depend" in str(record.get("error") or "").lower()):
+            return {"state": "error", "dependency": record.get("depends_on"),
+                    "detail": record.get("error")}
+        with self._lock:
+            if not record.get("depends_on"):
+                return {"state": "ready", "dependency": None, "detail": None}
+            return self._dependency_state_locked(record)
+
+    def _validate_dependency_locked(self, work_id, run_id, depends_on):
+        """Reject bad dependencies before mutating any queue state."""
+        if depends_on is None:
+            return
+        dependency = str(depends_on).strip()
+        if (not dependency or "/" in dependency or "\\" in dependency
+                or dependency in (".", "..")):
+            raise DependencyError("Invalid depends_on run id %r." % (depends_on,))
+        identities = {str(work_id)}
+        if run_id:
+            identities.add(str(run_id))
+        chain = [dependency]
+        seen = set()
+        current = dependency
+        while current:
+            if current in seen:
+                raise DependencyError(
+                    "Dependency cycle detected: %s." %
+                    " -> ".join(chain + [current]))
+            seen.add(current)
+            if current in identities:
+                path = [str(work_id)] + chain
+                raise DependencyError(
+                    "Dependency cycle detected: %s." % " -> ".join(path))
+            item = self._find_item_locked(current)
+            if not item or not item.get("depends_on"):
+                break
+            current = str(item.get("depends_on"))
+            chain.append(current)
+        state = self._dependency_state_locked({"depends_on": dependency})
+        if state["state"] == "error":
+            raise DependencyError(
+                "Dependency run_id %r finished with error: %s." % (
+                    dependency, state.get("detail") or "unknown error"))
+        if state["state"] == "unknown":
+            raise DependencyError(
+                "Unknown dependency run_id %r: no queue record or run "
+                "metadata was found." % (dependency,))
+
     # -- public API --------------------------------------------------------
     def enqueue(self, work_id, priority=PRIORITY_BUILD, run_id=None,
-                spec_path=None, tool=None, meta=None):
+                spec_path=None, tool=None, meta=None, urgent=False,
+                depends_on=None):
         work_id = self._safe_id(work_id)
+        urgent = bool(urgent)
+        if depends_on is not None:
+            depends_on = str(depends_on).strip()
         with self._lock, self._work_lock(work_id):
             now = self._now_val()
             existing = self._load_item(work_id)
@@ -296,23 +534,34 @@ class AdmissionStore:
                 return existing
             if existing and self._lease_live(self._load_lease(work_id), now):
                 return existing
+            # Validate before mutating: a rejected dependency must not leave a
+            # half-updated item that the dispatcher could later claim.
+            self._validate_dependency_locked(work_id, run_id, depends_on)
             if existing:
                 record = existing
                 record["priority"] = int(priority)
-                record["priority_label"] = priority_label(priority)
+                record["priority_label"] = priority_label(priority, urgent)
+                record["urgent"] = urgent
                 record["status"] = "queued"
                 record["updated"] = _now_iso(now)
+                if depends_on:
+                    record["depends_on"] = depends_on
+                else:
+                    record.pop("depends_on", None)
             else:
                 record = {
                     "work_id": work_id,
                     "priority": int(priority),
-                    "priority_label": priority_label(priority),
+                    "priority_label": priority_label(priority, urgent),
+                    "urgent": urgent,
                     "created": _now_iso(now),
                     "created_ts": now,
                     "updated": _now_iso(now),
                     "status": "queued",
                     "fencing_token": 0,
                 }
+                if depends_on:
+                    record["depends_on"] = depends_on
             if run_id is not None:
                 record["run_id"] = run_id
             if spec_path is not None:
@@ -344,9 +593,25 @@ class AdmissionStore:
                 except Exception:
                     rec["_created_ts"] = 0.0
                 records.append(rec)
-        records.sort(key=lambda r: (int(r.get("priority", PRIORITY_BUILD)),
-                                    r["_created_ts"],
-                                    str(r.get("work_id"))))
+        # P3.1: a queued job's dependency is expedited ahead of ordinary
+        # builds.  Urgent is likewise expedited, still below P0 resume.  The
+        # dependency/urgent tier is a tie-breaker after the numeric priority,
+        # so old records and P0 semantics are unchanged.
+        depended_on = set()
+        for rec in records:
+            dependency = rec.get("depends_on")
+            if dependency:
+                depended_on.add(str(dependency))
+        def sort_key(rec):
+            try:
+                priority = int(rec.get("priority", PRIORITY_BUILD))
+            except Exception:
+                priority = PRIORITY_BUILD
+            identities = self._identities(rec)
+            expedited = bool(rec.get("urgent")) or bool(identities & depended_on)
+            return (priority, 0 if expedited else 1, rec["_created_ts"],
+                    str(rec.get("work_id")))
+        records.sort(key=sort_key)
         return records
 
     def pending(self):
@@ -405,6 +670,13 @@ class AdmissionStore:
             item = self._record_for_claim(work_id)
             if item.get("status") != "queued":
                 return None
+            # A dependency-waiting record is never claimable, even if a caller
+            # reaches claim() outside the dispatcher.  Waiting must not hold a
+            # lease/slot, and claiming it could deadlock the dependency.
+            if item.get("depends_on"):
+                state = self._dependency_state_locked(item)
+                if state.get("state") != "ready":
+                    return None
             lease = self._load_lease(work_id)
             if self._lease_live(lease, now):
                 return None
@@ -487,6 +759,46 @@ class AdmissionStore:
             self._save_item(work_id, item)
             self._remove_lease(work_id)
             return item
+
+    def fail(self, work_id, message, status="failed"):
+        """Mark a queue record failed with a caller-visible error message."""
+        work_id = self._safe_id(work_id)
+        with self._lock, self._work_lock(work_id):
+            now = self._now_val()
+            item = self._load_item(work_id)
+            if item is None:
+                raise AdmissionError("unknown work id: %s" % work_id)
+            item["status"] = str(status or "failed")
+            item["error"] = str(message)
+            item["updated"] = _now_iso(now)
+            item["released"] = _now_iso(now)
+            self._save_item(work_id, item)
+            self._remove_lease(work_id)
+            return item
+
+    def record_event(self, event_type, payload=None):
+        """Append a cheap queue-level event under ``<root>/events.jsonl``."""
+        self._ensure_dirs()
+        now = self._now_val()
+        data = dict(payload or {})
+        entry = {"at": _now_iso(now), "ts": now, "type": str(event_type),
+                 "payload": data}
+        # Flattening is additive: operators can read the common fields either
+        # at the top level or under payload.  Reserved keys never overwrite
+        # the envelope.
+        for key, value in data.items():
+            entry.setdefault(key, value)
+        line = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        path = os.path.join(self.root, "events.jsonl")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise AdmissionError("cannot record admission event: %s" % exc)
+        return entry
 
     def _should_reclaim(self, lease, now):
         try:
@@ -601,19 +913,114 @@ class AdmissionStore:
         holder = None
         if item.get("status") == "running" and lease and self._lease_live(lease):
             holder = lease.get("pid")
+        depends_on = item.get("depends_on")
+        dependency = (self.dependency_state(item) if depends_on
+                      else {"state": "ready", "dependency": None, "detail": None})
+        waiting_on = (depends_on if dependency.get("state") in
+                      ("waiting", "unknown") else None)
+        dependency_error = (dependency.get("detail")
+                            if dependency.get("state") == "error" else None)
         return {
             "queue_position": position,
             "priority": item.get("priority"),
-            "priority_label": priority_label(item.get("priority")),
+            "priority_label": priority_label(item.get("priority"),
+                                             bool(item.get("urgent"))),
+            "urgent": bool(item.get("urgent")),
+            "depends_on": depends_on,
+            "waiting_on": waiting_on,
+            "dependency_status": dependency.get("state"),
+            "dependency_error": dependency_error,
             "holder": holder,
             "lease_until": lease.get("lease_until") if holder else None,
             "fencing_token": item.get("fencing_token"),
             "status": item.get("status"),
+            "error": item.get("error"),
         }
 
 
+def _cfg_value(cfg, name, default=None):
+    try:
+        return cfg.get(name, default)
+    except AttributeError:
+        return getattr(cfg, name, default)
+
+
+def _status_probe(cfg):
+    """Cheap file-only dependency probe over jobs and saved run records."""
+    jobs_dir = _cfg_value(cfg, "jobs_dir")
+    log_dir = _cfg_value(cfg, "log_dir")
+    if not jobs_dir and not log_dir:
+        return None
+    jobs_base = os.path.abspath(str(jobs_dir)) if jobs_dir else None
+    runs_base = os.path.abspath(str(log_dir)) if log_dir else None
+
+    def probe(run_id):
+        text = str(run_id or "").strip()
+        if (not text or "/" in text or "\\" in text
+                or text in (".", "..")):
+            return None
+        if jobs_base:
+            path = os.path.join(jobs_base, text + ".status.json")
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                data = None
+            if isinstance(data, dict):
+                return {"status": data.get("status"),
+                        "progress": data.get("progress"),
+                        "error": data.get("error")}
+        # A finished run may have outlived its job status file (retention) but
+        # still have a saved run record.  Read it file-only; never guess.
+        if runs_base:
+            run_path = os.path.join(runs_base, text + ".json")
+            try:
+                with open(run_path, "r", encoding="utf-8") as handle:
+                    run = json.load(handle)
+            except (OSError, ValueError):
+                return None
+            if isinstance(run, dict):
+                return {"status": run.get("status"),
+                        "error": run.get("error") or run.get("detail")}
+        return None
+    return probe
+
+
+def _idle_probe(cfg):
+    """Cheap file-only 'slot idle/waiting' probe over job status files."""
+    jobs_dir = _cfg_value(cfg, "jobs_dir")
+    if not jobs_dir:
+        return None
+    base = os.path.abspath(str(jobs_dir))
+
+    def probe(record):
+        run_id = record.get("run_id") or record.get("work_id")
+        text = str(run_id or "").strip()
+        if (not text or "/" in text or "\\" in text
+                or text in (".", "..")):
+            return False
+        path = os.path.join(base, text + ".status.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        status = str(data.get("status") or "").lower()
+        progress = str(data.get("progress") or "").lower()
+        if status in ("queued", "waiting", "idle", "needs_input", "done",
+                      "error", "failed", "cancelled"):
+            return True
+        words = ("waiting", "idle", "needs_input")
+        return any(word in progress for word in words)
+    return probe
+
+
 class AdmissionController:
-    def __init__(self, cfg, store=None, spawn=None, detected_limit=None):
+    def __init__(self, cfg, store=None, spawn=None, detected_limit=None,
+                 dependency_probe=None, idle_probe=None, event_sink=None,
+                 fail_sink=None):
         self.cfg = cfg
         self.capacity = resolved_capacity(cfg, detected_limit=detected_limit)
         if store is None:
@@ -627,6 +1034,20 @@ class AdmissionController:
                 lease_seconds=getattr(cfg, "admission_lease_seconds", 90.0),
             )
         self.store = store
+        if dependency_probe is not None:
+            self.store.dependency_probe = dependency_probe
+        elif self.store.dependency_probe is None:
+            self.store.dependency_probe = _status_probe(cfg)
+        if idle_probe is None:
+            idle_probe = _idle_probe(cfg)
+        self.idle_probe = idle_probe
+        self.event_sink = event_sink
+        self.fail_sink = fail_sink
+        # P3.1 safety net: a fixed 2x effective-cap ceiling.  It is the only
+        # path that may exceed ``capacity`` and is checked under queue.lock.
+        self.hard_ceiling = (2 * self.capacity
+                             if self.capacity is not None else None)
+        self._last_safety_net = 0.0
         self._spawn = spawn
         self._stop = threading.Event()
         self._thread = None
@@ -645,7 +1066,89 @@ class AdmissionController:
             return None
         return self.capacity - self.store.active_count()
 
+    @staticmethod
+    def _effective_rank(record, pending):
+        """Queue-order rank: numeric priority then urgent/dependency boost."""
+        try:
+            priority = int(record.get("priority", PRIORITY_BUILD))
+        except Exception:
+            priority = PRIORITY_BUILD
+        depended_on = set()
+        for other in pending:
+            dependency = other.get("depends_on")
+            if dependency:
+                depended_on.add(str(dependency))
+        identities = set()
+        for key in ("work_id", "run_id"):
+            value = record.get(key)
+            if value:
+                identities.add(str(value))
+        expedited = bool(record.get("urgent")) or bool(identities & depended_on)
+        return (priority, 0 if expedited else 1)
+
+    @staticmethod
+    def _queue_order_key(record, pending):
+        """Full queue order: effective rank, then creation time and work id."""
+        try:
+            created = float(record.get("created_ts") or 0)
+        except Exception:
+            created = 0.0
+        return (AdmissionController._effective_rank(record, pending), created,
+                str(record.get("work_id") or ""))
+
+    def _dependency_ready(self, record):
+        if not record.get("depends_on"):
+            return True
+        try:
+            return self.store.dependency_state(record).get("state") == "ready"
+        except Exception:
+            return False
+
+    def _reject_bad_dependency_locked(self, record):
+        """Fail a queue item whose dependency became unknown/failed."""
+        if not record.get("depends_on"):
+            return False
+        try:
+            state = self.store.dependency_state(record)
+        except Exception:
+            return False
+        kind = state.get("state")
+        if kind not in ("unknown", "error"):
+            return False
+        dependency = state.get("dependency") or record.get("depends_on")
+        if kind == "unknown":
+            message = ("Dependency run_id %r is unknown: no queue record or "
+                       "run metadata was found." % (dependency,))
+        else:
+            message = ("Dependency run_id %r finished with error: %s" %
+                       (dependency, state.get("detail") or "unknown error"))
+        work_id = record.get("work_id")
+        try:
+            self.store.fail(work_id, message)
+        except Exception:
+            return False
+        payload = {"work_id": work_id, "run_id": record.get("run_id"),
+                   "depends_on": dependency, "error": message,
+                   "dependency_status": kind}
+        try:
+            self.store.record_event("admission_dependency_failed", payload)
+        except Exception:
+            pass
+        if self.event_sink is not None:
+            try:
+                self.event_sink("admission_dependency_failed", payload)
+            except Exception:
+                pass
+        if self.fail_sink is not None:
+            try:
+                self.fail_sink(record, message)
+            except Exception:
+                pass
+        return True
+
     def _may_start(self, record):
+        if not self._dependency_ready(record):
+            return False
         if self.capacity is None:
             return True
         free = self._slots()
@@ -662,15 +1165,70 @@ class AdmissionController:
         return not self._p0_pending()
 
     def submit(self, work_id, priority=PRIORITY_BUILD, run_id=None,
-               spec_path=None, tool=None, spawn=None):
+               spec_path=None, tool=None, spawn=None, urgent=False,
+               depends_on=None):
         spawn_fn = spawn or self._spawn
         # The capacity check and the claim must be one critical section across
         # every controller sharing this queue root, not just this instance.
         with self.store.queue_lock(), self._dispatch_lock:
-            record = self.store.enqueue(work_id, priority=priority, run_id=run_id,
-                                        spec_path=spec_path, tool=tool)
+            record = self.store.enqueue(
+                work_id, priority=priority, run_id=run_id,
+                spec_path=spec_path, tool=tool, urgent=urgent,
+                depends_on=depends_on)
             fields = self.store.status_fields(work_id)
-            if record.get("status") == "queued" and self._may_start(record):
+            if record.get("status") == "queued":
+                self._reject_bad_dependency_locked(record)
+                record = self.store._load_item(work_id) or record
+                fields = self.store.status_fields(work_id)
+                if record.get("status") in ("failed", "error"):
+                    raise DependencyError(
+                        record.get("error") or "dependency is unavailable")
+            can_claim = (record.get("status") == "queued"
+                         and self._may_start(record))
+            if can_claim:
+                # Never bypass a queued record with a better effective order
+                # just because this submit observed the free slot before the
+                # dispatcher did.  Without this guard a new normal job could
+                # jump a queued urgent job or a queued dependency (reviewer
+                # regression: submit must not self-claim past the queue head).
+                pending = self.store.pending()
+                ahead = []
+                for pending_record in pending:
+                    if str(pending_record.get("work_id")) == str(work_id):
+                        break
+                    ahead.append(pending_record)
+                # A record already marked ``reclaimed`` lost its worker
+                # (dead pid/expired lease) and is waiting for the dispatcher,
+                # not a live queued holder.  It must not block a fresh submit
+                # forever; a genuinely queued equal-rank record still does.
+                startable = [item for item in ahead
+                             if self._may_start(item)
+                             and not item.get("reclaimed")]
+                if startable:
+                    own_key = self._queue_order_key(record, pending)
+                    head_key = min(self._queue_order_key(item, pending)
+                                   for item in startable)
+                    # Preserve the documented reserve_resume_slot=false
+                    # compatibility: only a non-urgent ordinary build may
+                    # take the last slot from a waiting P0 when the operator
+                    # disabled the reservation.  Urgent and dependency jobs
+                    # never use this bypass, so an urgent submission can
+                    # never start ahead of a queued P0.
+                    legacy_no_reserve = (
+                        not self._reserve_enabled()
+                        and int(record.get("priority", PRIORITY_BUILD))
+                        == PRIORITY_BUILD
+                        and not record.get("urgent")
+                        and not record.get("depends_on")
+                        and all(int(item.get("priority", PRIORITY_BUILD))
+                                == PRIORITY_RESUME for item in startable))
+                    # Only the full queue head may self-claim.  Comparing the
+                    # complete order key (rank + created_ts + work_id) keeps
+                    # FIFO for equal effective rank, so a new urgent job
+                    # cannot jump an older urgent/dependency record.
+                    if head_key <= own_key and not legacy_no_reserve:
+                        can_claim = False
+            if can_claim:
                 claimed = self.store.claim(work_id)
                 if claimed is not None:
                     try:
@@ -681,11 +1239,21 @@ class AdmissionController:
                         raise
                     return {"state": "started", "position": 0,
                             "priority": claimed.get("priority"),
-                            "priority_label": priority_label(claimed.get("priority"))}
+                            "urgent": bool(claimed.get("urgent")),
+                            "depends_on": claimed.get("depends_on"),
+                            "waiting_on": None,
+                            "priority_label": priority_label(
+                                claimed.get("priority"),
+                                bool(claimed.get("urgent")))}
             return {"state": "queued",
                     "position": self.store.position(work_id) or fields.get("queue_position") or 0,
                     "priority": record.get("priority"),
-                    "priority_label": priority_label(record.get("priority"))}
+                    "urgent": bool(record.get("urgent")),
+                    "depends_on": record.get("depends_on"),
+                    "waiting_on": fields.get("waiting_on"),
+                    "dependency_status": fields.get("dependency_status"),
+                    "priority_label": priority_label(
+                        record.get("priority"), bool(record.get("urgent")))}
 
     def run_once(self, spawn=None):
         spawn_fn = spawn or self._spawn
@@ -700,6 +1268,9 @@ class AdmissionController:
                 break
             progressed = False
             for rec in pending:
+                if self._reject_bad_dependency_locked(rec):
+                    progressed = True
+                    break
                 if not self._may_start(rec):
                     continue
                 work_id = rec.get("work_id")
@@ -718,6 +1289,100 @@ class AdmissionController:
             if not progressed:
                 break
         return started
+
+    def _emit_safety_event(self, payload):
+        try:
+            self.store.record_event("admission_safety_net", payload)
+        except Exception:
+            pass
+        if self.event_sink is not None:
+            try:
+                self.event_sink("admission_safety_net", payload)
+            except Exception:
+                pass
+
+    def safety_net(self, spawn=None):
+        """Admit one extra job when every occupied slot is idle/waiting.
+
+        Cheap file-only check (``idle_probe``), guarded by the same
+        cross-process queue lock as normal admission.  It may exceed
+        ``capacity`` by at most the fixed ``2 * capacity`` ceiling and never
+        claims a dependency-waiting record.  Returns the claimed record, or
+        None.  Queue events are recorded for every admission.
+        """
+        spawn_fn = spawn or self._spawn
+        if spawn_fn is None:
+            # Do not mark a record running when there is no worker to start.
+            return None
+        with self.store.queue_lock(), self._dispatch_lock:
+            if self.capacity is None or self.hard_ceiling is None:
+                return None
+            pending = self.store.pending()
+            if not pending:
+                return None
+            active = self.store.active()
+            if len(active) < self.capacity:
+                # A normal slot is free; the regular dispatcher owns this.
+                return None
+            if len(active) >= self.hard_ceiling:
+                return None
+            idle = []
+            for rec in active:
+                try:
+                    is_idle = bool(self.idle_probe(rec)) if self.idle_probe else False
+                except Exception:
+                    is_idle = False
+                if not is_idle:
+                    return None
+                idle.append(str(rec.get("work_id")))
+            candidate = None
+            for rec in pending:
+                if self._reject_bad_dependency_locked(rec):
+                    continue
+                if not self._dependency_ready(rec):
+                    continue
+                candidate = rec
+                break
+            if candidate is None:
+                return None
+            work_id = candidate.get("work_id")
+            claimed = self.store.claim(work_id)
+            if claimed is None:
+                return None
+            payload = {
+                "work_id": work_id,
+                "run_id": claimed.get("run_id"),
+                "active_before": len(active),
+                "active_count": len(active) + 1,
+                "active_after": len(active) + 1,
+                "capacity": self.capacity,
+                "ceiling": self.hard_ceiling,
+                "idle_work_ids": idle,
+                "idle": list(idle),
+                "depends_on": claimed.get("depends_on"),
+                "waiting_on": None,
+            }
+            try:
+                if spawn_fn is not None:
+                    spawn_fn(claimed)
+            except Exception:
+                self.store.release(work_id, status="failed",
+                                   token=claimed.get("fencing_token"))
+                payload.update({"error": "spawn failed", "admitted": False})
+                self._emit_safety_event(payload)
+                return None
+            payload["admitted"] = True
+            self._emit_safety_event(payload)
+            return claimed
+
+    def maybe_safety_net(self, spawn=None, force=False):
+        """Throttled safety net used by the dispatcher loop."""
+        now = time.monotonic()
+        interval = max(0.05, float(self.store.heartbeat_seconds) / 10.0)
+        if not force and now - self._last_safety_net < interval:
+            return None
+        self._last_safety_net = now
+        return self.safety_net(spawn=spawn)
 
     def start(self, spawn=None):
         if spawn is not None:
@@ -740,6 +1405,14 @@ class AdmissionController:
                 started = self.run_once()
             except Exception:
                 started = []
+            # P3.1 safety net: if all occupied slots are idle/waiting and work
+            # is queued, make progress without a model call.  It is throttled
+            # and hard-ceiling bounded, so a stale idle signal cannot run away.
+            if not started:
+                try:
+                    self.maybe_safety_net()
+                except Exception:
+                    pass
             try:
                 pending = self.store.pending()
             except Exception:

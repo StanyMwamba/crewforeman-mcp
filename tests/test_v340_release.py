@@ -21,12 +21,12 @@ class ReleaseMetadataTests(unittest.TestCase):
         return load_config(config_path=Path(tmp.name) / "missing.json", env={})
 
     def test_version_is_current_everywhere(self):
-        self.assertEqual(__version__, "3.9.0")
-        self.assertEqual(config.SERVER_VERSION, "3.9.0")
+        self.assertEqual(__version__, "3.9.1")
+        self.assertEqual(config.SERVER_VERSION, "3.9.1")
         response = server.dispatch("initialize", {"protocolVersion": "2025-06-18"},
                                    cfg=self.cfg())
         self.assertNotIn("error", response)
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.9.0")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.9.1")
         instructions = response["result"]["instructions"]
         self.assertTrue(instructions.startswith(f"crewforeman-mcp {config.SERVER_VERSION}:"))
         self.assertIn("progress", instructions)
@@ -34,7 +34,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertIn("generic MCP", instructions)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("# CrewForeman", readme.splitlines()[0])
-        self.assertIn("CrewForeman 3.9.0", readme)
+        self.assertIn("CrewForeman 3.9.1", readme)
 
     def test_server_tool_text_describes_v34(self):
         tools = server.dispatch("tools/list", cfg=self.cfg())["result"]["tools"]

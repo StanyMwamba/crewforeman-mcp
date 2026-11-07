@@ -40,6 +40,7 @@
   "dsh_transport": "headless",
   "dsh_provider": "deepseek-official",
   "dsh_model": "deepseek-flash",
+  "reviewer_prices": {},
   "checkpoint": true,
   "dedupe_active": true,
   "providers": [],

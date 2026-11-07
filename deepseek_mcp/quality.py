@@ -1386,13 +1386,46 @@ def build_review_task(prompt, deliverable_files, skill=None,
                                     for item in prior_signatures
                                     if str(item).strip()))
         parts.append(focused)
+    evidence_text = str(test_evidence or "")
+    evidence_lower = evidence_text.lower()
+    status_match = re.search(r"(?im)^\s*-\s*status:\s*([a-z_]+)\s*$",
+                             evidence_text)
+    evidence_status = (status_match.group(1).lower()
+                       if status_match else "")
+    evidence_skipped = evidence_status == "skipped"
+    tree_changed = ("tree changed while the suite ran: yes" in evidence_lower
+                    or "tree changed while the suite ran: yes (rerun"
+                    in evidence_lower)
+    evidence_ok = evidence_status == "ok" and not tree_changed
+    if evidence_skipped:
+        test_step = (
+            "0. The connector did not run a test suite for this workspace "
+            "(signed evidence status: skipped). Do not claim tests passed. Run only "
+            "the relevant or new tests for the changed files; do not run a whole-repo "
+            "test discovery unless a changed file has no focused test. "
+        )
+    elif evidence_ok:
+        test_step = (
+            "0. The connector already ran the suite for this exact tree (signed "
+            "evidence below). "
+            "Trust that signed result for the tree hash it names; do not run the full "
+            "unittest discovery over the whole repo. Rerun only a new test or a test "
+            "directly related to a suspected defect, unless the evidence looks "
+            "suspicious. Start from the diff (connector diff below); read only changed files and "
+            "immediate dependencies; target <=10 minutes. Round 1 is a full review; "
+            "later rounds focus on the flagged defects and the new diff. Do not read "
+            "the whole repository when a diff is provided. "
+        )
+    else:
+        test_step = (
+            "0. Start from the connector diff and any signed test evidence provided. "
+            "If no usable evidence is present, run only the relevant or new tests for "
+            "the changed files; do not run a whole-repo test discovery. Read only "
+            "changed files and immediate dependencies when a diff is provided. "
+        )
     parts.append(
         "\n\n## Review method\n"
-        "0. Start from the connector diff and the signed test evidence when provided. "
-        "Trust the signed result for the exact tree hash it names; rerun only new or "
-        "defect-related tests, or rerun everything if the evidence looks suspicious. "
-        "Round 1 is a full review; later rounds focus on the flagged defects and "
-        "the new diff. Do not read the whole repository when a diff is provided.\n"
+        + test_step + "\n"
         "1. Open the listed deliverable files and the files named in the connector diff. "
         "Do not read the whole repository when a diff is provided. For images, PDFs and visual output, render or convert as "
         "needed and inspect with `read_image` at the target size; check overflow, clipping, "

@@ -44,11 +44,16 @@ STATUS_MEANING = {
 
 def final_status(builder_status="ok", review_status="disabled", score=None,
                  blocking_defects=0, target=8.5, rescued=False, cancelled=False,
-                 stop_reason=None):
+                 stop_reason=None, review_recorded=True):
     """Return ``(status, detail, review_passed)``.
 
     ``review_passed`` is ``True`` for an accepted review, ``False`` for a
     stopped/failed one, and ``None`` when no independent review ran.
+
+    ``review_recorded=False`` means a requested review never produced a
+    durable round: that must not become a plain ``ok`` even when the builder
+    itself succeeded.  It defaults to ``True`` so existing callers are
+    unchanged.
     """
     if cancelled or stop_reason == "cancelled":
         return "cancelled", STATUS_MEANING["cancelled"], None
@@ -60,6 +65,10 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "no_balance", STATUS_MEANING["no_balance"], None
     if builder_status not in ("ok", "ok_rescued"):
         return "error", STATUS_MEANING["error"], None
+    if review_recorded is False and review_status != "disabled":
+        return ("error",
+                "review was requested but no review round was recorded",
+                None)
 
     try:
         blocking = int(blocking_defects or 0)
