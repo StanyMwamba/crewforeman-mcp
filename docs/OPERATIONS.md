@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.10.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.11.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -433,6 +433,110 @@ prove that a reopened app is running. If the ancestor walk fails (for example
 The baseline copy is bounded (256 KiB per file, 400 files); larger or binary
 files are recorded in the manifest with an `excluded` reason and listed as
 changed/added/deleted with a metadata-only body.
+
+## Gates, plans, failure notes and pipelining (3.11.0)
+
+These four features are connector-wide. All keys are in `config.example.json`
+and in `DEFAULTS`; every key has a `DSH_*` and a `DEEPSEEK_*` environment
+alias. Missing keys are not inferred from the environment by the feature
+modules.
+
+### F1 deterministic gate
+
+The gate runs on the exact post-builder tree, before the first paid reviewer
+call, only when an independent review is requested. Order is fixed:
+secrets -> lint -> tests. A failed secret scan skips the tests (never execute a
+tree with a leaked credential); lint and tests still produce evidence when it
+is safe. Evidence is signed and bounded; `output_tail` is capped and redacted.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `gate_enabled` | `True` | Master switch; false records a skip. |
+| `gate_tests` | `auto` | `auto`, `off`, or a command string/list. |
+| `gate_test_command` | `""` | Explicit command; a missing executable fails the gate. |
+| `gate_lint` | `auto` | `auto`, `off`, or a command string/list. |
+| `gate_lint_command` | `""` | Explicit command; a missing executable fails the gate. |
+| `gate_secret_scan` | `True` | Built-in scan; no external command replaces it. |
+| `gate_secret_patterns` | `[]` | Additional regexes. They add findings, never suppress them. |
+| `gate_timeout_seconds` | `300.0` | Total gate wall clock. |
+| `gate_max_revisions` | `2` | Gate-funded revisions before `gate_failed`. |
+| `gate_max_output_chars` | `4000` | Per-check output tail cap. |
+
+A failure starts a gate revision with the same cost, health and checkpoint path
+as a review revision, but no reviewer process. After the cap the run ends
+`gate_failed` (`review_status="skipped"`, `quality_score=None`). A gate
+exception fails closed with `error` / `stop_reason="gate_error"`. When no tests
+and no lint are detected the verdict is `skipped` and the reviewer proceeds.
+
+### F2 written predictions
+
+The builder is told to write `PLAN.json` before the first edit. After the
+build the connector compares declared files/tests/risks and `write_set` with the
+actual diff.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `plan_contract` | `warn` | `warn`, `block`, `off`; unknown values fall back to warn. |
+| `plan_file` | `PLAN.json` | Workspace-relative path; absolute/`..` falls back to the default. |
+| `plan_max_files` | `200` | Cap on declared files plus tests. |
+| `plan_max_risks` | `20` | Cap on normalised risks. |
+
+`warn` records mismatches and adds a `plan:` note to the result header without
+changing score or blocking. `block` adds one blocking defect after the reviewer
+parse, so a 10/10 review must still revise; a fixed plan clears it. `PLAN.json`
+is not a deliverable and is excluded from review context.
+
+### F3 failure notes
+
+After a completed review round with blocking defects, the connector maps each
+defect through the fixed `quality.defect_kind` buckets and records it per task
+type. The next builder or revision prompt of that type may receive at most one
+short "common failures" section.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `failure_notes` | `on` | `on`/`off`; off disables reads, writes and file creation. |
+| `failure_notes_max` | `3` | Maximum labels in one note. |
+| `failure_notes_half_life_days` | `30.0` | Decay half-life; minimum 0.1. |
+| `failure_notes_min_occurrences` | `2` | Minimum lifetime count before injection. |
+| `failure_notes_max_store` | `200` | Global cap; highest weight is kept. |
+| `failure_notes_store` | `""` | Override path; empty means `<state_dir>/failure_notes.json`. |
+
+Only bucket labels and opaque run ids are stored. A non-bucket label is
+rejected if it looks like a path, email, URL or long prose; a passing label is
+stored as `sig:<hash>` and never rendered. A corrupt store is quarantined and
+the run continues; notes never change score, retries or pass/fail.
+
+### F4 pipelined jobs
+
+A job is pipeline-eligible only when it declares a non-empty `write_set` (tool
+argument) or a `slice` resolved from `SLICES.md`, `pipeline_enabled` is true,
+isolation is `worktree`, the canonical workspace is a git work tree (git >=
+2.5) and its dirty paths are only previously installed patches or recorded
+deliverables. Non-declaring jobs keep the serial behaviour.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `pipeline_enabled` | `True` | Admission switch: false stops new eligible/extra starts; already isolated jobs still finish and install. |
+| `pipeline_max_extra_jobs` | `1` | Extra jobs beyond capacity. |
+| `pipeline_require_disjoint` | `True` | Enforce write-set disjointness; unknown overlaps everything. |
+| `pipeline_isolation` | `worktree` | Only `worktree` is implemented; anything else disables the feature. |
+| `pipeline_worktree_root` | `""` | Empty means `<state_dir>/worktrees`. |
+| `pipeline_patch_dir` | `""` | Empty means `<state_dir>/patches`. |
+| `pipeline_install` | `auto` | `auto`, `manual` (keep the patch), `off` (skip). |
+| `pipeline_min_remaining_usd` | `1.0` | Daily-budget headroom floor for an extra start. |
+| `pipeline_max_pending_patches` | `8` | Backlog cap before extras are refused. |
+| `pipeline_queue_scan` | `head` | `head` (FIFO, predictable) or `first_fit`. |
+| `pipeline_patch_retention_days` | `3` | Days to keep a worktree/patch after manual or conflict. |
+
+While a base job is in its review phase and capacity is full, one extra job may
+start if its write-set does not overlap any active job. Each job has its own
+worktree, patch and reviewer. Accepted patches are installed FIFO only after
+`git apply --check` succeeds for the whole set in a throwaway worktree; a
+conflict applies nothing and sets `stop_reason="install_conflict"`. A manual
+patch at the FIFO head is a drain point: later patches stay pending. Set
+`pipeline_install="manual"` to stop canonical installs while inspecting
+patches; set `pipeline_enabled=false` to stop new starts.
 
 ## Safety and sandboxing
 

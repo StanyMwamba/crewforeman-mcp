@@ -217,6 +217,62 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.dsh_sessions_dir), str(sessions))
         self.assertEqual(str(cfg.state_dir), str(root / "state"))
 
+    def test_v3110_gate_plan_notes_pipeline_defaults_and_env(self):
+        expected = {
+            "gate_enabled": True,
+            "gate_tests": "auto",
+            "gate_test_command": "",
+            "gate_lint": "auto",
+            "gate_lint_command": "",
+            "gate_secret_scan": True,
+            "gate_secret_patterns": [],
+            "gate_timeout_seconds": 300.0,
+            "gate_max_revisions": 2,
+            "gate_max_output_chars": 4000,
+            "plan_contract": "warn",
+            "plan_file": "PLAN.json",
+            "plan_max_files": 200,
+            "plan_max_risks": 20,
+            "failure_notes": "on",
+            "failure_notes_max": 3,
+            "failure_notes_half_life_days": 30,
+            "failure_notes_min_occurrences": 2,
+            "failure_notes_max_store": 200,
+            "failure_notes_store": "",
+            "pipeline_enabled": True,
+            "pipeline_max_extra_jobs": 1,
+            "pipeline_require_disjoint": True,
+            "pipeline_isolation": "worktree",
+            "pipeline_worktree_root": "",
+            "pipeline_patch_dir": "",
+            "pipeline_install": "auto",
+            "pipeline_min_remaining_usd": 1.0,
+            "pipeline_max_pending_patches": 8,
+            "pipeline_queue_scan": "head",
+            "pipeline_patch_retention_days": 3,
+        }
+        cfg = load_config(config_path=self.config_path, env={})
+        for key, value in expected.items():
+            self.assertEqual(getattr(cfg, key), value, key)
+        self.assertEqual(len(expected), 31)
+
+        env = {
+            "DSH_GATE_ENABLED": "0",
+            "DSH_PIPELINE_MAX_EXTRA_JOBS": "2",
+            "DSH_PLAN_CONTRACT": "block",
+            "DSH_GATE_SECRET_PATTERNS": "a,b",
+            "DEEPSEEK_GATE_TIMEOUT_SECONDS": "12.5",
+            "DEEPSEEK_PIPELINE_INSTALL": "manual",
+        }
+        cfg = load_config(config_path=self.config_path, env=env)
+        self.assertFalse(cfg.gate_enabled)
+        self.assertEqual(cfg.pipeline_max_extra_jobs, 2)
+        self.assertEqual(cfg.plan_contract, "block")
+        self.assertEqual(cfg.gate_secret_patterns, ["a", "b"])
+        self.assertEqual(cfg.gate_timeout_seconds, 12.5)
+        self.assertEqual(cfg.pipeline_install, "manual")
+        self.assertEqual(cfg.failure_notes_store, "")
+
     def test_unknown_config_keys_ignored(self):
         self.config_path.write_text(json.dumps({"not_a_setting": 1, "model": "deepseek-flash"}),
                                     encoding="utf-8")

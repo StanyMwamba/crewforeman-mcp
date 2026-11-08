@@ -69,7 +69,7 @@ _TERMINAL_EVENTS = frozenset(("result", "failed", "cancelled"))
 
 _FAILURE_ATTENTION = frozenset((
     "ok_unreviewed", "error", "no_balance", "deadline_exceeded",
-    "budget_exceeded",
+    "budget_exceeded", "gate_failed",
 ))
 _REVIEW_EVIDENCE_STATUSES = frozenset((
     "pending", "running", "accepted", "stopped", "error", "in_progress",

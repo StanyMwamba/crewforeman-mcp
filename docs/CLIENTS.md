@@ -1,6 +1,6 @@
 # Connecting MCP clients
 
-`crewforeman-mcp` 3.10.0 is a local **stdio** MCP server. The client starts the
+`crewforeman-mcp` 3.11.0 is a local **stdio** MCP server. The client starts the
 process and speaks newline-delimited JSON-RPC 2.0 over stdin/stdout; there is no
 network listener.
 
@@ -24,13 +24,13 @@ Before configuring a client, check the command itself:
 /path/to/crewforeman-mcp --version
 ```
 
-It prints `crewforeman-mcp 3.10.0`. If that fails, fix the install first
+It prints `crewforeman-mcp 3.11.0`. If that fails, fix the install first
 (see [INSTALL.md](INSTALL.md)); the client snippets below cannot repair a
 missing executable.
 
 ## Native command
 
-Version 3.10.0 installs the `crewforeman-mcp` command and the shorter alias
+Version 3.11.0 installs the `crewforeman-mcp` command and the shorter alias
 `deepseek-mcp`. A client that accepts the common `mcpServers` shape can use
 this minimal entry:
 

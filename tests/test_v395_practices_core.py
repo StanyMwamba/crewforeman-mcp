@@ -115,7 +115,7 @@ class RecordTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_server_version(self):
-        self.assertEqual(SERVER_VERSION, "3.10.0")
+        self.assertEqual(SERVER_VERSION, "3.11.0")
 
     def test_builder_practices_default_true(self):
         cfg = load_config(env={}, include_file=False)

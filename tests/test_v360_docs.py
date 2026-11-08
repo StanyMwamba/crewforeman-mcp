@@ -6,6 +6,7 @@ guard the claims that an independent review found contradicting the code
 smoke-test denominator).  No network, clock or paid API is involved.
 """
 
+import json
 import os
 import unittest
 from pathlib import Path
@@ -41,6 +42,40 @@ class OperationsPathTests(unittest.TestCase):
             self.assertEqual(config.BASE_DIR, "~/DeepSeek-MCP")
             self.assertTrue(str(config.DEFAULTS["log_dir"]).startswith(
                 "~/DeepSeek-MCP/"))
+
+
+class FeatureConfigDocTests(unittest.TestCase):
+    KEYS = (
+        "gate_enabled", "gate_tests", "gate_test_command", "gate_lint",
+        "gate_lint_command", "gate_secret_scan", "gate_secret_patterns",
+        "gate_timeout_seconds", "gate_max_revisions", "gate_max_output_chars",
+        "plan_contract", "plan_file", "plan_max_files", "plan_max_risks",
+        "failure_notes", "failure_notes_max", "failure_notes_half_life_days",
+        "failure_notes_min_occurrences", "failure_notes_max_store",
+        "failure_notes_store", "pipeline_enabled", "pipeline_max_extra_jobs",
+        "pipeline_require_disjoint", "pipeline_isolation",
+        "pipeline_worktree_root", "pipeline_patch_dir", "pipeline_install",
+        "pipeline_min_remaining_usd", "pipeline_max_pending_patches",
+        "pipeline_queue_scan", "pipeline_patch_retention_days",
+    )
+
+    def test_every_3110_key_is_example_and_operations(self):
+        example = json.loads(
+            (REPO_ROOT / "config.example.json").read_text(encoding="utf-8"))
+        text = _flat(OPERATIONS)
+        self.assertEqual(len(self.KEYS), 31)
+        for key in self.KEYS:
+            self.assertIn(key, example, key)
+            self.assertEqual(example[key], config.DEFAULTS[key], key)
+            self.assertIn("`%s`" % key, text, key)
+
+    def test_gate_failed_and_pipeline_install_are_documented(self):
+        status_text = _flat(STATUS)
+        self.assertIn("`gate_failed`", status_text)
+        self.assertIn("install_conflict", status_text)
+        ops = _flat(OPERATIONS)
+        self.assertIn("git apply --check", ops)
+        self.assertIn("gate_failed", ops)
 
 
 class ReadmeClaimTests(unittest.TestCase):

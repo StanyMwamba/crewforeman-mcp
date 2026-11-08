@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.10.0)
+# Known limitations and failure modes (3.11.0)
 
 Only limitations that remain in this version are listed here.
 

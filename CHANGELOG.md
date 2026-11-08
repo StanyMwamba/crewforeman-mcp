@@ -5,6 +5,68 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.11.0
+
+P3.5: a deterministic pre-review gate, written predictions, learned failure
+notes and write-set-aware pipelined jobs.
+
+### Added
+
+- **Deterministic gate (F1).** Before any paid reviewer call, the connector
+  scans the builder's added/changed files for secrets, detects and runs lint,
+  and runs the project test suite on the exact post-builder tree. Checks are
+  ordered secrets → lint → tests with per-check budgets, signed evidence and
+  skip-safe detection. A hard failure starts a gate revision without a
+  reviewer process; after `gate_max_revisions` the run ends `gate_failed` with
+  `review_status="skipped"` and `quality_score=None`. A gate crash fails
+  closed (`error`, `stop_reason="gate_error"`), never open.
+- **Written predictions (F2).** The builder is asked to write `PLAN.json`
+  before its first edit. The connector normalises paths and globs, compares
+  the declaration with the actual diff (unexpected/missing files and tests,
+  risk hits, stale/late/invalid plans) and records bounded evidence.
+  `plan_contract="warn"` is the default; `"block"` adds one blocking defect so
+  even a 10/10 review must revise; `"off"` disables the feature.
+- **Learning from failures (F3).** A bounded, decaying per-task-type store
+  records reviewer blocking-defect categories after each round and injects at
+  most one short "common failures" note into the next builder or revision
+  prompt. Only fixed buckets and opaque ids are stored; non-bucket labels are
+  rejected or hashed and never rendered.
+- **Pipelined jobs (F4).** A job may declare a `write_set` (or a `slice` from
+  `SLICES.md`). While a base job is in its review phase and capacity is full,
+  one disjoint queued job may start in its own detached git worktree, with its
+  own patch and reviewer. Accepted patches are installed FIFO only after a
+  combined `git apply --check` in a throwaway worktree; a conflict applies
+  nothing and is reported on the job and in the result header. Limits:
+  `pipeline_max_extra_jobs=1`, a 2× hard ceiling, cost headroom or a finite
+  per-job budget (unknown cost fails closed), and a bounded patch backlog.
+
+### Changed
+
+- Reviewer failure attribution now names the reviewer that actually ran. A
+  credit/quota/auth/429 failure from a non-DeepSeek backup names its vendor
+  and model and says the DeepSeek balance is unaffected; the
+  "DeepSeek account balance is empty" sentence is reserved for a DeepSeek
+  reviewer. Main-reviewer attribution is unchanged.
+- Status vocabulary gains failure-shaped `gate_failed`; jobs refuse to close a
+  `gate_failed` run as done. `docs/STATUS.md` documents the precedence and the
+  `install_conflict` terminal detail.
+- Jobs expose `write_set`, `pipeline_slot`, `base_commit` and `install_status`
+  in the structured status; the tool accepts `write_set` and `slice`.
+
+### Fixed
+
+- A backup-reviewer quota error is no longer reported as a DeepSeek balance
+  problem, so operators do not top up the wrong account.
+- A pipeline install conflict no longer leaves a job looking accepted; the
+  canonical tree is left untouched and the job reports `install_conflict`.
+
+### Tests
+
+- Focused suites for the gate, plan contract, failure notes, pipeline core,
+  queue transport, vendor attribution, status vocabulary and integration
+  seams; release/docs assertions updated to 3.11.0. The full stdlib `unittest`
+  suite is the release gate.
+
 ## 3.10.0
 
 Part A: reviewer resilience, resumable reviews and explicit job deadlines.

@@ -563,7 +563,14 @@ class PreflightRetryTests(unittest.TestCase):
         self.assertIn("503 service unavailable",
                       metadata.get("backup_error") or "")
         message = run.get("review_error") or ""
-        self.assertIn("Backup reviewer also failed", message)
+        # 3.11.0: the terminal message is attributed to the reviewer that
+        # actually ran (vendor/model), not "main + raw backup text".
+        self.assertIn("reviewer failed", message)
+        self.assertIn("Anthropic", message)
+        self.assertNotIn("DeepSeek account balance is empty", message)
+        self.assertNotIn("503 service unavailable", message,
+                         "raw provider text must stay in backup_error, not "
+                         "the user-facing attributed sentence")
         self.assertNotIn("Final quality score: 0.0", json.dumps(run, default=str))
 
 

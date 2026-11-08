@@ -219,6 +219,16 @@ TOOLS = [
                 "holds no running slot; the dependency is ordered ahead of normal "
                 "queued builds. Unknown, failed, cancelled or cyclic dependencies are "
                 "rejected. This is explicit only: the prompt text is never scanned.")},
+            "write_set": {"type": "array", "items": {"type": "string"},
+                          "description": (
+                              "Repo-relative file prefixes or globs this job expects to "
+                              "write, e.g. [\"src/api/\"]. Enables pipeline eligibility: "
+                              "a disjoint job may start during another job's review in "
+                              "its own worktree. Omit unless you declare it; without a "
+                              "declaration the job runs serially as before.")},
+            "slice": {"type": "string", "description": (
+                "Optional slice name from SLICES.md. Resolved to that slice's Writes "
+                "write-set when no explicit write_set is given.")},
         }, "required": ["prompt"]},
     },
     {

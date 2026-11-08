@@ -1,7 +1,7 @@
-"""Documentation invariants for 3.10.0 Part B (item 6d).
+"""Documentation invariants for the current release (3.11.0) plus 3.10.0 Part B.
 
 Focused checks only: README's public shape is fixed, the three product docs
-describe the Part B efficiency work, and the release stays 3.10.0.
+describe the Part B efficiency work, and the current release is 3.11.0.
 """
 
 import re
@@ -74,16 +74,18 @@ class ReadmeInvariants(unittest.TestCase):
         self.assertLessEqual(len(self.text.splitlines()), 110)
         self.assertNotIn("$", self.text)
 
-    def test_exactly_one_new_guarantees_bullet(self):
+    def test_one_new_guarantees_bullet_per_3110_feature(self):
         current = _guarantees_bullets(self.text)
         head = _guarantees_bullets(self.head)
         self.assertGreaterEqual(len(current), len(head))
         added = [bullet for bullet in current if bullet not in head]
-        # Part A already added the backup-reviewer bullet before this build.
+        # The backup-reviewer line was edited in 3.11.0 (vendor attribution);
+        # the four feature lines are new.
         mine = [bullet for bullet in added if "backup reviewer" not in bullet.lower()]
-        self.assertEqual(len(mine), 1, added)
-        self.assertIn("overlap", mine[0].lower())
-        self.assertIn("waste", mine[0].lower())
+        self.assertEqual(len(mine), 4, added)
+        text = " ".join(mine).lower()
+        for token in ("gate", "plan.json", "failure notes", "write-set"):
+            self.assertIn(token, text)
 
     def test_roles_table_and_bold_line_unchanged(self):
         self.assertIsNotNone(_roles_table(self.head))
@@ -97,8 +99,8 @@ class ReadmeInvariants(unittest.TestCase):
         self.assertEqual(_mermaid_blocks(self.text), _mermaid_blocks(self.head))
         self.assertEqual(len(_mermaid_blocks(self.text)), 2)
 
-    def test_version_line_stays_3100(self):
-        self.assertIn("3.10.0", self.text.splitlines()[2])
+    def test_version_line_is_current(self):
+        self.assertIn("3.11.0", self.text.splitlines()[2])
 
 
 class TeamsDoc(unittest.TestCase):
@@ -160,9 +162,9 @@ class ChangelogDoc(unittest.TestCase):
         ):
             self.assertIn(token, body)
 
-    def test_version_stays_3100(self):
-        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.10.0")
-        self.assertNotIn("## 3.10.1", self.text)
+    def test_version_is_current(self):
+        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.11.0")
+        self.assertNotIn("## 3.11.1", self.text)
 
 
 if __name__ == "__main__":

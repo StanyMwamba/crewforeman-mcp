@@ -1033,9 +1033,12 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
                        concurrency=DEFAULT_CONCURRENCY,
                        independent_review=True, render_hint=None,
                        task_type=None, builder_practices=True,
-                       project_map_hint=None):
+                       project_map_hint=None, plan_block=None,
+                       failure_note=None, extra_sections=None):
     """Return the full task text sent to ``dsh --profile headless``."""
     parts = [prompt.strip()]
+    if plan_block:
+        parts.append("\n\n%s\n" % str(plan_block).strip())
     if project_map_hint:
         parts.append("\n\n## Persisted project map (connector)\n\n%s\n"
                      % str(project_map_hint).strip())
@@ -1150,6 +1153,14 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
     # before the render hint and execution-safety contract.
     if builder_practices:
         parts.append(builder_practice_block(task_type))
+
+    if failure_note:
+        parts.append("\n\n%s\n" % str(failure_note).strip())
+    if extra_sections:
+        for section in extra_sections:
+            text = str(section or "").strip()
+            if text:
+                parts.append("\n\n%s\n" % text)
 
     if render_hint:
         parts.append("\n\n## Render environment (connector probe)\n%s\n" % render_hint)
@@ -1680,7 +1691,8 @@ def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
                         skill=None, quality_target=DEFAULT_QUALITY_TARGET,
                         round_no=1, escalation=None, task_type=None,
                         scope_note=None, score_missing=False,
-                        builder_practices=True):
+                        builder_practices=True, plan_block=None,
+                        failure_note=None, extra_sections=None):
     """Task text for a connector-owned REVISION run after a failed review.
 
     ``scope_note`` is the operator's manual ``resume_with_scope`` note after a
@@ -1700,8 +1712,17 @@ def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
         "REVIEW.md; the reviewer owns that file.\n\n"
         "## Original brief\n\n%s\n" % (prompt or "").strip(),
     ]
+    if plan_block:
+        parts.append("\n\n%s\n" % str(plan_block).strip())
     if builder_practices:
         parts.append(builder_practice_block(task_type))
+    if failure_note:
+        parts.append("\n\n%s\n" % str(failure_note).strip())
+    if extra_sections:
+        for section in extra_sections:
+            text = str(section or "").strip()
+            if text:
+                parts.append("\n\n%s\n" % text)
     if score_missing:
         parts.append(
             "\n\n## Unscored review (score missing)\n\n"

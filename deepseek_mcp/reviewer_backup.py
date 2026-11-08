@@ -3,10 +3,29 @@
 The harness integration is owned by the lead.  This module deliberately has no
 harness imports and uses the standard library only so it can be unit-tested in
 isolation.
+
+``error_message`` attributes a reviewer failure to the vendor that actually
+ran.  It derives the label from :func:`identity` and the failure class from
+:func:`switch_class`; raw error text is never accepted into the returned
+sentence, so a secret cannot be echoed.  A plain HTTP 429 that is not a
+credit/quota failure is reported as a rate limit.  The DeepSeek balance
+sentence is reserved for a DeepSeek *vendor* identity: an unknown vendor that
+merely falls back to a ``dsh_model`` such as ``deepseek-flash`` is never
+attributed to DeepSeek, and nothing is inferred from the main reviewer's
+config.  If attribution itself raises, a fixed unknown/unknown sentence is
+returned rather than a guess.
 """
 
 import os
 import re
+
+try:  # The API module is dependency-free, but attribution must never fail.
+    from .api import redact_secrets as _redact_secrets
+except Exception:  # pragma: no cover - defensive only
+
+    def _redact_secrets(text):
+        return str(text or "")
+
 
 CONFIG_KEYS = (
     "backup_dsh_bin",
@@ -25,6 +44,16 @@ _VENDOR_MARKERS = (
     ("gpt", "OpenAI"),
     ("deepseek", "DeepSeek"),
     ("gemini", "Google"),
+)
+
+_VENDOR_KEYS = (
+    ("moonshot", "MOONSHOT_API_KEY"),
+    ("kimi", "MOONSHOT_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("claude", "ANTHROPIC_API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("gpt", "OPENAI_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
 )
 
 _SUCCESS_STATUSES = frozenset(("ok", "done", "completed", "success", "succeeded"))
@@ -109,6 +138,15 @@ _TRANSPORT_FIELDS = (
     "output",
     "result",
     "text",
+)
+
+_UNAFFECTED_CLAUSE = "; the DeepSeek balance is unaffected."
+_DEEPSEEK_REMEDY = (
+    "; DeepSeek account balance is empty: top up at "
+    "https://platform.deepseek.com/top_up."
+)
+_ATTRIBUTION_UNAVAILABLE = (
+    "unknown/unknown reviewer failed (attribution unavailable)"
 )
 
 
@@ -248,6 +286,87 @@ def switch_class(execution, retries_exhausted=False):
         return "service unavailable (5xx)"
 
     return None
+
+
+def _vendor_key(vendor):
+    lower = _text(vendor).lower()
+    for marker, key in _VENDOR_KEYS:
+        if marker in lower:
+            return key
+    return ""
+
+
+def _clean_label(label):
+    """Keep the display label single-line and free of secrets/home paths."""
+    text = _redact_secrets(label)
+    text = " ".join(_text(text).split())
+    return text or "unknown/unknown"
+
+
+def error_message(cfg, execution=None, role="reviewer"):
+    """Return one attributed sentence for a reviewer failure.
+
+    ``execution`` is used only for the vendor/model fallbacks and for the
+    failure class; its free text is never echoed.  A DeepSeek remedy is used
+    only when the resolved *vendor* is DeepSeek, never when an unknown vendor's
+    model merely looks like DeepSeek.
+    """
+    try:
+        ident = identity(cfg, execution)
+        label = _clean_label(ident.get("label"))
+        vendor = _text(ident.get("vendor")).strip()
+        reason_class = switch_class(execution)
+    except Exception:
+        return _ATTRIBUTION_UNAVAILABLE
+
+    deepseek = "deepseek" in vendor.lower()
+    role_text = " ".join(_text(role or "reviewer").split()) or "reviewer"
+    subject = "%s %s" % (label, role_text)
+
+    if reason_class == "credit/budget":
+        message = (
+            "%s quota is exhausted: top up or raise the limit with that vendor"
+            % subject
+        )
+        message += _DEEPSEEK_REMEDY if deepseek else _UNAFFECTED_CLAUSE
+        return message
+
+    if reason_class == "auth":
+        key = _vendor_key(vendor)
+        if key:
+            message = (
+                "%s authentication failed: check the vendor key (%s) and the "
+                "vendor console" % (subject, key)
+            )
+        else:
+            message = (
+                "%s authentication failed: check the vendor key and the "
+                "vendor console" % subject
+            )
+        message += "." if deepseek else _UNAFFECTED_CLAUSE
+        return message
+
+    # A bare 429 is a rate limit; switch_class reserves credit/budget for
+    # money/quota 429s, so it is safe to check here.
+    if reason_class is None:
+        try:
+            plain_429 = bool(_HTTP_429_RE.search(_haystack(execution)))
+        except Exception:
+            plain_429 = False
+        if plain_429:
+            message = (
+                "%s reviewer hit a rate limit (HTTP 429); wait and retry"
+                % label
+            )
+            message += "." if deepseek else _UNAFFECTED_CLAUSE
+            return message
+
+    message = (
+        "%s reviewer failed (unclassified); see the redacted run record"
+        % label
+    )
+    message += "." if deepseek else _UNAFFECTED_CLAUSE
+    return message
 
 
 def banner(cfg, reason_class, execution=None):

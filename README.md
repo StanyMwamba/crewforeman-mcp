@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.10.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.11.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -80,8 +80,12 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 - Team size and exact waves follow the Harness child limit. One whole-job budget covers time and estimated cost for every phase.
 - Every Harness run is saved as Markdown and JSON with token usage, estimated cost and the review trail. Resume a killed run with `resume_deepseek`.
 - Blocking review defects come with an ordered fix list before the next review.
-- If the reviewer's service fails, a backup reviewer from another vendor takes over.
+- If the reviewer's service fails, a backup reviewer from another vendor takes over, and a quota error names that reviewer's vendor and model, never DeepSeek.
 - Slices that share a file in the same wave are reported as overlap warnings, and waste-aware sizing nudges a high-discard team smaller.
+- Before any paid review, a deterministic gate runs a secret scan, lint and tests; a failure is revised without a reviewer call and ends `gate_failed` when its cap is exhausted.
+- The builder writes `PLAN.json` before the first edit; the connector compares it with the actual diff and warns by default or blocks on mismatches.
+- Bounded, decaying failure notes for each task type are added to the next builder prompt; only fixed defect categories and opaque ids are stored.
+- A disjoint queued job (declared write-set) may start during another job's review in its own worktree; patches are installed only after `git apply --check` proves the whole set applies.
 ## Limits
 - macOS gets a best-effort file-write boundary. Linux and Windows rely on the Harness permission mode and the workspace convention.
 - The reviewer is a model. Its score is judgement, not proof of correctness. Run records are plaintext.

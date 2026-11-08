@@ -26,7 +26,8 @@ from .api import redact_secrets
 ALGORITHM = "sha256"
 IGNORED_DIRS = {".git", "__pycache__", ".pycache", ".mypy_cache",
                 ".pytest_cache", ".ruff_cache", ".tmp"}
-IGNORED_NAMES = {"REVIEW.md", ".DS_Store"}
+IGNORED_NAMES = {"REVIEW.md", "REVIEW.partial.json", "REVIEW.partial.md",
+                 ".DS_Store", "plan.json", "PLAN.json"}
 IGNORED_PREFIXES = (".dsh-tmp-",)
 STATE_DIRS = {"state", ".state", "state_dir"}
 _TEXT_LIMIT_DEFAULT = 60000
@@ -294,6 +295,72 @@ def _safe_env(env):
     return base
 
 
+def run_command(command, cwd=None, timeout=300.0, env=None):
+    """Run one bounded command and return a small evidence-safe result.
+
+    The command owns its process group on POSIX, so a timeout kills its
+    children too. The returned ``output`` is the decoded combined
+    stdout/stderr; callers cap and redact what they persist. This is the
+    shared runner for ``run_test_suite`` and the deterministic gate; it never
+    places environment values in the result.
+    """
+    spec = command
+    started = time.monotonic()
+    timed_out = False
+    output = ""
+    code = None
+    error = None
+    stdout = b""
+    stderr = b""
+    proc = None
+    try:
+        kwargs = {
+            "cwd": cwd,
+            "env": _safe_env(env),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": isinstance(spec, str),
+        }
+        if os.name != "nt":
+            # Own process group: a timeout kills the command's children too.
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(spec, **kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=float(timeout))
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                if os.name != "nt":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = b"", b""
+            code = proc.returncode
+        output = ((stdout or b"") + (stderr or b"")).decode(
+            "utf-8", "replace")
+    except OSError as exc:
+        error = "Failed to start command: %s" % exc
+        output = error
+        code = None
+    return {
+        "command": spec,
+        "exit_code": code,
+        "output": output,
+        "timed_out": timed_out,
+        "seconds": round(time.monotonic() - started, 4),
+        "error": error,
+    }
+
+
 def run_test_suite(workspace, command=None, timeout=300.0, env=None,
                    secret=None, key_store=None, metadata=None):
     """Run a test suite under a hard timeout and return signed, secret-free evidence.
@@ -336,51 +403,11 @@ def run_test_suite(workspace, command=None, timeout=300.0, env=None,
         skipped.update(extra)
         skipped["signature"] = sign_payload(skipped, secret)
         return skipped
-    started = time.monotonic()
-    timed_out = False
-    output = ""
-    code = None
-    stdout = b""
-    stderr = b""
-    proc = None
-    try:
-        kwargs = {
-            "cwd": project_root,
-            "env": _safe_env(env),
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "shell": isinstance(spec, str),
-        }
-        if os.name != "nt":
-            # Own process group: a timeout kills the suite's children too.
-            kwargs["start_new_session"] = True
-        proc = subprocess.Popen(spec, **kwargs)
-        try:
-            stdout, stderr = proc.communicate(timeout=float(timeout))
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                if os.name != "nt":
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                else:
-                    proc.kill()
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except Exception:
-                stdout, stderr = b"", b""
-            code = proc.returncode
-        output = ((stdout or b"") + (stderr or b"")).decode(
-            "utf-8", "replace")
-    except OSError as exc:
-        output = "Failed to start test command: %s" % exc
-        code = None
-    seconds = round(time.monotonic() - started, 4)
+    run = run_command(spec, cwd=project_root, timeout=timeout, env=env)
+    timed_out = run["timed_out"]
+    output = run["output"]
+    code = run["exit_code"]
+    seconds = run["seconds"]
     after = tree_digest(workspace)
     tests, failures, errors = _parse_counts(output)
     if timed_out:

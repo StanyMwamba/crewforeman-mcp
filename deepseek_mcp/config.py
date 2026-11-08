@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.10.0"
+SERVER_VERSION = "3.11.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -277,6 +277,43 @@ DEFAULTS = {
     "auto_skills_refresh_after": 3,
     "auto_skills_refresh_cooldown_days": 7.0,
     "auto_skills_store_evidence_text": False,
+    # v3.11.0 F1: deterministic gate (tests + lint + secret scan) before the
+    # paid reviewer. gate_tests/gate_lint accept "auto", "off" or a command
+    # string ("off" is checked by the caller, so they stay plain strings).
+    "gate_enabled": True,
+    "gate_tests": "auto",
+    "gate_test_command": "",
+    "gate_lint": "auto",
+    "gate_lint_command": "",
+    "gate_secret_scan": True,
+    "gate_secret_patterns": [],
+    "gate_timeout_seconds": 300.0,
+    "gate_max_revisions": 2,
+    "gate_max_output_chars": 4000,
+    # v3.11.0 F2: PLAN.json contract check.
+    "plan_contract": "warn",
+    "plan_file": "PLAN.json",
+    "plan_max_files": 200,
+    "plan_max_risks": 20,
+    # v3.11.0 F3: bounded lesson store for repeated failure notes.
+    "failure_notes": "on",
+    "failure_notes_max": 3,
+    "failure_notes_half_life_days": 30.0,
+    "failure_notes_min_occurrences": 2,
+    "failure_notes_max_store": 200,
+    "failure_notes_store": "",
+    # v3.11.0 F4: structured pipeline of independent jobs and patch queue.
+    "pipeline_enabled": True,
+    "pipeline_max_extra_jobs": 1,
+    "pipeline_require_disjoint": True,
+    "pipeline_isolation": "worktree",
+    "pipeline_worktree_root": "",
+    "pipeline_patch_dir": "",
+    "pipeline_install": "auto",
+    "pipeline_min_remaining_usd": 1.0,
+    "pipeline_max_pending_patches": 8,
+    "pipeline_queue_scan": "head",
+    "pipeline_patch_retention_days": 3,
 }
 
 # Environment variable -> config key. New names are listed first; legacy v2
@@ -451,6 +488,72 @@ ENV_MAP = {
     "DSH_AUTO_SKILLS_GATE": "auto_skills_quality_gate",
     "DSH_AUTO_SKILLS_REVIEW_ROUNDS": "auto_skills_review_rounds",
     "DSH_AUTO_SKILLS_PROMOTE_AFTER": "auto_skills_promote_after",
+    # v3.11.0 F1 gate keys.
+    "DSH_GATE_ENABLED": "gate_enabled",
+    "DEEPSEEK_GATE_ENABLED": "gate_enabled",
+    "DSH_GATE_TESTS": "gate_tests",
+    "DEEPSEEK_GATE_TESTS": "gate_tests",
+    "DSH_GATE_TEST_COMMAND": "gate_test_command",
+    "DEEPSEEK_GATE_TEST_COMMAND": "gate_test_command",
+    "DSH_GATE_LINT": "gate_lint",
+    "DEEPSEEK_GATE_LINT": "gate_lint",
+    "DSH_GATE_LINT_COMMAND": "gate_lint_command",
+    "DEEPSEEK_GATE_LINT_COMMAND": "gate_lint_command",
+    "DSH_GATE_SECRET_SCAN": "gate_secret_scan",
+    "DEEPSEEK_GATE_SECRET_SCAN": "gate_secret_scan",
+    "DSH_GATE_SECRET_PATTERNS": "gate_secret_patterns",
+    "DEEPSEEK_GATE_SECRET_PATTERNS": "gate_secret_patterns",
+    "DSH_GATE_TIMEOUT_SECONDS": "gate_timeout_seconds",
+    "DEEPSEEK_GATE_TIMEOUT_SECONDS": "gate_timeout_seconds",
+    "DSH_GATE_MAX_REVISIONS": "gate_max_revisions",
+    "DEEPSEEK_GATE_MAX_REVISIONS": "gate_max_revisions",
+    "DSH_GATE_MAX_OUTPUT_CHARS": "gate_max_output_chars",
+    "DEEPSEEK_GATE_MAX_OUTPUT_CHARS": "gate_max_output_chars",
+    # v3.11.0 F2 plan keys.
+    "DSH_PLAN_CONTRACT": "plan_contract",
+    "DEEPSEEK_PLAN_CONTRACT": "plan_contract",
+    "DSH_PLAN_FILE": "plan_file",
+    "DEEPSEEK_PLAN_FILE": "plan_file",
+    "DSH_PLAN_MAX_FILES": "plan_max_files",
+    "DEEPSEEK_PLAN_MAX_FILES": "plan_max_files",
+    "DSH_PLAN_MAX_RISKS": "plan_max_risks",
+    "DEEPSEEK_PLAN_MAX_RISKS": "plan_max_risks",
+    # v3.11.0 F3 failure-note keys.
+    "DSH_FAILURE_NOTES": "failure_notes",
+    "DEEPSEEK_FAILURE_NOTES": "failure_notes",
+    "DSH_FAILURE_NOTES_MAX": "failure_notes_max",
+    "DEEPSEEK_FAILURE_NOTES_MAX": "failure_notes_max",
+    "DSH_FAILURE_NOTES_HALF_LIFE_DAYS": "failure_notes_half_life_days",
+    "DEEPSEEK_FAILURE_NOTES_HALF_LIFE_DAYS": "failure_notes_half_life_days",
+    "DSH_FAILURE_NOTES_MIN_OCCURRENCES": "failure_notes_min_occurrences",
+    "DEEPSEEK_FAILURE_NOTES_MIN_OCCURRENCES": "failure_notes_min_occurrences",
+    "DSH_FAILURE_NOTES_MAX_STORE": "failure_notes_max_store",
+    "DEEPSEEK_FAILURE_NOTES_MAX_STORE": "failure_notes_max_store",
+    "DSH_FAILURE_NOTES_STORE": "failure_notes_store",
+    "DEEPSEEK_FAILURE_NOTES_STORE": "failure_notes_store",
+    # v3.11.0 F4 pipeline keys.
+    "DSH_PIPELINE_ENABLED": "pipeline_enabled",
+    "DEEPSEEK_PIPELINE_ENABLED": "pipeline_enabled",
+    "DSH_PIPELINE_MAX_EXTRA_JOBS": "pipeline_max_extra_jobs",
+    "DEEPSEEK_PIPELINE_MAX_EXTRA_JOBS": "pipeline_max_extra_jobs",
+    "DSH_PIPELINE_REQUIRE_DISJOINT": "pipeline_require_disjoint",
+    "DEEPSEEK_PIPELINE_REQUIRE_DISJOINT": "pipeline_require_disjoint",
+    "DSH_PIPELINE_ISOLATION": "pipeline_isolation",
+    "DEEPSEEK_PIPELINE_ISOLATION": "pipeline_isolation",
+    "DSH_PIPELINE_WORKTREE_ROOT": "pipeline_worktree_root",
+    "DEEPSEEK_PIPELINE_WORKTREE_ROOT": "pipeline_worktree_root",
+    "DSH_PIPELINE_PATCH_DIR": "pipeline_patch_dir",
+    "DEEPSEEK_PIPELINE_PATCH_DIR": "pipeline_patch_dir",
+    "DSH_PIPELINE_INSTALL": "pipeline_install",
+    "DEEPSEEK_PIPELINE_INSTALL": "pipeline_install",
+    "DSH_PIPELINE_MIN_REMAINING_USD": "pipeline_min_remaining_usd",
+    "DEEPSEEK_PIPELINE_MIN_REMAINING_USD": "pipeline_min_remaining_usd",
+    "DSH_PIPELINE_MAX_PENDING_PATCHES": "pipeline_max_pending_patches",
+    "DEEPSEEK_PIPELINE_MAX_PENDING_PATCHES": "pipeline_max_pending_patches",
+    "DSH_PIPELINE_QUEUE_SCAN": "pipeline_queue_scan",
+    "DEEPSEEK_PIPELINE_QUEUE_SCAN": "pipeline_queue_scan",
+    "DSH_PIPELINE_PATCH_RETENTION_DAYS": "pipeline_patch_retention_days",
+    "DEEPSEEK_PIPELINE_PATCH_RETENTION_DAYS": "pipeline_patch_retention_days",
 }
 
 BOOL_KEYS = {"builder_practices", "quality", "independent_review", "child_progress",
@@ -461,7 +564,9 @@ BOOL_KEYS = {"builder_practices", "quality", "independent_review", "child_progre
              "auto_skills_store_evidence_text",
              "auto_skills_capture_explicit_none", "allow_writing_reviewer",
              "health_gate", "allow_first_phase_overrun",
-             "reserve_resume_slot", "review_preflight"}
+             "reserve_resume_slot", "review_preflight",
+             "gate_enabled", "gate_secret_scan", "pipeline_enabled",
+             "pipeline_require_disjoint"}
 INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
              "restart_helper_attempts",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
@@ -478,15 +583,25 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "auto_skills_max_skills", "auto_skills_max_candidates",
             "auto_skills_max_skill_chars", "auto_skills_max_versions",
             "auto_skills_refresh_after", "authority_ttl_seconds",
-            "cost_reservation_ttl_seconds"}
+            "cost_reservation_ttl_seconds",
+            "gate_max_revisions", "gate_max_output_chars",
+            "plan_max_files", "plan_max_risks",
+            "failure_notes_max",
+            "failure_notes_min_occurrences", "failure_notes_max_store",
+            "pipeline_max_extra_jobs", "pipeline_max_pending_patches",
+            "pipeline_patch_retention_days"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request"),
-             "quality_convergence": ("observe", "auto")}
+             "quality_convergence": ("observe", "auto"),
+             "plan_contract": ("warn", "block", "off"),
+             "failure_notes": ("on", "off"),
+             "pipeline_install": ("auto", "manual", "off"),
+             "pipeline_queue_scan": ("head", "first_fit")}
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
-             "allowed_workspace_roots"}
+             "allowed_workspace_roots", "gate_secret_patterns"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "admission_heartbeat_seconds", "admission_lease_seconds",
-              "review_test_timeout_seconds",
+              "review_test_timeout_seconds", "failure_notes_half_life_days",
               "daily_alert_usd", "daily_limit_usd", "render_probe_timeout",
               "stall_cap_grace_seconds", "stall_cap_extension_seconds",
               "stall_cap_hard_max_seconds",
@@ -503,10 +618,13 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "auto_skills_refresh_cooldown_days",
               "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
               "review_context_max_chars", "review_preflight_timeout",
-              "restart_helper_retry_seconds"}
+              "restart_helper_retry_seconds",
+              "gate_timeout_seconds", "pipeline_min_remaining_usd"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",
-             "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path"}
+             "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path",
+             "failure_notes_store", "pipeline_worktree_root",
+             "pipeline_patch_dir"}
 
 # P3.4a: the four connector-owned keys derived from a non-empty state_root
 # (env CREWFOREMAN_STATE_DIR or config file state_root). This sits below

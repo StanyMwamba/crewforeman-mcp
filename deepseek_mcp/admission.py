@@ -31,7 +31,7 @@ _TERMINAL = ("done", "failed", "cancelled", "error")
 _ERROR_STATUSES = frozenset((
     "error", "failed", "failure", "cancelled", "canceled", "no_balance",
     "deadline_exceeded", "budget_exceeded", "timeout",
-    "time_budget_exceeded", "cost_budget_exceeded"))
+    "time_budget_exceeded", "cost_budget_exceeded", "gate_failed"))
 _SUCCESS_STATUSES = frozenset((
     "done", "ok", "success", "succeeded", "complete", "completed",
     "ok_unreviewed", "ok_below_gate", "ok_rescued"))
@@ -522,7 +522,7 @@ class AdmissionStore:
     # -- public API --------------------------------------------------------
     def enqueue(self, work_id, priority=PRIORITY_BUILD, run_id=None,
                 spec_path=None, tool=None, meta=None, urgent=False,
-                depends_on=None):
+                depends_on=None, pipeline=None):
         work_id = self._safe_id(work_id)
         urgent = bool(urgent)
         if depends_on is not None:
@@ -570,6 +570,16 @@ class AdmissionStore:
                 record["tool"] = tool
             if meta:
                 record["meta"] = dict(meta)
+            if isinstance(pipeline, dict):
+                # P3.5 pipeline reservation: write-set, eligibility, slot and
+                # base-commit evidence are durable with the queue record.
+                for key in ("write_set", "write_set_source", "write_set_impl",
+                            "pipeline_eligible", "pipeline_extra",
+                            "base_commit", "base_ref", "canonical_workspace",
+                            "defer_next_start", "head_skip_count",
+                            "job_max_cost_usd", "install_status"):
+                    if key in pipeline:
+                        record[key] = pipeline[key]
             self._save_item(work_id, record)
             self._remove_lease(work_id)
             return record
@@ -663,7 +673,7 @@ class AdmissionStore:
             raise AdmissionError("unknown work id: %s" % work_id)
         return item
 
-    def claim(self, work_id, pid=None):
+    def claim(self, work_id, pid=None, extra=False):
         work_id = self._safe_id(work_id)
         with self._lock, self._work_lock(work_id):
             now = self._now_val()
@@ -691,6 +701,8 @@ class AdmissionStore:
                 "lease_until_ts": lease_until,
                 "heartbeat": _now_iso(now),
             })
+            if extra:
+                item["pipeline_extra"] = True
             self._save_item(work_id, item)
             lease = {
                 "work_id": work_id,
@@ -935,6 +947,12 @@ class AdmissionStore:
             "fencing_token": item.get("fencing_token"),
             "status": item.get("status"),
             "error": item.get("error"),
+            "write_set": item.get("write_set") or [],
+            "write_set_source": item.get("write_set_source"),
+            "pipeline_eligible": bool(item.get("pipeline_eligible")),
+            "pipeline_extra": bool(item.get("pipeline_extra")),
+            "base_commit": item.get("base_commit"),
+            "install_status": item.get("install_status") or "n/a",
         }
 
 
@@ -1020,8 +1038,11 @@ def _idle_probe(cfg):
 class AdmissionController:
     def __init__(self, cfg, store=None, spawn=None, detected_limit=None,
                  dependency_probe=None, idle_probe=None, event_sink=None,
-                 fail_sink=None):
+                 fail_sink=None, review_probe=None):
         self.cfg = cfg
+        # P3.5: injected by jobs.py as a file-only read of the durable run
+        # phase plus the live admission lease. It is never imported here.
+        self.review_probe = review_probe
         self.capacity = resolved_capacity(cfg, detected_limit=detected_limit)
         if store is None:
             root = getattr(cfg, "state_dir", None) or getattr(cfg, "work_dir", None)
@@ -1061,10 +1082,196 @@ class AdmissionController:
         return any(int(r.get("priority", PRIORITY_BUILD)) == PRIORITY_RESUME
                    for r in self.store.pending())
 
+    @staticmethod
+    def _is_extra(record):
+        return bool(isinstance(record, dict) and record.get("pipeline_extra"))
+
+    def _base_active(self):
+        try:
+            return [rec for rec in self.store.active()
+                    if not self._is_extra(rec)]
+        except Exception:
+            return []
+
     def _slots(self):
+        """Base slots only; pipeline extras never consume a base slot."""
         if self.capacity is None:
             return None
-        return self.capacity - self.store.active_count()
+        return self.capacity - len(self._base_active())
+
+    def _reviewing(self, record):
+        probe = self.review_probe
+        if probe is None:
+            return False
+        try:
+            return bool(probe(record))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _write_sets_overlap(first, second):
+        first = [str(item) for item in (first or []) if str(item).strip()]
+        second = [str(item) for item in (second or []) if str(item).strip()]
+        if not first or not second:
+            # Unknown is the universe: it overlaps everything.
+            return True
+        try:
+            from . import pipeline as pipeline_mod
+            return bool(pipeline_mod.overlaps(first, second))
+        except Exception:
+            pass
+        for left in first:
+            for right in second:
+                left_n = left.replace("\\", "/").strip("/")
+                right_n = right.replace("\\", "/").strip("/")
+                if not left_n or not right_n:
+                    return True
+                if left_n == right_n:
+                    return True
+                if left_n.startswith(right_n + "/") or right_n.startswith(
+                        left_n + "/"):
+                    return True
+        return False
+
+    def _patch_backlog(self, record=None):
+        """Count *pending* patches, not installed/retained history."""
+        try:
+            canonical = (record or {}).get("canonical_workspace") if isinstance(
+                record, dict) else None
+            if canonical:
+                try:
+                    from . import pipeline as pipeline_mod
+                    pending = pipeline_mod._pending_records(self.cfg, canonical)
+                    return len(pending)
+                except Exception:
+                    # Fall through to the conservative directory count.
+                    pass
+            state_dir = _cfg_value(self.cfg, "state_dir", "")
+            patch_dir = _cfg_value(self.cfg, "pipeline_patch_dir", "") or os.path.join(
+                str(state_dir), "patches")
+            patch_dir = os.path.expanduser(str(patch_dir))
+            if not os.path.isdir(patch_dir):
+                return 0
+            count = 0
+            for name in os.listdir(patch_dir):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(patch_dir, name), "r",
+                              encoding="utf-8") as handle:
+                        data = json.load(handle)
+                except Exception:
+                    continue
+                if str(data.get("status") or "pending") in (
+                        "pending", "accepted", "manual", "conflict"):
+                    count += 1
+            # A directory with only raw .patch files (older/partial state) is
+            # counted conservatively so extras cannot over-admit.
+            if count == 0:
+                count = len([name for name in os.listdir(patch_dir)
+                             if name.endswith(".patch")])
+            return count
+        except Exception:
+            # An unreadable backlog fails closed for an extra start.
+            return 10 ** 6
+
+    def _cost_headroom_ok(self, record):
+        """Fail closed when an extra's cost cannot be proven affordable."""
+        try:
+            daily = _cfg_value(self.cfg, "daily_limit_usd", None)
+            job_max = record.get("job_max_cost_usd")
+            if job_max is None:
+                job_max = _cfg_value(self.cfg, "job_max_cost_usd", None)
+            if job_max is not None:
+                job_max = float(job_max)
+            if daily is None:
+                return job_max is not None and job_max > 0
+            try:
+                from .budget import CostLedger
+                ledger = CostLedger(_cfg_value(self.cfg, "state_dir"))
+                spent = float(ledger.daily_total(0.0))
+            except Exception:
+                return False
+            floor = float(_cfg_value(self.cfg, "pipeline_min_remaining_usd", 1.0)
+                          or 0.0)
+            required = max(floor, job_max or 0.0)
+            return float(daily) - spent >= required
+        except Exception:
+            return False
+
+    def _active_run_defers(self, record):
+        """True when an active job's run record says defer further starts."""
+        run_id = record.get("run_id") if isinstance(record, dict) else None
+        if not run_id:
+            return False
+        try:
+            from .store import find_run
+            run = find_run(str(run_id), self.cfg)[0]
+        except Exception:
+            return False
+        if not isinstance(run, dict):
+            return False
+        pipe = run.get("pipeline") if isinstance(run.get("pipeline"), dict) else {}
+        return bool(pipe.get("defer_next_start"))
+
+    def _pipeline_extra_allowed(self, record):
+        """The exact §F4.4 extra-start test; all conditions must hold."""
+        if self.capacity is None or self.hard_ceiling is None:
+            return False
+        try:
+            if not bool(_cfg_value(self.cfg, "pipeline_enabled", True)):
+                return False
+        except Exception:
+            return False
+        if not record.get("pipeline_eligible"):
+            return False
+        write_set = [str(item) for item in (record.get("write_set") or [])
+                     if str(item).strip()]
+        if not write_set:
+            return False
+        if self._slots() is None or self._slots() > 0:
+            return False
+        try:
+            active = self.store.active()
+        except Exception:
+            return False
+        if len(active) >= self.hard_ceiling:
+            return False
+        try:
+            max_extra = max(0, int(_cfg_value(
+                self.cfg, "pipeline_max_extra_jobs", 1) or 0))
+        except (TypeError, ValueError):
+            max_extra = 1
+        if len([rec for rec in active if self._is_extra(rec)]) >= max_extra:
+            return False
+        if not any((not self._is_extra(rec)) and self._reviewing(rec)
+                   for rec in active):
+            return False
+        if self._p0_pending():
+            return False
+        if bool(_cfg_value(self.cfg, "pipeline_require_disjoint", True)):
+            for other in active:
+                if self._write_sets_overlap(write_set,
+                                            other.get("write_set") or []):
+                    return False
+        if any(rec.get("defer_next_start") for rec in active):
+            return False
+        # PLAN widening happens after admission and is recorded on the run, so
+        # read the durable record as well as the queue field.
+        if any(self._active_run_defers(rec) for rec in active):
+            return False
+        try:
+            backlog_cap = max(0, int(_cfg_value(
+                self.cfg, "pipeline_max_pending_patches", 8) or 0))
+        except (TypeError, ValueError):
+            backlog_cap = 8
+        if self._patch_backlog(record) >= backlog_cap:
+            return False
+        if not self._cost_headroom_ok(record):
+            return False
+        if record.get("depends_on") and not self._dependency_ready(record):
+            return False
+        return True
 
     @staticmethod
     def _effective_rank(record, pending):
@@ -1096,13 +1303,32 @@ class AdmissionController:
         return (AdmissionController._effective_rank(record, pending), created,
                 str(record.get("work_id") or ""))
 
+    def _dependency_install_ready(self, record):
+        """A dependency is ready only after its pipeline patch is installed."""
+        dependency = str(record.get("depends_on") or "")
+        canonical = record.get("canonical_workspace")
+        if not dependency or not canonical:
+            return True
+        try:
+            from . import pipeline as pipeline_mod
+            records = pipeline_mod._patch_records(self.cfg, canonical)
+        except Exception:
+            return True
+        for item in records:
+            if str(item.get("run_id") or "") != dependency:
+                continue
+            return str(item.get("status") or "pending") == "installed"
+        return True
+
     def _dependency_ready(self, record):
         if not record.get("depends_on"):
             return True
         try:
-            return self.store.dependency_state(record).get("state") == "ready"
+            if self.store.dependency_state(record).get("state") != "ready":
+                return False
         except Exception:
             return False
+        return self._dependency_install_ready(record)
 
     def _reject_bad_dependency_locked(self, record):
         """Fail a queue item whose dependency became unknown/failed."""
@@ -1151,6 +1377,25 @@ class AdmissionController:
             return False
         if self.capacity is None:
             return True
+        # P3.5 invariant: never overlap a canonical (non-eligible) builder with
+        # a pipeline-eligible job that may need to install a patch, in either
+        # direction. Install's dirty-tree check is only the second defence.
+        try:
+            active = self.store.active()
+        except Exception:
+            return False
+        eligible_active = [rec for rec in active
+                           if rec.get("pipeline_eligible")]
+        if record.get("pipeline_eligible"):
+            if any(not rec.get("pipeline_eligible") for rec in active):
+                return False
+        else:
+            if eligible_active or self._patch_backlog(record) > 0:
+                return False
+        # An extra job may start only during a review, beyond capacity, and
+        # with a disjoint write-set. This runs before the normal slot test.
+        if self._pipeline_extra_allowed(record):
+            return True
         free = self._slots()
         if free is None or free <= 0:
             return False
@@ -1166,7 +1411,7 @@ class AdmissionController:
 
     def submit(self, work_id, priority=PRIORITY_BUILD, run_id=None,
                spec_path=None, tool=None, spawn=None, urgent=False,
-               depends_on=None):
+               depends_on=None, pipeline=None):
         spawn_fn = spawn or self._spawn
         # The capacity check and the claim must be one critical section across
         # every controller sharing this queue root, not just this instance.
@@ -1174,7 +1419,7 @@ class AdmissionController:
             record = self.store.enqueue(
                 work_id, priority=priority, run_id=run_id,
                 spec_path=spec_path, tool=tool, urgent=urgent,
-                depends_on=depends_on)
+                depends_on=depends_on, pipeline=pipeline)
             fields = self.store.status_fields(work_id)
             if record.get("status") == "queued":
                 self._reject_bad_dependency_locked(record)
@@ -1229,7 +1474,18 @@ class AdmissionController:
                     if head_key <= own_key and not legacy_no_reserve:
                         can_claim = False
             if can_claim:
-                claimed = self.store.claim(work_id)
+                is_extra = self._pipeline_extra_allowed(record)
+                if is_extra and str(_cfg_value(
+                        self.cfg, "pipeline_queue_scan", "head")).lower() == "head":
+                    # Head scan: a disjoint candidate may not jump the FIFO
+                    # head just because submit observed the review window.
+                    queue = self.store.pending()
+                    if queue and str(queue[0].get("work_id")) != str(work_id):
+                        can_claim = False
+                if can_claim:
+                    claimed = self.store.claim(work_id, extra=is_extra)
+                else:
+                    claimed = None
                 if claimed is not None:
                     try:
                         if spawn_fn is not None:
@@ -1266,6 +1522,17 @@ class AdmissionController:
             pending = self.store.pending()
             if not pending:
                 break
+            # P3.5 head scan: when no base slot is free, only the FIFO head is
+            # eligible for the review-window extra. first_fit may look past a
+            # waited head; normal same-slot admission is unchanged.
+            try:
+                scan = str(_cfg_value(
+                    self.cfg, "pipeline_queue_scan", "head")).lower()
+                free = self._slots()
+            except Exception:
+                scan, free = "head", 0
+            if scan == "head" and free is not None and free <= 0:
+                pending = pending[:1]
             progressed = False
             for rec in pending:
                 if self._reject_bad_dependency_locked(rec):
@@ -1274,7 +1541,8 @@ class AdmissionController:
                 if not self._may_start(rec):
                     continue
                 work_id = rec.get("work_id")
-                claimed = self.store.claim(work_id)
+                claimed = self.store.claim(
+                    work_id, extra=self._pipeline_extra_allowed(rec))
                 if claimed is None:
                     continue
                 started.append(claimed)

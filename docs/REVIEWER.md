@@ -92,3 +92,21 @@ starts with the main reviewer again. If the main reviewer's pre-flight fails
 with a switch class, the backup must pass its own pre-flight before the paid
 review runs. If both reviewers fail, the run fails with a clear reviewer error
 and `quality_score` is `None`; no score is invented.
+
+## Vendor attribution (new in 3.11.0)
+
+The failure message names the reviewer that actually ran, not the main
+reviewer's vendor. With a DeepSeek main reviewer and a Kimi backup, a Kimi
+quota error says `Kimi (Moonshot)/<model> reviewer quota is exhausted ...; the
+DeepSeek balance is unaffected.` The sentence `DeepSeek account balance is
+empty` is reserved for a reviewer whose identity is DeepSeek. Auth errors name
+the vendor key variable when it is known (`MOONSHOT_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`); a bare 429 names
+the vendor and asks the operator to wait and retry; any other failure gets a
+generic attributed sentence. Raw provider text is not copied into the
+user-facing sentence, so it cannot echo a secret.
+
+The label comes from `backup_reviewer_vendor` / `backup_reviewer_model` when
+set; otherwise the wrapper basename and the execution model are fallbacks, and
+an unidentified vendor is labelled `unknown`, never DeepSeek. This is a
+message-only change: it does not alter admission, retry, score or status.

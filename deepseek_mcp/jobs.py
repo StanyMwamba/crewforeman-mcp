@@ -53,6 +53,24 @@ def _admission_controller(cfg):
                 idle_probe=admission_mod._idle_probe(cfg),
                 event_sink=_admission_event_sink(cfg),
                 fail_sink=_admission_fail_sink(cfg))
+
+            def _review_probe(record, _cfg=cfg, _controller=controller):
+                """True only for a live lease whose run is in the review phase."""
+                try:
+                    work_id = record.get("work_id")
+                    lease = _controller.store._load_lease(work_id)
+                    if not lease or not _controller.store._lease_live(lease):
+                        return False
+                    run_id = (record.get("run_id")
+                              or record.get("canonical_run_id"))
+                    if not run_id:
+                        return False
+                    in_flight = _review_gate_state(_cfg, run_id)[0]
+                    return bool(in_flight)
+                except Exception:
+                    return False
+
+            controller.review_probe = _review_probe
             _admission_controllers[root] = controller
         return controller
 
@@ -489,6 +507,10 @@ def _review_gate_error(gate, canonical=False):
     job; only a run that genuinely ended in ``error`` is propagated.
     """
     in_flight, review_expected, recorded, run_status, run_error = gate
+    if run_status == "gate_failed":
+        detail = str(run_error or "").strip() or "see status_detail"
+        return ("deterministic gate failed; reviewer was not called: %s"
+                % detail)
     if in_flight:
         return ("review phase is still in flight; refusing a "
                 "terminal done status")
@@ -496,11 +518,12 @@ def _review_gate_error(gate, canonical=False):
     if (review_expected and not recorded
             and run_status in success_shaped):
         return ("review was requested but no review round was recorded")
-    if review_expected and run_status == "error":
+    if run_status == "error":
+        # A terminal run error belongs to the job even when no independent
+        # review was requested (install conflict, gate error, builder error).
         detail = str(run_error or "").strip()
         subject = "the canonical run" if canonical else "the run"
-        message = ("independent review failed; %s ended with status "
-                   "'error'" % subject)
+        message = ("%s ended with status 'error'" % subject)
         if detail:
             message += ": " + detail
         return message
@@ -837,6 +860,63 @@ def _rewrite_admission_spec(record, spec_path):
         pass
 
 
+def _materialize_pipeline_worktree(cfg, record_data, run_id):
+    """Create a deferred pipeline worktree at dispatch time (depends_on)."""
+    try:
+        from . import pipeline as pipeline_mod
+        args = record_data.get("args") if isinstance(record_data.get("args"), dict) else {}
+        pipe = args.get("_pipeline") or record_data.get("pipeline") or {}
+        if not isinstance(pipe, dict) or not pipe.get("eligible"):
+            return record_data
+        worktree = pipe.get("worktree")
+        if worktree and os.path.isdir(str(worktree)):
+            return record_data
+        canonical = (pipe.get("canonical_workspace")
+                     or args.get("_canonical_workspace"))
+        if not canonical:
+            pipe.update({"eligible": False,
+                         "unavailable_reason": "pipeline_lost"})
+            return record_data
+        created = pipeline_mod.create_worktree(cfg, canonical, run_id)
+        if not created.get("ok"):
+            pipe.update({"eligible": False, "worktree": None,
+                         "unavailable_reason": created.get("reason")
+                         or "worktree_add_failed"})
+            return record_data
+        pipe.update({
+            "eligible": True, "decided": True,
+            "worktree": created.get("path"),
+            "base_commit": created.get("base_commit") or pipe.get("base_commit"),
+            "base_ref": created.get("base_ref") or pipe.get("base_ref"),
+            "canonical_workspace": canonical,
+        })
+        args["workspace"] = created.get("path")
+        args["_canonical_workspace"] = canonical
+        args["_pipeline"] = dict(pipe)
+        args["_pipeline_decided"] = True
+        record_data["args"] = args
+        record_data["pipeline"] = dict(pipe)
+        return record_data
+    except Exception as exc:
+        try:
+            pipe = record_data.setdefault("pipeline", {})
+            pipe.update({"eligible": False,
+                         "unavailable_reason": "pipeline_setup_failed",
+                         "detail": redact_secrets(str(exc))[:300]})
+        except Exception:
+            pass
+        return record_data
+
+
+def _write_spec(path, data):
+    path = Path(path)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
 def _status_is_cancelled(status_path):
     try:
         state = json.loads(Path(status_path).read_text(encoding="utf-8"))
@@ -857,6 +937,12 @@ def _dispatch_admitted(record, cfg):
     _rewrite_admission_spec(record, spec_path)
     data = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     run_id = data.get("run_id")
+    if data.get("pipeline") or (data.get("args") or {}).get("_pipeline"):
+        data = _materialize_pipeline_worktree(cfg, data, run_id)
+        try:
+            _write_spec(spec_path, data)
+        except Exception as exc:
+            log("pipeline worktree spec update skipped: %s" % exc)
     jobs_dir = Path(cfg.jobs_dir)
     status = jobs_dir / (run_id + ".status.json")
     if _status_is_cancelled(status):
@@ -995,6 +1081,122 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 "deepseek_job_status in a moment.]" % admission["work_id"])
     call_args.pop("idempotency_key", None)
     run_id = new_id()
+    # P3.5 pipeline: decide write-set/eligibility once, before the builder,
+    # and run an eligible job in its own detached worktree. Non-eligible jobs
+    # keep today's canonical-workspace behaviour.
+    pipeline_info = {}
+    if tool == "harness_deepseek" and not call_args.get("resume_run_id"):
+        try:
+            from . import pipeline as pipeline_mod
+            canonical = os.path.abspath(os.path.expanduser(str(
+                call_args.get("workspace") or cfg.harness_workspace)))
+            declared = pipeline_mod.declared_write_set(call_args, cfg)
+            pre_source = declared.get("source") in ("arg", "slice", "prompt")
+            if not (pre_source and declared.get("write_set")):
+                # No pre-builder declaration: not pipeline-eligible, and do
+                # not run any git probe. This preserves the serial path
+                # byte-for-byte (and keeps existing job tests subprocess-free).
+                pipeline_info = {
+                    "enabled": bool(_cfg_get(cfg, "pipeline_enabled", True)),
+                    "eligible": False, "decided": True,
+                    "unavailable_reason": "no_declared_write_set",
+                    "slot": "base", "worktree": None,
+                    "canonical_workspace": canonical,
+                    "base_ref": None, "base_commit": None,
+                    "write_set": list(declared.get("write_set") or []),
+                    "write_set_source": declared.get("source") or "none",
+                    "write_set_impl": declared.get("impl") or "builtin",
+                    "write_set_invalid": declared.get("invalid") or [],
+                    "install": {"status": "n/a", "applied": [],
+                                "reason": None},
+                }
+                call_args["_pipeline_decided"] = True
+                call_args["_pipeline"] = dict(pipeline_info)
+                raise StopIteration
+            stub = {"id": run_id, "workspace": canonical,
+                    "pipeline": {"slot": "base"}}
+            info = pipeline_mod.prepare_args(cfg, call_args, stub)
+            if not isinstance(info, dict):
+                info = {}
+            info["decided"] = True
+            info["slot"] = "base"
+            info["canonical_workspace"] = canonical
+            if (pre_source and info.get("eligible")
+                    and declared.get("write_set")):
+                created = ({"ok": False, "reason": "deferred_until_dispatch"}
+                           if depends_on else
+                           pipeline_mod.create_worktree(cfg, canonical, run_id))
+                if created.get("ok"):
+                    info["worktree"] = created.get("path")
+                    info["base_commit"] = (created.get("base_commit")
+                                           or info.get("base_commit"))
+                    info["base_ref"] = (created.get("base_ref")
+                                        or info.get("base_ref"))
+                    call_args["workspace"] = created.get("path")
+                    call_args["_canonical_workspace"] = canonical
+                    call_args["_pipeline_decided"] = True
+                    call_args["_pipeline"] = dict(info)
+                elif depends_on and created.get("reason") == "deferred_until_dispatch":
+                    info["worktree"] = None
+                    info["deferred_worktree"] = True
+                    call_args["_pipeline_decided"] = True
+                    call_args["_pipeline"] = dict(info)
+                else:
+                    info["eligible"] = False
+                    info["unavailable_reason"] = (
+                        created.get("reason") or "worktree_add_failed")
+                    info["detail"] = created.get("detail")
+                    info["worktree"] = None
+                    call_args["_pipeline_decided"] = True
+                    call_args["_pipeline"] = dict(info)
+            else:
+                if not pre_source:
+                    info["eligible"] = False
+                    info["unavailable_reason"] = (
+                        info.get("unavailable_reason") or "no_declared_write_set")
+                info["worktree"] = None
+                call_args["_pipeline_decided"] = True
+                call_args["_pipeline"] = dict(info)
+            pipeline_info = dict(info)
+        except StopIteration:
+            pass
+        except Exception as exc:
+            pipeline_info = {
+                "enabled": bool(_cfg_get(cfg, "pipeline_enabled", True)),
+                "eligible": False, "decided": True,
+                "unavailable_reason": "pipeline_setup_failed",
+                "detail": redact_secrets(str(exc))[:300],
+                "slot": "base", "worktree": None,
+                "canonical_workspace": str(
+                    call_args.get("workspace") or cfg.harness_workspace),
+                "write_set": [], "write_set_source": "none",
+                "write_set_impl": "builtin",
+                "install": {"status": "n/a", "applied": [], "reason": None},
+            }
+    if resume_source and not pipeline_info:
+        try:
+            from .store import find_run
+            saved_resume = find_run(str(resume_source), cfg)[0] or {}
+            pipe = saved_resume.get("pipeline") or {}
+        except Exception:
+            pipe = {}
+        if isinstance(pipe, dict) and pipe.get("eligible"):
+            worktree = pipe.get("worktree")
+            if worktree and os.path.isdir(str(worktree)):
+                call_args["workspace"] = str(worktree)
+                if pipe.get("canonical_workspace"):
+                    call_args["_canonical_workspace"] = pipe.get(
+                        "canonical_workspace")
+                call_args["_pipeline"] = dict(pipe)
+                call_args["_pipeline_decided"] = True
+                pipeline_info = dict(pipe)
+            else:
+                lost = dict(pipe, eligible=False,
+                            unavailable_reason="pipeline_lost")
+                call_args["_pipeline"] = lost
+                call_args["_pipeline_lost"] = True
+                pipeline_info = lost
+
     call_args["_run_id"] = run_id
     if resume_identity is not None:
         call_args["_work_id"] = resume_identity[0]
@@ -1023,6 +1225,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         "config_path": config_path,
         "worker_entry": str(entry) if entry else None,
         "worker_python": str(python) if python else None,
+        "pipeline": pipeline_info or None,
     }
     if resume_identity is not None:
         spec_data.update({
@@ -1047,6 +1250,12 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         "title": call_args.get("title") or call_args.get("prompt", "")[:60],
         "created": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "admission_work_id": run_id,
+        "write_set": list((pipeline_info or {}).get("write_set") or []),
+        "pipeline_slot": (pipeline_info or {}).get("slot") or "base",
+        "pipeline_eligible": bool((pipeline_info or {}).get("eligible")),
+        "install_status": (("pending" if (pipeline_info or {}).get("eligible")
+                            else "n/a")),
+        "base_commit": (pipeline_info or {}).get("base_commit"),
     }
     if resume_identity is not None:
         queued.update({
@@ -1096,6 +1305,14 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             record_data = json.loads(record_spec.read_text(encoding="utf-8"))
         except Exception:
             record_data = {}
+        if record_data.get("pipeline") or (
+                record_data.get("args") or {}).get("_pipeline"):
+            record_data = _materialize_pipeline_worktree(
+                cfg, record_data, record_run_id)
+            try:
+                _write_spec(record_spec, record_data)
+            except Exception as exc:
+                log("pipeline worktree spec update skipped: %s" % exc)
         record_entry = record_data.get("worker_entry") or None
         record_python = record_data.get("worker_python") or None
         if _status_is_cancelled(record_status):
@@ -1119,6 +1336,13 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                          urgent=bool(record.get("urgent")),
                          depends_on=record.get("depends_on"),
                          waiting_on=None,
+                         write_set=record.get("write_set") or [],
+                         pipeline_slot=("extra" if record.get(
+                             "pipeline_extra") else "base"),
+                         pipeline_extra=bool(record.get("pipeline_extra")),
+                         pipeline_eligible=bool(record.get("pipeline_eligible")),
+                         base_commit=record.get("base_commit"),
+                         install_status=record.get("install_status") or "n/a",
                          priority_label=(record.get("priority_label") or
                                          admission_mod.priority_label(
                                              record.get("priority", priority),
@@ -1149,10 +1373,33 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
     # silently queue unrelated tools.
     if tool in ("harness_deepseek", "resume_deepseek"):
         try:
+            queue_pipeline = {}
+            if pipeline_info:
+                queue_pipeline = {
+                    "write_set": list(pipeline_info.get("write_set") or []),
+                    "write_set_source": pipeline_info.get("write_set_source"),
+                    "write_set_impl": pipeline_info.get("write_set_impl"),
+                    "pipeline_eligible": bool(pipeline_info.get("eligible")),
+                    "pipeline_extra": False,
+                    "base_commit": pipeline_info.get("base_commit"),
+                    "base_ref": pipeline_info.get("base_ref"),
+                    "canonical_workspace": pipeline_info.get(
+                        "canonical_workspace"),
+                    "defer_next_start": bool(pipeline_info.get(
+                        "defer_next_start")),
+                    "job_max_cost_usd": (call_args.get("job_max_cost_usd")
+                                         if call_args.get("job_max_cost_usd")
+                                         is not None
+                                         else cfg.get("job_max_cost_usd")),
+                    "install_status": ("pending"
+                                       if pipeline_info.get("eligible")
+                                       else "n/a"),
+                }
             submitted = controller.submit(
                 queue_work_id, priority=priority, run_id=run_id,
                 spec_path=str(spec), tool=tool, spawn=_spawn_record,
-                urgent=urgent, depends_on=depends_on)
+                urgent=urgent, depends_on=depends_on,
+                pipeline=queue_pipeline)
         except admission_mod.DependencyError as exc:
             # A dependency rejection is caller-visible and must not be
             # disguised as an admission/lock failure.
@@ -1211,6 +1458,17 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                      dependency_status=dependency_status,
                      holder=fields.get("holder"),
                      lease_until=fields.get("lease_until"),
+                     write_set=(fields.get("write_set")
+                                or (pipeline_info or {}).get("write_set")
+                                or []),
+                     pipeline_slot=(pipeline_info or {}).get("slot") or "base",
+                     pipeline_eligible=bool((pipeline_info or {}).get(
+                         "eligible")),
+                     base_commit=(fields.get("base_commit")
+                                  or (pipeline_info or {}).get("base_commit")),
+                     install_status=fields.get("install_status") or (
+                         "pending" if (pipeline_info or {}).get("eligible")
+                         else "n/a"),
                      admission_work_id=queue_work_id)
         # A queue-only submit needs a live dispatcher in this process; the
         # startup dispatcher exits when it has nothing to do.
@@ -1382,6 +1640,13 @@ def _structured_status(args, state, run_id, cfg):
     # P2-3: the reservation view is part of the structured status contract.
     # The plain (no events_since) text response stays byte-for-byte compatible.
     payload["cost"] = (run or {}).get("cost_ledger")
+    pipe = (run or {}).get("pipeline") or {}
+    payload["pipeline"] = pipe
+    payload["write_set"] = pipe.get("write_set") or []
+    payload["pipeline_slot"] = pipe.get("slot") or "base"
+    payload["base_commit"] = pipe.get("base_commit")
+    payload["install_status"] = ((pipe.get("install") or {}).get("status")
+                                 or "n/a")
     if (run or {}).get("admission_overrun"):
         payload["admission_overrun"] = run.get("admission_overrun")
     # P3-2: reviewer token usage and per-round cost are part of the structured

@@ -1,9 +1,14 @@
-# Installing crewforeman-mcp 3.10.0
+# Installing crewforeman-mcp 3.11.0
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime
 dependencies**. It ships a local MCP stdio server and five skill checklists
 (`code`, `data`, `document`, `poster`, `web`) that are installed as data files
 under `share/crewforeman-mcp/skills`.
+
+3.11.0 adds no runtime dependency. Pipelined jobs need git 2.5 or newer in
+the target workspace; when git is missing or the tree is not a repository the
+connector falls back to serial jobs. The deterministic gate, `PLAN.json` and
+failure notes need no extra tooling.
 
 There are three supported one-command forms. Run them from the repository
 root (the directory containing `pyproject.toml`).
@@ -129,7 +134,7 @@ then builds and inspects the sdist. It removes its own `venv/`, `sdist/`,
 
 On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
-Expected results: the version prints `3.10.0`, each `--help` exits 0, and the
+Expected results: the version prints `3.11.0`, each `--help` exits 0, and the
 file listing shows the five `.md` skill data files under
 `share/crewforeman-mcp/skills`. If the files are present but a run says
 skills are missing, set `DSH_SKILLS_DIR` to that directory (see docs/OPERATIONS.md).

@@ -44,9 +44,9 @@ from . import work as work_mod
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
                       build_review_task, build_revision_task,
                       build_score_reprompt_task, choose_agents,
-                      convergence_decision, extract_quality_score, parse_review,
-                      persist_signatures, plan_escalation, quality_default,
-                      recurring_lessons)
+                      convergence_decision, defect_kind, extract_quality_score,
+                      parse_review, persist_signatures, plan_escalation,
+                      quality_default, recurring_lessons)
 from .skills import (append_lesson, detect_skill, detect_skill_legacy,
                      detect_skill_match, distill_lesson, lesson_signal,
                      load_skill)
@@ -947,6 +947,21 @@ def _result_text(run, path):
         metric_bits.append("follow-ups %d" % int(metrics["follow_ups"]))
     if metric_bits:
         head += " | " + ", ".join(metric_bits)
+    plan_note = str((run.get("plan") or {}).get("note") or "").strip()
+    if plan_note:
+        head += " | " + plan_note[:160]
+    gate_info = run.get("deterministic_gate") or {}
+    if str(gate_info.get("verdict") or "") in ("failed", "error"):
+        head += " | gate: %s" % gate_info.get("verdict")
+    install_info = ((run.get("pipeline") or {}).get("install") or {})
+    install_status = str(install_info.get("status") or "")
+    if install_status in ("conflict", "manual", "skipped"):
+        head += " | install: %s" % install_status
+        conflict = install_info.get("conflict") or {}
+        if conflict:
+            head += " (%s: %s)" % (
+                conflict.get("patch_id") or "patch",
+                ", ".join(conflict.get("files") or [])[:160] or "see run record")
     head += " | tools: %s" % tool_text
     if run.get("cost_source") == "session_logs":
         cost_text = ("$%s" % api.fmt_cost(run.get("estimated_cost_usd"))
@@ -1029,6 +1044,198 @@ def _bool_value(value):
     if value is None:
         return False
     return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def _feature_module(name):
+    """Import a 3.11 feature module lazily; a missing module is a skip."""
+    try:
+        return __import__("%s.%s" % (__package__, name), fromlist=[name])
+    except Exception:
+        return None
+
+
+def _plan_mode(cfg):
+    mode = str(cfg.get("plan_contract", "warn") or "warn").strip().lower()
+    return mode if mode in ("warn", "block", "off") else "warn"
+
+
+def _plan_path(cfg):
+    raw = str(cfg.get("plan_file", "PLAN.json") or "PLAN.json").strip()
+    raw = raw.replace("\\", "/")
+    if (not raw or raw.startswith("/") or raw.startswith("../")
+            or "/../" in raw or ":" in raw.split("/", 1)[0]):
+        return "PLAN.json"
+    while raw.startswith("./"):
+        raw = raw[2:]
+    return raw or "PLAN.json"
+
+
+def _plan_block(path):
+    return (
+        "## Written prediction before any edit (connector)\n\n"
+        "Before your first file edit, write `%s` in the workspace root. It is "
+        "a written prediction, not a plan essay: list the files you expect to "
+        "change, the tests you expect to add, and the risks you foresee. Use "
+        "this schema (unknown keys are ignored):\n"
+        "{\"version\": 1, \"task_type\": \"code\", \"files_expected\": "
+        "[\"src/a.py\"], \"tests_expected\": [\"tests/test_a.py\"], "
+        "\"risks\": [\"flaky fixture\"], \"write_set\": [\"src/\"]}\n"
+        "Keep it under 200 entries. After the build the connector compares it "
+        "with the real diff and records every mismatch; an accurate prediction "
+        "is cheaper than explaining a surprise."
+        % path
+    )
+
+
+def _revision_plan_block(path):
+    return (
+        "## Written prediction (connector)\n\n"
+        "Update the same `%s` **before your first edit in this revision** so it "
+        "still describes the files and tests you expect to change. Do not create "
+        "a second plan file; do not delete it. A stale or missing plan is a "
+        "recorded defect when the connector runs in block mode." % path
+    )
+
+
+def _failure_note_for(task_type, cfg):
+    """Return (note text, bounded run-record details) for the next builder prompt."""
+    module = _feature_module("failure_notes")
+    if module is None or str(cfg.get("failure_notes", "on") or "on").lower() == "off":
+        return "", None
+    try:
+        note = str(module.note_for(task_type, cfg) or "").strip()
+    except Exception:
+        return "", None
+    injected = []
+    for line in note.splitlines():
+        match = re.match(r"^- (.*) \(seen (\d+)x, weight ([\d.]+)\)\s*$", line)
+        if match:
+            try:
+                injected.append({"kind": match.group(1).strip(),
+                                 "runs": int(match.group(2)),
+                                 "weight": float(match.group(3))})
+            except (TypeError, ValueError):
+                continue
+    details = {
+        "task_type": task_type,
+        "injected": injected,
+        "note_chars": len(note),
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return note, details
+
+
+def _record_review_failure_notes(run, cfg, entry):
+    """Idempotently record one completed blocking review round (F3)."""
+    module = _feature_module("failure_notes")
+    if module is None or not isinstance(entry, dict) or entry.get("kind") != "review":
+        return
+    try:
+        blocking = int(entry.get("blocking_defects") or 0)
+    except (TypeError, ValueError):
+        blocking = 0
+    if blocking <= 0:
+        return
+    kinds = []
+    for defect in entry.get("defects") or []:
+        text = str(defect or "").strip()
+        if not text:
+            continue
+        kind = defect_kind(text)
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    if not kinds:
+        return
+    try:
+        module.record(run.get("task_type") or "unknown", kinds, run.get("id") or "",
+                      entry.get("round") or 1, cfg)
+    except Exception:
+        pass
+
+
+def _gate_test_evidence(gate_record, cfg, workspace):
+    """Reuse gate-signed test evidence only when it signs the current tree."""
+    if not isinstance(gate_record, dict):
+        return None
+    checks = gate_record.get("checks")
+    if not isinstance(checks, list):
+        return None
+    try:
+        current = review_context.tree_digest(workspace).get("sha256")
+    except Exception:
+        return None
+    for check in checks:
+        if not isinstance(check, dict) or check.get("name") != "tests":
+            continue
+        if check.get("status") != "ok" or not check.get("signed"):
+            continue
+        if check.get("tree_sha256") != current:
+            continue
+        try:
+            if not review_context.verify_evidence(
+                    check, state_dir=str(cfg.state_dir)):
+                continue
+        except Exception:
+            continue
+        return check
+    return None
+
+
+def _gate_baseline_path(cfg, run_id):
+    return Path(cfg.state_dir) / "gate-baseline" / ("%s.json" % run_id)
+
+
+def _save_gate_baseline(cfg, run_id, snapshot):
+    """Persist the pre-builder snapshot so a resumed run can scan secrets."""
+    try:
+        path = _gate_baseline_path(cfg, run_id)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        payload = {str(key): list(value) for key, value in (snapshot or {}).items()}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return str(path)
+    except Exception:
+        return None
+
+
+def _load_gate_baseline(cfg, run_id):
+    try:
+        path = _gate_baseline_path(cfg, run_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        out = {}
+        for key, value in data.items():
+            try:
+                out[str(key)] = (value[0], value[1])
+            except Exception:
+                continue
+        return out or None
+    except Exception:
+        return None
+
+
+def _merge_plan_contract_defect(plan_result, defects, fixes, blocking):
+    """Prepend one F2 block-mode defect and raise blocking to at least one."""
+    defects = list(defects or [])
+    fixes = list(fixes or [])
+    try:
+        blocking = int(blocking or 0)
+    except (TypeError, ValueError):
+        blocking = 0
+    if not isinstance(plan_result, dict) or not plan_result.get("blocking_defect"):
+        return defects, fixes, blocking
+    plan_defect = str(plan_result.get("blocking_defect")).strip()
+    if plan_defect and plan_defect not in defects:
+        defects.insert(0, plan_defect)
+    blocking = max(1, blocking)
+    plan_fix = (
+        "Update %s before the first edit so it matches the actual changed "
+        "files and tests." % str(plan_result.get("path") or "PLAN.json"))
+    if plan_fix not in fixes:
+        fixes.insert(0, plan_fix)
+    return defects, fixes, blocking
 
 
 def _stash_old(workspace, name, run_id, round_no=None):
@@ -3854,6 +4061,40 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     workspace = Path(workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
     run["workspace"] = str(workspace)
+    run["pipeline"] = {
+        "enabled": bool(cfg.get("pipeline_enabled", True)),
+        "eligible": False, "slot": "base", "worktree": None,
+        "canonical_workspace": str(workspace),
+        "install": {"status": "n/a", "applied": [], "reason": None},
+    }
+    try:
+        pipeline_mod = _feature_module("pipeline")
+        declared_pipeline = bool(args.get("_pipeline") or args.get("write_set")
+                                 or args.get("slice"))
+        if pipeline_mod is not None and declared_pipeline:
+            pipeline_info = pipeline_mod.prepare_args(cfg, args, run)
+            if isinstance(pipeline_info, dict):
+                run["pipeline"].update(pipeline_info)
+        else:
+            run["pipeline"].update({
+                "eligible": False, "decided": True,
+                "unavailable_reason": "no_declared_write_set",
+                "install": {"status": "n/a", "applied": [], "reason": None},
+            })
+    except Exception as exc:
+        run["pipeline"]["unavailable_reason"] = api.redact_secrets(str(exc))[:300]
+    pipeline_lost = bool(args.get("_pipeline_lost")) or (
+        bool(run["pipeline"].get("eligible"))
+        and not run["pipeline"].get("worktree"))
+    if pipeline_lost:
+        run.update(
+            status="error", stop_reason="pipeline_lost",
+            error=("the pipeline worktree for this run is missing; refusing "
+                   "to rebuild it in the canonical workspace"),
+            status_detail="pipeline worktree missing; work is not installed")
+        path = save_run(run, cfg)
+        _finalize_work(run, cfg)
+        raise RuntimeError(run["error"] + _saved_note(run, path))
 
     # P2-1: one authority envelope authorizes every phase of this job. A direct
     # grant is opened only here; resume/rescue/reviewer/revision phases inherit
@@ -4063,7 +4304,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     checkpoint = None
     if cfg.get("checkpoint", True):
         try:
-            plan = ["builder"]
+            plan = ["builder"] + (["gate"] if independent else [])
             for index in range(1, rounds + 1):
                 plan.extend(["review-%d" % index, "revision-%d" % index])
             checkpoint = checkpoints.Checkpoint(
@@ -4155,6 +4396,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
 
     project_map_hint = _project_map_hint(
         workspace, getattr(cfg, "state_dir", None), run)
+    plan_mode = _plan_mode(cfg)
+    plan_path = _plan_path(cfg)
+    plan_block = _plan_block(plan_path) if plan_mode != "off" else None
+    failure_note, failure_details = _failure_note_for(
+        choice.get("task_type"), cfg)
+    if failure_details:
+        run["failure_notes"] = failure_details
     task = build_harness_task(prompt, choice["subagents"], choice["reason"], skill,
                               quality=quality, quality_rounds=rounds,
                               concurrency=child_concurrency,
@@ -4162,7 +4410,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               render_hint=render_hint,
                               task_type=choice.get("task_type"),
                               builder_practices=practices["enabled"],
-                              project_map_hint=project_map_hint)
+                              project_map_hint=project_map_hint,
+                              plan_block=plan_block,
+                              failure_note=failure_note or None)
     # The audit copy of the builder task must not duplicate the private map
     # body into the run record; the state directory owns that body.
     audit_task = task
@@ -4360,6 +4610,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         run["job_budget"] = job_budget.snapshot(0.0, True)
         path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
         raise RuntimeError(run["error"] + _saved_note(run, path))
+    builder_before = None
+    builder_started_ts = None
+    plan_after = None
     if args.get("_prior_builder") is not None:
         # Durability resume: the saved builder phase is reused as-is. Its
         # session logs are intentionally not re-read (they were already priced
@@ -4370,7 +4623,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         run["resumed"] = True
         run["resumed_from"] = args.get("_resume_from")
     else:
+        builder_started_ts = time.time()
         builder_before = safety.snapshot_workspace(workspace)
+        if independent:
+            _save_gate_baseline(cfg, run["id"], builder_before)
         builder_writing = ((builder_policy or {}).get("sandbox")
                            != "read-only")
         admission = _cost_admit(run, cfg, cost_ledger, "builder",
@@ -4577,6 +4833,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
         raise RuntimeError("cancelled by client" + _saved_note(run, path))
     _persist(run, cfg, "builder_done")
+    # F2 compares this pre-gate tree with the pre-builder snapshot. Live-wave
+    # outputs are recorded separately and excluded from unexpected_file.
+    plan_after = safety.snapshot_workspace(workspace)
     if trace:
         trace.event("builder", "finish", status=builder.get("status"),
                     seconds=builder.get("seconds"),
@@ -5201,6 +5460,363 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         raise RuntimeError(message + _saved_note(run, path))
 
     deliverable_files = _deliverable_files(workspace, review_scope)
+    if plan_mode != "off":
+        deliverable_files = [name for name in deliverable_files
+                             if str(name).replace("\\", "/") != plan_path]
+
+    if (builder_before is None
+            and (args.get("_prior_builder") is not None
+                 or args.get("_resume_from"))):
+        builder_before = _load_gate_baseline(
+            cfg, str(args.get("_source_run_id") or run["id"]))
+
+    # ------------------------------------------------------------ F2 plan contract
+    plan_result = None
+    if plan_mode != "off":
+        plan_module = _feature_module("plan_contract")
+        if plan_module is None:
+            plan_result = {
+                "schema": 1, "status": "skipped", "mode": plan_mode,
+                "path": plan_path, "reason": "plan_module_missing",
+                "mismatches": [], "mismatch_count": 0, "truncated": False,
+                "blocking": False, "blocking_defect": None,
+                "note": "plan: skipped (module unavailable)",
+            }
+        elif builder_before is None or builder_started_ts is None:
+            plan_result = {
+                "schema": 1, "status": "skipped", "mode": plan_mode,
+                "path": plan_path, "reason": "resume_without_baseline",
+                "mismatches": [], "mismatch_count": 0, "truncated": False,
+                "blocking": False, "blocking_defect": None,
+                "note": "plan: skipped (resume without baseline)",
+            }
+        else:
+            try:
+                plan_result = plan_module.check_plan_contract(
+                    workspace, cfg, run, builder_before, plan_after or {},
+                    builder_started_ts, run.get("task_type"))
+            except Exception as exc:
+                plan_result = {
+                    "schema": 1, "status": "skipped", "mode": plan_mode,
+                    "path": plan_path,
+                    "reason": "plan_check_error: %s" % api.redact_secrets(
+                        str(exc))[:200],
+                    "mismatches": [], "mismatch_count": 0, "truncated": False,
+                    "blocking": False, "blocking_defect": None,
+                    "note": "plan: skipped (check error)",
+                }
+        run["plan"] = plan_result
+        try:
+            pipeline_mod = _feature_module("pipeline")
+            if pipeline_mod is not None and (workspace / plan_path).is_file():
+                pipeline_mod.note_plan(run, str(workspace / plan_path))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ F1 gate
+    gate_blocked = None
+    gate_record = None
+    gate_evidence_text = ""
+    if independent:
+        gate_module = _feature_module("gate")
+        if gate_module is None:
+            gate_record = {
+                "verdict": "skipped", "reason": "gate_module_missing",
+                "checks": [], "revisions": [], "revision_rounds": 0,
+                "blocked_review": False, "gate_error": None,
+            }
+            run["deterministic_gate"] = gate_record
+            _persist(run, cfg, "gate")
+        else:
+            try:
+                max_gate_revisions = max(
+                    0, int(cfg.get("gate_max_revisions", 2) or 0))
+            except (TypeError, ValueError):
+                max_gate_revisions = 2
+            saved_gate = None
+            if (args.get("_prior_builder") is not None
+                    or args.get("_resume_from")):
+                try:
+                    saved_gate = (find_run(
+                        str(args.get("_source_run_id") or run["id"]),
+                        cfg)[0] or {}).get("deterministic_gate")
+                except Exception:
+                    saved_gate = None
+            gate_revisions = []
+            gate_revision_rounds = 0
+            if isinstance(saved_gate, dict):
+                gate_revisions = [item for item in (
+                    saved_gate.get("revisions") or []) if isinstance(item, dict)]
+                try:
+                    gate_revision_rounds = max(
+                        0, int(saved_gate.get("revision_rounds") or 0))
+                except (TypeError, ValueError):
+                    gate_revision_rounds = 0
+            if checkpoint:
+                try:
+                    checkpoint.begin("gate")
+                except Exception:
+                    pass
+            _persist(run, cfg, "gate")
+            while True:
+                if saved_gate is not None:
+                    saved_verdict = str(
+                        saved_gate.get("verdict") or "").lower()
+                    try:
+                        current_tree = review_context.tree_digest(
+                            workspace).get("sha256")
+                    except Exception:
+                        current_tree = None
+                    if (saved_verdict in ("passed", "skipped")
+                            and current_tree
+                            and saved_gate.get("tree_sha256") == current_tree):
+                        gate_record = dict(saved_gate)
+                        gate_record["reused"] = True
+                        run["deterministic_gate"] = gate_record
+                        break
+                    saved_gate = None
+                # The gate needs the PRE-builder snapshot to find the lines the
+                # builder changed for the secret scan. Its own lint/test checks
+                # snapshot the tree themselves for mutation detection.
+                gate_before = (builder_before if builder_before is not None
+                               else safety.snapshot_workspace(workspace))
+                try:
+                    gate_record = gate_module.run_gate(
+                        cfg, workspace, run, phase="pre_review",
+                        before=gate_before)
+                except Exception as exc:
+                    gate_record = {
+                        "verdict": "error", "checks": [],
+                        "gate_error": api.redact_secrets(str(exc))[:500],
+                        "blocked_review": True,
+                    }
+                if not isinstance(gate_record, dict):
+                    gate_record = {
+                        "verdict": "error", "checks": [],
+                        "gate_error": "gate returned a non-dict result",
+                        "blocked_review": True,
+                    }
+                gate_record["revision_rounds"] = gate_revision_rounds
+                gate_record["revisions"] = list(gate_revisions)
+                run["deterministic_gate"] = gate_record
+                _persist(run, cfg, "gate")
+                verdict = str(gate_record.get("verdict") or "").lower()
+                if verdict in ("passed", "skipped"):
+                    break
+                if verdict == "error":
+                    gate_blocked = "error"
+                    break
+                if gate_revision_rounds >= max_gate_revisions:
+                    gate_blocked = "failed"
+                    break
+                try:
+                    defects, fixes = gate_module.synthetic_defects(gate_record)
+                except Exception:
+                    defects, fixes = (
+                        ["deterministic gate failed: %s" % (
+                            gate_record.get("gate_error") or "see evidence")],
+                        ["fix the failing gate check and re-run the local tests"])
+                if not defects:
+                    defects = ["deterministic gate failed"]
+                if not fixes:
+                    fixes = ["fix the failing gate check and re-run the local tests"]
+                gate_revision_rounds += 1
+                rev_label = "gate revision %d" % gate_revision_rounds
+                try:
+                    rev_failure_note, rev_failure_details = _failure_note_for(
+                        run.get("task_type"), cfg)
+                    if rev_failure_details:
+                        run["failure_notes"] = rev_failure_details
+                    revision_task = build_revision_task(
+                        prompt, deliverable_files, fixes, defects, skill=skill,
+                        quality_target=DEFAULT_QUALITY_TARGET,
+                        round_no=gate_revision_rounds,
+                        task_type=run.get("task_type"),
+                        builder_practices=(run.get("builder_practices")
+                                           or {}).get("enabled", True),
+                        plan_block=(_revision_plan_block(plan_path)
+                                    if plan_mode != "off" else None),
+                        failure_note=rev_failure_note or None)
+                except Exception as exc:
+                    gate_blocked = "error"
+                    gate_record["gate_error"] = (
+                        "could not build the gate revision task: %s"
+                        % api.redact_secrets(str(exc))[:300])
+                    break
+                rev_admission = _cost_admit(
+                    run, cfg, cost_ledger, "gate-revision",
+                    max(1, int(run.get("subagents") or 1)),
+                    job_budget.phase_limit(limit), job_budget)
+                if rev_admission and rev_admission.get("error"):
+                    message = ("cost admission refused the gate revision: %s"
+                               % rev_admission["error"])
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["status_detail"] = status_mod.STATUS_MEANING[
+                        "budget_exceeded"]
+                    run["error"] = message
+                    gate_blocked = "error"
+                    gate_record["gate_error"] = message
+                    break
+                rev_guard = None
+                rev_live_cb = None
+                if job_budget.max_cost_usd is not None:
+                    rev_prior, _rev_known = _guard_prior(
+                        rev_admission, *_running_cost(executions))
+                    rev_guard = budget_mod.LiveCostGuard(
+                        limit=job_budget.max_cost_usd,
+                        reserved=(rev_admission or {}).get(
+                            "estimate", {}).get("cost_usd") or 0.0,
+                        prior_committed=rev_prior,
+                        prior_known=_rev_known,
+                        model=getattr(cfg, "dsh_model", None))
+
+                    def rev_live_cb(event, parsed, _guard=rev_guard):
+                        usage = _usage_from_event(event)
+                        if not usage:
+                            return None
+                        if _guard.observe(usage, _model_from_event(event)):
+                            return "budget"
+                        return None
+                if checkpoint:
+                    try:
+                        checkpoint.begin("gate")
+                    except Exception:
+                        pass
+                _persist(run, cfg, "gate")
+                if trace:
+                    trace.event("gate", "revision_start",
+                                round=gate_revision_rounds,
+                                fixes=len(fixes))
+                revision = _execute_once(
+                    cfg, workspace, revision_task,
+                    limit=job_budget.phase_limit(limit),
+                    progress_cb=progress_cb, label=rev_label,
+                    exclude_logs=used_logs, policy=revision_policy,
+                    add_dirs=run["add_dirs"],
+                    transport_name=run["transport"],
+                    cancel_check=cancel_check,
+                    live_usage_cb=rev_live_cb)
+                executions.append(revision)
+                used_logs.update(revision.get("session_logs") or [])
+                _cost_settle(run, cost_ledger, "gate-revision", revision,
+                             job_budget,
+                             operation_id=(rev_admission or {}).get(
+                                 "reservation", {}).get("id"))
+                rev_health = _health_record(
+                    health_board, "revision", revision)
+                _health_attention(run, cfg, "revision", rev_health)
+                revision_entry = {
+                    "round": gate_revision_rounds,
+                    "label": rev_label,
+                    "status": revision.get("status"),
+                    "seconds": revision.get("seconds"),
+                    "cost": revision.get("estimated_cost_usd"),
+                    "files": list(revision.get("output_files") or []),
+                    "error": (api.redact_secrets(
+                        str(revision.get("error") or ""))[:300] or None),
+                }
+                gate_revisions.append(revision_entry)
+                gate_record["revisions"] = list(gate_revisions)
+                run["deterministic_gate"] = gate_record
+                if (str(revision.get("stop_reason")) == "budget"
+                        or (rev_guard is not None and rev_guard.exceeded)):
+                    message = ("live cost usage crossed the whole-job ceiling; "
+                               "the gate revision was stopped at an event "
+                               "boundary")
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["status_detail"] = status_mod.STATUS_MEANING[
+                        "budget_exceeded"]
+                    run["error"] = message
+                    gate_blocked = "error"
+                    gate_record["gate_error"] = message
+                    break
+                run["output_files"] = sorted(_union_files(
+                    run.get("output_files") or [],
+                    revision.get("output_files") or []))
+                deliverable_files = _deliverable_files(
+                    workspace, _union_files(deliverable_files,
+                                            revision.get("output_files") or []))
+                if plan_mode != "off":
+                    try:
+                        plan_result = plan_module.check_plan_contract(
+                            workspace, cfg, run, builder_before,
+                            safety.snapshot_workspace(workspace),
+                            builder_started_ts, run.get("task_type"))
+                        run["plan"] = plan_result
+                    except Exception:
+                        pass
+                if revision.get("status") != "ok":
+                    gate_blocked = "error"
+                    gate_record["gate_error"] = (
+                        "gate revision %d failed: %s"
+                        % (gate_revision_rounds,
+                           api.redact_secrets(str(revision.get("error")
+                                               or "unknown"))[:300]))
+                    if _is_no_balance(revision):
+                        run["status"] = "no_balance"
+                        run["error"] = provider_error_message(
+                            revision, cfg, role="revision")
+                    break
+                if job_budget.time_exceeded():
+                    run["status"] = "deadline_exceeded"
+                    run["stop_reason"] = "deadline"
+                    run["error"] = "whole-job deadline reached during a gate revision"
+                    gate_blocked = "error"
+                    break
+                if trace:
+                    trace.event("gate", "revision_finish",
+                                round=gate_revision_rounds,
+                                status=revision.get("status"),
+                                seconds=revision.get("seconds"))
+            run["deterministic_gate"] = gate_record
+            if checkpoint:
+                try:
+                    checkpoint.finish(
+                        "gate",
+                        status=("interrupted" if gate_blocked == "error"
+                                else ("failed" if gate_blocked else "done")),
+                        verdict=gate_record.get("verdict"),
+                        revision_rounds=gate_revision_rounds,
+                        error=(gate_record.get("gate_error") or "")[:500] or None)
+                except Exception:
+                    pass
+            if gate_blocked == "failed":
+                run["status"] = "gate_failed"
+                run["stop_reason"] = "gate_failed"
+                run["review_status"] = "skipped"
+                run["review_passed"] = False
+                run["quality_score"] = None
+                run["review_error"] = (
+                    "deterministic gate failed after %d revision(s); the "
+                    "reviewer was not called: %s"
+                    % (gate_revision_rounds,
+                       gate_record.get("gate_error") or "see gate evidence"))
+                run["status_detail"] = status_mod.STATUS_MEANING.get(
+                    "gate_failed", "deterministic gate failed; reviewer skipped.")
+            elif gate_blocked == "error":
+                # A deadline/budget/credit stop wins over the gate error: the
+                # gate did not cause the stop, it only stopped running.
+                if run.get("status") not in (
+                        "budget_exceeded", "deadline_exceeded", "no_balance"):
+                    run["status"] = "error"
+                    run["stop_reason"] = "gate_error"
+                    run["review_passed"] = False
+                    run["error"] = (
+                        "deterministic gate could not run: %s"
+                        % (gate_record.get("gate_error") or "unknown error"))
+                    run["status_detail"] = run["error"]
+                run["review_status"] = "skipped"
+            else:
+                try:
+                    gate_evidence_text = str(
+                        gate_module.format_gate_evidence(gate_record) or "")
+                except Exception:
+                    gate_evidence_text = ""
+                run["review_status"] = "skipped"
+            _persist(run, cfg, "gate")
+
     # Reviewer-facing browser evidence: console errors, failed requests and a
     # DOM summary. No Chrome means a recorded limitation, never a failed run.
     browser_evidence = None
@@ -5291,7 +5907,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             "note": api.redact_secrets(scope_note),
         }
 
-    if independent:
+    if independent and not gate_blocked:
         # Reuse every finished phase. Rounds are a prefix: the first phase
         # that is not ``done`` is where this attempt starts.
         review_rounds = [dict(prior_reviews[number])
@@ -5474,13 +6090,29 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 # R1: the connector, not the builder, runs the full suite on
                 # the exact tree and signs the result for the reviewer.
                 test_evidence = None
+                reused_gate_tests = _gate_test_evidence(
+                    run.get("deterministic_gate"), cfg, workspace)
+                if reused_gate_tests is not None:
+                    # The gate already signed a passing suite on this exact
+                    # tree and appended that exact payload to the run record;
+                    # do not pay for the same suite twice or duplicate the
+                    # evidence entry.
+                    test_evidence = dict(reused_gate_tests)
+                    try:
+                        review_progress.add_test(
+                            reused_gate_tests.get("command")
+                            or "deterministic gate tests",
+                            status="ok",
+                            seconds=reused_gate_tests.get("seconds"))
+                    except Exception:
+                        pass
                 try:
                     suite_mode = cfg.get("review_test_suite", "auto")
                     disabled = (suite_mode is False or suite_mode is None
                                 or str(suite_mode).strip().lower() in ("", "off",
                                                                        "none",
                                                                        "false"))
-                    if not disabled:
+                    if not disabled and test_evidence is None:
                         command = cfg.get("review_test_command") or None
                         mode_text = str(suite_mode).strip().lower()
                         if mode_text in ("auto", "true", "1", "on"):
@@ -5556,6 +6188,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             focus_paths=deliverable_files)
                     except Exception as exc:
                         run["review_context_error"] = api.redact_secrets(str(exc))
+                if gate_evidence_text:
+                    review_diff = (gate_evidence_text.rstrip() + "\n\n"
+                                   + review_diff)
                 review_task = build_review_task(
                     prompt, deliverable_files, skill=skill,
                     quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
@@ -5751,12 +6386,25 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                         or "backup pre-flight did not answer "
                                            "READY"))[:500]
                     if not _answered:
-                        _message = provider_error_message(
-                            _family_execution, cfg, role="reviewer")
+                        if review_backup_identity is not None:
+                            # Attribute the failure to the reviewer that
+                            # actually ran. The main reviewer's family and its
+                            # "balance is empty" sentence must not leak into a
+                            # backup vendor's quota diagnosis.
+                            try:
+                                _message = reviewer_backup_mod.error_message(
+                                    cfg, review_backup_error or "",
+                                    role="reviewer")
+                            except Exception:
+                                _label = (review_backup_identity or {}).get(
+                                    "label") or "unknown/unknown"
+                                _message = (
+                                    "%s reviewer failed (attribution "
+                                    "unavailable)" % _label)
+                        else:
+                            _message = provider_error_message(
+                                _family_execution, cfg, role="reviewer")
                         if review_backup_error:
-                            _message = (
-                                "%s Backup reviewer also failed: %s"
-                                % (_message, review_backup_error))
                             run["reviewer_backup"] = {
                                 "used": True,
                                 "status": "error",
@@ -5787,7 +6435,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "status": "error",
                             "error": _raw or "pre-flight did not answer READY",
                             "message": _message,
-                            "vendor": _provider_label(_family),
+                            "vendor": ((review_backup_identity or {}).get(
+                                "vendor") or _provider_label(_family)),
                             "seconds": preflight.get("seconds"),
                             "attempts": preflight_attempt,
                             "retry_delays": list(preflight_retry_delays),
@@ -6140,11 +6789,21 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "banner": run["reviewed_by_line"],
                         })
                     else:
-                        _main_error = review_backup_main_error or "unknown"
-                        review["error"] = (
-                            "main reviewer failed (%s); backup reviewer also "
-                            "failed: %s" % (_main_error,
-                                            review.get("error") or "unknown"))
+                        # Capture the backup's own error before anything else
+                        # rewrites review["error"]. The main reviewer's error
+                        # stays in reviewer_backup.main_error and is never
+                        # classified as the backup vendor's balance claim.
+                        backup_error_text = str(review.get("error") or "")
+                        try:
+                            attributed_error = reviewer_backup_mod.error_message(
+                                cfg, backup_error_text, role="reviewer")
+                        except Exception:
+                            _label = (review_backup_identity or {}).get(
+                                "label") or "unknown/unknown"
+                            attributed_error = (
+                                "%s reviewer failed (attribution unavailable)"
+                                % _label)
+                        review["error"] = attributed_error
                         run["reviewer_backup"] = {
                             "used": True,
                             "status": "error",
@@ -6153,7 +6812,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "reason_class": review_backup_reason,
                             "main_error": review_backup_main_error,
                             "backup_error": api.redact_secrets(
-                                str(review.get("error") or ""))[:500],
+                                attributed_error)[:500],
                         }
                         _emit_run_event(run, cfg, "reviewer_backup", {
                             "round": round_no,
@@ -6249,6 +6908,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         if carried_group == "blocking":
                             blocking += 1
                 fixes = list(parsed.get("fixes") or [])
+                # F2 block mode: one additional blocking defect, merged after
+                # the reviewer parse so even a 10/10 review must revise.
+                if plan_mode == "block":
+                    defects, fixes, blocking = _merge_plan_contract_defect(
+                        plan_result, defects, fixes, blocking)
                 score_missing = False
                 reprompt_record = None
                 if (score is None and review.get("status") == "ok"
@@ -6416,6 +7080,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     entry.setdefault("signatures", [])
                     entry.setdefault("first_seen_round", {})
                 review_rounds.append(entry)
+                _record_review_failure_notes(run, cfg, entry)
                 if not review.get("review_phase_in_flight"):
                     run["review_in_flight"] = False
                 run["reviewer_usage"] = _reviewer_usage_aggregate(review_rounds)
@@ -6482,10 +7147,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                           and int(item.get("round") or 0) == round_no), None)
             if review.get("status") != "ok":
                 review_status = "error"
-                review_error = (
-                    provider_error_message(review, cfg, role="reviewer")
-                    if _is_no_balance(review) or review.get("error")
-                    else "reviewer run failed")
+                if review_backup_used and review.get("error"):
+                    # Already attributed to the backup vendor; copy it through
+                    # without reclassifying the merged text.
+                    review_error = str(review.get("error"))
+                else:
+                    review_error = (
+                        provider_error_message(review, cfg, role="reviewer")
+                        if _is_no_balance(review) or review.get("error")
+                        else "reviewer run failed")
                 if str(review.get("stop_reason")) == "budget":
                     run["status"] = "budget_exceeded"
                     run["stop_reason"] = "budget"
@@ -6587,13 +7257,20 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             round_scope = (scope_note if (scope_resume is not None
                                           and int(round_no) == scope_round)
                            else None)
+            rev_failure_note, rev_failure_details = _failure_note_for(
+                run.get("task_type"), cfg)
+            if rev_failure_details:
+                run["failure_notes"] = rev_failure_details
             revision_task = build_revision_task(
                 prompt, deliverable_files, fixes, defects, skill=skill,
                 quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
                 escalation=escalation, task_type=run.get("task_type"),
                 scope_note=round_scope, score_missing=score_missing,
                 builder_practices=(run.get("builder_practices")
-                                   or {}).get("enabled", True))
+                                   or {}).get("enabled", True),
+                plan_block=(_revision_plan_block(plan_path)
+                            if plan_mode != "off" else None),
+                failure_note=rev_failure_note or None)
             if checkpoint:
                 try:
                     checkpoint.begin("revision-%d" % round_no)
@@ -6779,6 +7456,22 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             deliverable_files = _deliverable_files(
                 workspace, _union_files(run.get("output_files"),
                                         revision.get("output_files")))
+            if plan_mode != "off":
+                try:
+                    plan_module = _feature_module("plan_contract")
+                    if plan_module is not None:
+                        plan_result = plan_module.check_plan_contract(
+                            workspace, cfg, run, builder_before,
+                            safety.snapshot_workspace(workspace),
+                            builder_started_ts, run.get("task_type"))
+                        run["plan"] = plan_result
+                        pipeline_mod = _feature_module("pipeline")
+                        if (pipeline_mod is not None
+                                and (workspace / plan_path).is_file()):
+                            pipeline_mod.note_plan(
+                                run, str(workspace / plan_path))
+                except Exception:
+                    pass
         run["quality_rounds_used"] = len([item for item in review_rounds
                                            if item.get("kind") == "review"])
     else:
@@ -6790,7 +7483,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                  if review_entries else None)
     run["review_scores"] = [entry.get("score") for entry in review_entries]
 
-    if independent:
+    if independent and not gate_blocked:
         last_review = next((item for item in reversed(review_rounds)
                             if item.get("kind") == "review"), None)
         run["quality_score"] = last_review.get("score") if last_review else None
@@ -6806,6 +7499,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         _report_text, report_path = _read_review(workspace)
         if report_path:
             run["review_report"] = report_path
+    elif gate_blocked:
+        # The gate owns the terminal verdict; no reviewer round was recorded.
+        run["quality_score"] = None
+        run["review_status"] = "skipped"
+        run["review_rounds"] = []
+        run["quality_rounds_used"] = 0
+        run["reviewer_usage"] = _reviewer_usage_aggregate([])
+        run["reviewer_cost_known"] = False
     else:
         run["quality_score"] = run.get("self_score") if quality else None
         run["review_status"] = "disabled"
@@ -6869,7 +7570,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     review_recorded = bool(review_entries)
     run["review_recorded"] = review_recorded if independent else None
     forced_review_error = False
-    if independent and not hard_stop:
+    if independent and not hard_stop and not gate_blocked:
         in_flight = bool(run.get("review_in_flight"))
         unrecorded = (review_status != "disabled" and not review_recorded)
         if in_flight or unrecorded:
@@ -6911,7 +7612,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             rescued=bool(run.get("rescued")),
             cancelled=bool(run.get("cancelled")) or run.get("stop_reason") == "cancelled",
             stop_reason=run.get("stop_reason"),
-            review_recorded=review_recorded if independent else True)
+            review_recorded=review_recorded if independent else True,
+            gate_status=("gate_failed" if gate_blocked == "failed" else None))
         run["status_detail"] = status_detail
         run["review_passed"] = review_passed
     if review_status == "error":
@@ -6995,6 +7697,77 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 cfg, run, summary.get("timeline"))
         except Exception as exc:
             run["observability"] = {"error": api.redact_secrets(str(exc))}
+
+    # F3 terminal sweep: record any completed blocking review round a crash
+    # skipped. It is idempotent and never changes the run outcome.
+    try:
+        failure_mod = _feature_module("failure_notes")
+        if failure_mod is not None:
+            sweep = getattr(failure_mod, "terminal_sweep", None)
+            if callable(sweep):
+                sweep(run, cfg)
+            else:
+                for entry in review_rounds:
+                    _record_review_failure_notes(run, cfg, entry)
+            store_counts = getattr(failure_mod, "store_counts", None)
+            if callable(store_counts):
+                counts = store_counts(cfg)
+                if isinstance(counts, dict):
+                    details = run.setdefault("failure_notes", {})
+                    details["store_counts"] = counts
+                    details["updated"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    except Exception:
+        pass
+
+    # F4: capture this job's independent patch, then prove every accepted
+    # patch applies together before touching the canonical working tree.
+    pipeline_info = run.get("pipeline")
+    if isinstance(pipeline_info, dict) and pipeline_info.get("eligible"):
+        pipeline_mod = _feature_module("pipeline")
+        if pipeline_mod is not None:
+            try:
+                patch = pipeline_mod.capture_patch(run, cfg, workspace)
+                if isinstance(patch, dict):
+                    run["pipeline"]["patch"] = patch
+            except Exception as exc:
+                run["pipeline"]["patch_error"] = api.redact_secrets(str(exc))[:500]
+            try:
+                canonical = (pipeline_info.get("canonical_workspace")
+                             or str(args.get("_canonical_workspace") or ""))
+                install = pipeline_mod.install_pending(
+                    cfg, canonical, run.get("id") or "")
+                if isinstance(install, dict):
+                    run["pipeline"]["install"] = install
+                    install_status = str(install.get("status") or "")
+                    if install_status in ("conflict", "error"):
+                        conflict = install.get("conflict") or {}
+                        run["status"] = "error"
+                        run["stop_reason"] = "install_conflict"
+                        run["review_passed"] = False
+                        if install_status == "conflict":
+                            run["status_detail"] = (
+                                "pipeline install conflict: patch %s conflicts "
+                                "with %s (%s); nothing was applied to the "
+                                "canonical tree"
+                                % (conflict.get("patch_id") or run.get("id"),
+                                   conflict.get("conflicting_patch")
+                                   or "another patch",
+                                   ", ".join(conflict.get("files") or [])[:300]
+                                   or "no file list"))
+                        else:
+                            run["status_detail"] = (
+                                "pipeline install failed (%s); the canonical "
+                                "tree was not updated"
+                                % (install.get("reason") or "install_error"))
+                        run["error"] = run["status_detail"]
+            except Exception as exc:
+                run["pipeline"]["install_error"] = api.redact_secrets(
+                    str(exc))[:500]
+            try:
+                pipeline_mod.finalize_run(run, cfg, workspace)
+            except Exception:
+                pass
 
     if checkpoint:
         try:
@@ -7093,6 +7866,12 @@ def _resume_final_status(result, prior_rounds, spec=None,
         "blocking_defects") or 0)
     result["quality_score"] = score
     result["review_rounds"] = list(prior_rounds or [])
+    saved_gate = result.get("deterministic_gate")
+    gate_status = None
+    if (isinstance(saved_gate, dict)
+            and str(saved_gate.get("verdict") or "").lower() == "failed") or (
+                str(result.get("status") or "") == "gate_failed"):
+        gate_status = "gate_failed"
     result["status"], status_detail, review_passed = status_mod.final_status(
         builder_status="ok_rescued" if result.get("rescued") else "ok",
         review_status=review_status,
@@ -7102,7 +7881,8 @@ def _resume_final_status(result, prior_rounds, spec=None,
         rescued=bool(result.get("rescued")),
         cancelled=bool(result.get("cancelled")),
         stop_reason=result.get("stop_reason"),
-        review_recorded=recorded if expected else True)
+        review_recorded=recorded if expected else True,
+        gate_status=gate_status)
     result["status_detail"] = status_detail
     result["review_passed"] = review_passed
     return result
@@ -7485,6 +8265,7 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "live_scaling_max_extra_waves": saved.get(
             "live_scaling_max_extra_waves", spec.get("live_scaling_max_extra_waves")),
         "_resume_from": run_id,
+        "_source_run_id": run_id,
         "_job_elapsed_seconds": (0.0 if review_deadline_reset
                                  else _saved_elapsed_seconds(saved, manifest)),
         "_review_deadline_reset": review_deadline_reset,

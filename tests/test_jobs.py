@@ -253,6 +253,41 @@ class JobTests(unittest.TestCase):
         self.assertNotIn(secret, text)
         self.assertIn("[redacted", text)
 
+    def test_gate_failed_is_refused_by_job_gate(self):
+        env = base_env(self.root)
+        cfg = load_config(config_path=self.root / "config.json", env=env)
+        logs = Path(cfg.log_dir)
+        jobs_dir = Path(cfg.jobs_dir)
+        logs.mkdir(parents=True, exist_ok=True)
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        run_id = "20261108-120000-gate01"
+        (logs / (run_id + ".json")).write_text(json.dumps({
+            "id": run_id,
+            "status": "gate_failed",
+            "independent_review": True,
+            "phase": "gate",
+            "review_status": "skipped",
+            "stop_reason": "gate_failed",
+            "review_error": ("deterministic gate failed after 2 revision(s); "
+                             "the reviewer was not called: tests failed"),
+            "deterministic_gate": {"verdict": "failed"},
+        }), encoding="utf-8")
+        spec = jobs_dir / (run_id + ".job.json")
+        spec.write_text(json.dumps({
+            "tool": "fake", "run_id": run_id, "args": {"prompt": "x"},
+        }), encoding="utf-8")
+        with mock.patch.dict(os.environ,
+                             {"DEEPSEEK_NO_CAFFEINATE": "1"}, clear=False):
+            jobs.run_job(spec, {"fake": lambda args, cfg: "builder text"}, cfg)
+        state = json.loads(
+            (jobs_dir / (run_id + ".status.json")).read_text(encoding="utf-8"))
+        self.assertEqual(state.get("status"), "error")
+        self.assertIn("deterministic gate failed", state.get("error"))
+        self.assertIn("reviewer was not called", state.get("error"))
+        self.assertEqual(jobs._review_gate_error(
+            (False, True, False, "gate_failed", "tests failed")),
+            "deterministic gate failed; reviewer was not called: tests failed")
+
     def test_status_unknown_job(self):
         cfg = load_config(config_path=self.root / "config.json", env=base_env(self.root))
         with self.assertRaises(RuntimeError):

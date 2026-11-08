@@ -1,4 +1,4 @@
-"""3.10.0 S3: explicit job_max_seconds and backup reviewer config keys.
+"""3.11.0 S3: explicit job_max_seconds and backup reviewer config keys.
 
 Covers the reported 7200-s clamp bug and the backup reviewer defaults.
 Stdlib unittest; temp dirs only, no dsh process and no network.
@@ -120,8 +120,8 @@ class JobMaxSecondsTests(unittest.TestCase):
         self.assertEqual(cfg.backup_reviewer_model, "examplevendor-large")
 
     def test_release_sanity(self):
-        # This slice must not bump the version; the lead owns 3.10.0.
-        self.assertEqual(SERVER_VERSION, "3.10.0")
+        # This slice must not bump the version; the lead owns 3.11.0.
+        self.assertEqual(SERVER_VERSION, "3.11.0")
         self.assertEqual(DEFAULTS["job_max_seconds"], 7200.0)
 
 

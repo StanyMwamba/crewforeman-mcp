@@ -101,6 +101,28 @@ above `WASTE_NUDGE_THRESHOLD` (0.35), the automatic start is reduced by up to
 reason names the nudge. A lower or absent ratio changes nothing, and an explicit
 `subagents` count is never nudged.
 
+## Pipelined builds (new in 3.11.0)
+
+A job may declare a `write_set` (repo-relative prefixes or globs) or a `slice`
+name from `SLICES.md`. When the queue is full and a running base job is in its
+review phase, one disjoint job may start in its own git worktree, with its own
+patch and its own reviewer. Unknown or absent write-sets overlap everything, so
+a job that does not declare one stays serial. Plan widening defers further
+starts until that job is done.
+
+The connector never merges patches before install. In FIFO order it proves the
+whole accepted set applies with `git apply --check` in a throwaway worktree;
+any conflict applies nothing to the canonical tree and reports
+`install_conflict`. A manual patch at the head is a drain point: later patches
+stay pending until an operator installs or discards it. The lead still owns the
+shared files; pipelining is a scheduling feature, not a second integrator.
+
+The deterministic gate runs before the first reviewer call. Failure revises the
+builder without spending a reviewer call, and after `gate_max_revisions` the
+run ends `gate_failed` rather than pretending the work was reviewed. Failure
+notes from previous runs of the same task type are advisory: they add a short
+pre-flight list to the next builder prompt and never change the score.
+
 ## Settings
 
 | Setting | Default | Effect |

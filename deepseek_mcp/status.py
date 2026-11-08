@@ -19,6 +19,7 @@ STATUSES = (
     "cancelled",
     "deadline_exceeded",
     "budget_exceeded",
+    "gate_failed",
 )
 
 # Convenience groupings for clients and dashboards.  A successful status means
@@ -27,7 +28,7 @@ STATUSES = (
 SUCCESS_STATUSES = frozenset(("ok", "ok_rescued", "ok_unreviewed",
                               "ok_below_gate"))
 FAILURE_STATUSES = frozenset(("error", "no_balance", "cancelled",
-                              "deadline_exceeded", "budget_exceeded"))
+                              "deadline_exceeded", "budget_exceeded", "gate_failed"))
 
 STATUS_MEANING = {
     "ok": "finished and, when a review ran, accepted at or above the gate with zero blocking defects.",
@@ -39,12 +40,13 @@ STATUS_MEANING = {
     "cancelled": "the client cancelled the request; partial files may remain.",
     "deadline_exceeded": "the whole-job deadline stopped the run before it finished.",
     "budget_exceeded": "the whole-job estimated-cost budget stopped the run before it finished.",
+    "gate_failed": "the deterministic gate exhausted its revision budget; the paid reviewer was not called.",
 }
 
 
 def final_status(builder_status="ok", review_status="disabled", score=None,
                  blocking_defects=0, target=8.5, rescued=False, cancelled=False,
-                 stop_reason=None, review_recorded=True):
+                 stop_reason=None, review_recorded=True, gate_status=None):
     """Return ``(status, detail, review_passed)``.
 
     ``review_passed`` is ``True`` for an accepted review, ``False`` for a
@@ -54,6 +56,9 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
     durable round: that must not become a plain ``ok`` even when the builder
     itself succeeded.  It defaults to ``True`` so existing callers are
     unchanged.
+
+    ``gate_status="gate_failed"`` returns that status before any review
+    mapping, but only after the builder has succeeded.
     """
     if cancelled or stop_reason == "cancelled":
         return "cancelled", STATUS_MEANING["cancelled"], None
@@ -65,6 +70,8 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "no_balance", STATUS_MEANING["no_balance"], None
     if builder_status not in ("ok", "ok_rescued"):
         return "error", STATUS_MEANING["error"], None
+    if gate_status == "gate_failed":
+        return "gate_failed", STATUS_MEANING["gate_failed"], None
     if review_recorded is False and review_status != "disabled":
         return ("error",
                 "review was requested but no review round was recorded",
