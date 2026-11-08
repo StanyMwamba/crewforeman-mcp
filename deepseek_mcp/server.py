@@ -154,6 +154,28 @@ TOOLS = [
                 "most 2 and need two comparable runs. A low review score may escalate the revision. "
                 "Use 0 for one agent. Explicit values are kept exactly up to the configurable hard "
                 "maximum max_explicit_subagents (default 32).")},
+            "builder_model": {"type": "string", "description": (
+                "Builder model id for this job. Empty inherits builder_model "
+                "config, then dsh_model, then deepseek-flash.")},
+            "builder_provider": {"type": "string", "description": (
+                "Provider name for the builder model (built-in deepseek-official "
+                "or a providers[] entry). Empty inherits builder_provider config, "
+                "then dsh_provider.")},
+            "slice_models": {"type": "object", "description": (
+                "Optional slice-name -> 'provider/model' (or object with provider "
+                "and model) map for a mixed-model team. Capped by "
+                "builder_model_max_slices.")},
+            "model_candidates": {"type": "object", "description": (
+                "Optional slice-name -> list of 2..N model specs for competing "
+                "candidates; the connector scores them and applies the winner. "
+                "Capped by model_candidates_max.")},
+            "reviewer_model": {"type": "string", "description": (
+                "Optional per-job reviewer model id. The connector routes it "
+                "through a generated overlay; existing dsh_bin wrappers remain "
+                "the legacy path.")},
+            "reviewer_provider": {"type": "string", "description": (
+                "Optional per-job reviewer provider name, used with "
+                "reviewer_model.")},
             "quality": {"type": "boolean", "description": (
                 "Run the builder quality loop (default true for real work, false for simple questions).")},
             "quality_rounds": {"type": "integer", "description": (

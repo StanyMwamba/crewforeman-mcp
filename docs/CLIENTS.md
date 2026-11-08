@@ -1,6 +1,6 @@
 # Connecting MCP clients
 
-`crewforeman-mcp` 3.11.0 is a local **stdio** MCP server. The client starts the
+`crewforeman-mcp` 3.12.0 is a local **stdio** MCP server. The client starts the
 process and speaks newline-delimited JSON-RPC 2.0 over stdin/stdout; there is no
 network listener.
 
@@ -24,13 +24,13 @@ Before configuring a client, check the command itself:
 /path/to/crewforeman-mcp --version
 ```
 
-It prints `crewforeman-mcp 3.11.0`. If that fails, fix the install first
+It prints `crewforeman-mcp 3.12.0`. If that fails, fix the install first
 (see [INSTALL.md](INSTALL.md)); the client snippets below cannot repair a
 missing executable.
 
 ## Native command
 
-Version 3.11.0 installs the `crewforeman-mcp` command and the shorter alias
+Version 3.12.0 installs the `crewforeman-mcp` command and the shorter alias
 `deepseek-mcp`. A client that accepts the common `mcpServers` shape can use
 this minimal entry:
 
@@ -333,3 +333,28 @@ If the standalone `restart_claude.sh` reports "not running" while Claude is
 open, its `is_running()` test uses plain `pgrep -x`; change that one line to
 `pgrep -a -x "$PROC_NAME"` (the script is outside this package and is not
 edited by the connector).
+
+
+## Model routing environment (new in 3.12.0)
+
+The builder and reviewer can be selected without editing a wrapper. Keep keys
+in the server environment and name them in the client config:
+
+```json
+{
+  "env": {
+    "DEEPSEEK_API_KEY": "YOUR_DEEPSEEK_API_KEY",
+    "ANTHROPIC_API_KEY": "YOUR_ANTHROPIC_API_KEY",
+    "DSH_BUILDER_MODEL": "claude-sonnet-5-5",
+    "DSH_BUILDER_PROVIDER": "anthropic",
+    "DSH_REVIEWER_MODEL": "kimi-k3.1-pro",
+    "DSH_REVIEWER_PROVIDER": "moonshot"
+  }
+}
+```
+
+`DSH_BUILDER_MODEL`/`DSH_BUILDER_PROVIDER` and
+`DSH_REVIEWER_MODEL`/`DSH_REVIEWER_PROVIDER` are optional. The default remains
+DeepSeek. A per-call `builder_model`, `builder_provider`, `reviewer_model` or
+`reviewer_provider` overrides the environment for that job only. Do not put a
+key value in `config.json`; the connector stores env-var names only.

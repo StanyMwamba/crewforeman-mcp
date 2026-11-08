@@ -547,6 +547,16 @@ def validate_attention(text):
     return _normalise_attention(data)
 
 
+def build_reviewer_attention(payload):
+    """Validate an already-decoded reviewer attention payload.
+
+    Returns the normalised ``{"question", "options", "evidence"}`` dict, or
+    ``None`` when the payload would break the 500/200/2..8 limits.  The
+    harness uses this before persisting or fencing a reviewer question.
+    """
+    return _normalise_attention(payload)
+
+
 def record_attention(log, text, source=None):
     """Validate *text* and append one ``needs_input`` event (or return None).
 

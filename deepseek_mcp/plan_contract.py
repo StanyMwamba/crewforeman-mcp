@@ -31,6 +31,8 @@ except Exception:  # pragma: no cover
     def redact_secrets(value):
         return str(value or "")
 
+from . import path_scope
+
 
 PLAN_SCHEMA = 1
 PLAN_DEFAULT_FILE = "PLAN.json"
@@ -121,6 +123,7 @@ def _cfg_get(cfg, name, default=None):
                 found = False
         if not found:
             value = getattr(cfg, name, default)
+            found = True
     if not found or value is None:
         return default
     return value
@@ -519,6 +522,9 @@ def actual_changes(workspace, before, after, cfg):
         if path == plan_rel:
             ignored.append(path)
             continue
+        if path_scope.is_artifact(path, cfg):
+            ignored.append(path)
+            continue
         if path not in before_map:
             created.append(path)
         elif path not in after_map:
@@ -722,6 +728,8 @@ def _format_note(status, mismatches):
         return "plan: invalid"
     if status == "stale":
         return "plan: stale"
+    if status == "optional":
+        return "plan: optional (tiny job)"
     types = []
     for mismatch in mismatches:
         kind = mismatch.get("type", "mismatch")
@@ -823,47 +831,65 @@ def check_plan_contract(workspace, cfg, run, before, after, builder_started, tas
     data = read.get("data") if isinstance(read.get("data"), dict) else None
     mtime = read.get("mtime")
 
+    read_status = read["status"]
+    product_paths = []
+    for key in ("created", "modified", "deleted"):
+        for path in actual.get(key) or []:
+            if path_scope.classify_path(
+                    path, cfg, plan_rel) == path_scope.CATEGORY_PRODUCT:
+                if path not in product_paths:
+                    product_paths.append(path)
+    product_changes = len(product_paths)
+    try:
+        optional_max = int(_cfg_get(cfg, "plan_optional_max_files", 1))
+    except (TypeError, ValueError):
+        optional_max = 1
+    optional_max = max(0, optional_max)
+    tiny = 0 < product_changes <= optional_max
+    reason = None
+    snapshot_absent = False
+
     if status == "ok":
         after_map = _snapshot_map(after)
+        detail = None
         if after_map and plan_rel not in after_map:
-            status = "invalid"
-            mismatches = [
-                {
-                    "type": "invalid_plan",
-                    "path": plan_rel,
-                    "detail": "plan was not present in the pre-gate snapshot",
-                }
-            ]
-            data = None
+            detail = "plan was not present in the pre-gate snapshot"
         elif not after_map:
             before_map = _snapshot_map(before)
             if before_map and plan_rel not in before_map:
-                status = "invalid"
-                mismatches = [
-                    {
-                        "type": "invalid_plan",
-                        "path": plan_rel,
-                        "detail": "plan was not present in the before snapshot",
-                    }
-                ]
-                data = None
+                detail = "plan was not present in the before snapshot"
+        if detail:
+            snapshot_absent = True
+            status = "invalid"
+            mismatches = [{
+                "type": "invalid_plan",
+                "path": plan_rel,
+                "detail": detail,
+            }]
+            data = None
 
     if status == "absent":
-        mismatches = [
-            {
-                "type": "absent_plan",
-                "path": plan_rel,
-                "detail": "plan file not found",
-            }
-        ]
-    elif status == "invalid" and not mismatches:
-        mismatches = [
-            {
+        mismatches = [{
+            "type": "absent_plan",
+            "path": plan_rel,
+            "detail": "plan file not found",
+        }]
+        if tiny:
+            status = "optional"
+            reason = "tiny_job_absent_plan"
+            mismatches = []
+    elif status == "invalid":
+        if not mismatches:
+            mismatches = [{
                 "type": "invalid_plan",
                 "path": plan_rel,
                 "detail": _short(redact_secrets(read.get("reason", "")), 160),
-            }
-        ]
+            }]
+        if tiny:
+            status = "optional"
+            reason = ("tiny_job_plan_not_in_snapshot" if snapshot_absent
+                      else "tiny_job_invalid_plan")
+            mismatches = []
     elif status == "ok":
         mismatches = compare_plan(data or {}, actual)
         stale = False
@@ -895,8 +921,12 @@ def check_plan_contract(workspace, cfg, run, before, after, builder_started, tas
 
     truncated = len(mismatches) > MAX_MISMATCHES
     mismatches = [_mismatch_dict(item) for item in mismatches[:MAX_MISMATCHES]]
-    note = _format_note(status, mismatches)
-    blocking = mode == "block" and bool(mismatches)
+    if status == "optional":
+        note = "plan: optional (tiny job)"
+        blocking = False
+    else:
+        note = _format_note(status, mismatches)
+        blocking = mode == "block" and bool(mismatches)
     defect = None
     if blocking:
         labels = [_mismatch_label(item) for item in mismatches]
@@ -932,6 +962,8 @@ def check_plan_contract(workspace, cfg, run, before, after, builder_started, tas
         "status": status,
         "mode": mode,
         "path": plan_rel,
+        "reason": reason,
+        "plan_read_status": read_status,
         "task_type": _short(task_type, 40),
         "declared": declared,
         "actual": {
@@ -940,6 +972,8 @@ def check_plan_contract(workspace, cfg, run, before, after, builder_started, tas
             "deleted": len(actual.get("deleted") or []),
             "ignored_count": len(actual.get("ignored") or []),
             "extra_wave_paths": list(actual.get("extra_wave_paths") or [])[:MAX_PATHS],
+            "product_changes": product_changes,
+            "tiny": bool(tiny),
         },
         "mismatches": mismatches,
         "mismatch_count": len(mismatches),

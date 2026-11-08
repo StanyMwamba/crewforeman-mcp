@@ -201,7 +201,7 @@ class CheckTests(unittest.TestCase):
         write_plan(workspace, plan, plan_mtime)
         return pc.check_plan_contract(
             workspace,
-            {"plan_contract": mode},
+            {"plan_contract": mode, "plan_optional_max_files": 0},
             None,
             {},
             after,
@@ -278,7 +278,9 @@ class CheckTests(unittest.TestCase):
             after = snap({"PLAN.json": (1000.0, 10), "src/a.py": (1001.0, 4)})
             for mode in ("warn", "block"):
                 result = pc.check_plan_contract(
-                    workspace, {"plan_contract": mode}, None, {}, after, 990.0, "code"
+                    workspace,
+                    {"plan_contract": mode, "plan_optional_max_files": 0},
+                    None, {}, after, 990.0, "code"
                 )
                 self.assertEqual(result["status"], "invalid")
                 self.assertEqual(result["mismatches"][0]["type"], "invalid_plan")

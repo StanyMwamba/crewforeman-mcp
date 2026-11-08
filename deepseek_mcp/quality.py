@@ -451,20 +451,147 @@ def _review_scope_module():
     return review_scope
 
 
-def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
-                  target=DEFAULT_QUALITY_TARGET):
-    """Summarise comparable past runs per starting count.
+def _history_label(value):
+    if isinstance(value, dict):
+        value = value.get("model") or value.get("name") or value.get("label")
+    text = str(value or "").strip()
+    return text if text and len(text) <= 120 else ""
 
-    A run counts at its exact ``subagents`` value, so its bucket is directly
-    comparable with the automatic starting counts.  The utility penalises
-    stalled, timed-out, rescued and failed runs; ties prefer the lower mean
-    cost, then the shorter mean duration, then the smaller count.
-    """
+
+def _builder_role(role):
+    role = str(role or "").strip().lower()
+    if not role:
+        return True
+    return not (role == "reviewer" or role.startswith("reviewer:")
+                or role in ("revision", "quality", "judge")
+                or role.startswith("revision:"))
+
+
+def _run_builder_models(run):
+    """Return the distinct models used by builder-side executions."""
+    labels = []
+    raw = run.get("builder_models")
+    if isinstance(raw, dict):
+        raw = list(raw.keys())
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            label = _history_label(item)
+            if label and label not in labels:
+                labels.append(label)
+    elif _history_label(raw):
+        labels.append(_history_label(raw))
+    if not labels:
+        usage = run.get("model_usage")
+        models = usage.get("models") if isinstance(usage, dict) else None
+        if isinstance(models, dict):
+            for label, row in models.items():
+                roles = row.get("roles") if isinstance(row, dict) else None
+                if roles and not any(_builder_role(role) for role in roles):
+                    continue
+                text = _history_label(label)
+                if text and text not in labels:
+                    labels.append(text)
+        elif isinstance(models, list):
+            for item in models:
+                if isinstance(item, dict) and item.get("roles") and not any(
+                        _builder_role(role) for role in item["roles"]):
+                    continue
+                text = _history_label(item)
+                if text and text not in labels:
+                    labels.append(text)
+    if not labels:
+        raw = run.get("models")
+        if isinstance(raw, dict):
+            for item in raw:
+                text = _history_label(item)
+                if text and text not in labels:
+                    labels.append(text)
+        elif isinstance(raw, list):
+            for item in raw:
+                text = _history_label(item)
+                if text and text not in labels:
+                    labels.append(text)
+    if not labels:
+        text = _history_label(run.get("model"))
+        if "/" in text:
+            labels.append(text)
+    return labels
+
+
+def _run_cost_info(run):
+    """Return ``(mean cost or None, cost known, unpriced)`` for one run."""
+    usage = run.get("model_usage") if isinstance(run.get("model_usage"), dict) else {}
+    if usage.get("unpriced_models"):
+        return None, False, True
+    totals = usage.get("totals") if isinstance(usage.get("totals"), dict) else {}
+    if totals:
+        if totals.get("cost_known") is False:
+            return None, False, False
+        if totals.get("cost_known") is True:
+            cost = totals.get("estimated_cost_usd")
+            try:
+                return float(cost), cost is not None, False
+            except (TypeError, ValueError):
+                return None, False, False
+    if run.get("cost_known") is False:
+        return None, False, False
+    value = run.get("estimated_cost_usd")
+    if value is None:
+        return None, False, False
+    try:
+        return float(value), True, False
+    except (TypeError, ValueError):
+        return None, False, False
+
+
+def _slice_scores(run, builders):
+    """Collect verified per-slice scores from a mixed-model run."""
+    found = []
+    raw = run.get("slice_scores")
+    if isinstance(raw, dict):
+        for label, value in raw.items():
+            if isinstance(value, dict):
+                if value.get("verified") is False:
+                    continue
+                score = value.get("score", value.get("mean_score"))
+            else:
+                score = value
+            found.append((_history_label(label), score))
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict) or item.get("verified") is False:
+                continue
+            found.append((_history_label(item.get("model")),
+                          item.get("score", item.get("mean_score"))))
+    usage = run.get("model_usage") if isinstance(run.get("model_usage"), dict) else {}
+    models = usage.get("models") if isinstance(usage.get("models"), dict) else {}
+    for label in builders:
+        row = models.get(label)
+        if not isinstance(row, dict) or row.get("verified") is False:
+            continue
+        scores = row.get("scores")
+        if isinstance(scores, dict) and scores.get("count"):
+            if scores.get("source") in ("slice", "candidate", "quality", "reviewer"):
+                found.append((label, scores.get("mean", scores.get("last"))))
+    return found
+
+
+def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
+                  target=DEFAULT_QUALITY_TARGET, max_models=6):
+    """Summarise comparable past runs per starting count and per model."""
     try:
         concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     except (TypeError, ValueError):
         concurrency = DEFAULT_CONCURRENCY
+    try:
+        max_models = max(0, int(max_models if max_models is not None else 6))
+    except (TypeError, ValueError):
+        max_models = 6
     groups = {}
+    model_groups = {}
+    model_meta = {}
+    mixed_runs = 0
+    slice_totals = {}
     total = 0
     for run in runs or []:
         if not isinstance(run, dict):
@@ -502,6 +629,9 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
             group["scores"].append(score)
         group["costs"].append(cost)
         group["seconds"].append(seconds)
+        stalled = bool(run.get("stalled") or run.get("stop_reason") == "stalled")
+        rescued = bool(run.get("status") == "ok_rescued" or run.get("rescued"))
+        errored = run.get("status") in ("error", "no_balance")
         try:
             waste = (run.get("waste_report") or {}).get("waste_ratio")
             if waste is None:
@@ -510,13 +640,53 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
                 group["wastes"].append(min(1.0, max(0.0, float(waste))))
         except (TypeError, ValueError, AttributeError):
             pass
-        if run.get("stalled") or run.get("stop_reason") == "stalled":
+        if stalled:
             group["stalled"] += 1
-        if run.get("status") == "ok_rescued" or run.get("rescued"):
+        if rescued:
             group["rescued"] += 1
-        if run.get("status") in ("error", "no_balance"):
+        if errored:
             group["errors"] += 1
         total += 1
+
+        builders = _run_builder_models(run)
+        if len(builders) == 1:
+            model = builders[0]
+            mg = model_groups.setdefault(model, {
+                "runs": 0, "utilities": [], "scores": [], "costs": [],
+                "cost_known": 0, "unpriced": 0, "stalled": 0,
+                "rescued": 0, "errors": 0,
+            })
+            mg["runs"] += 1
+            mg["utilities"].append(utility)
+            if score is not None:
+                mg["scores"].append(score)
+            run_cost, known, unpriced = _run_cost_info(run)
+            if known and run_cost is not None:
+                mg["costs"].append(run_cost)
+                mg["cost_known"] += 1
+            if unpriced:
+                mg["unpriced"] += 1
+            if stalled:
+                mg["stalled"] += 1
+            if rescued:
+                mg["rescued"] += 1
+            if errored:
+                mg["errors"] += 1
+            model_meta[model] = {"stalled": mg["stalled"],
+                                 "rescued": mg["rescued"],
+                                 "errors": mg["errors"]}
+        elif len(builders) > 1:
+            mixed_runs += 1
+            for label, score_value in _slice_scores(run, builders):
+                if not label:
+                    continue
+                try:
+                    value = float(score_value)
+                except (TypeError, ValueError):
+                    continue
+                entry = slice_totals.setdefault(label, {"scores": [], "count": 0})
+                entry["scores"].append(value)
+                entry["count"] += 1
 
     rows = []
     for bucket in sorted(groups):
@@ -539,10 +709,57 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
             "rescued": group["rescued"],
             "errors": group["errors"],
         })
+
+    model_rows = []
+    for model, mg in model_groups.items():
+        runs_n = mg["runs"]
+        model_rows.append({
+            "model": model,
+            "runs": runs_n,
+            "scored_runs": len(mg["scores"]),
+            "mean_utility": round(sum(mg["utilities"]) / runs_n, 2),
+            "mean_score": (round(sum(mg["scores"]) / len(mg["scores"]), 2)
+                           if mg["scores"] else None),
+            "mean_cost": (round(sum(mg["costs"]) / len(mg["costs"]), 4)
+                          if mg["costs"] else None),
+            "cost_known_runs": mg["cost_known"],
+            "unpriced_runs": mg["unpriced"],
+            "stall_rate": round(mg["stalled"] / float(runs_n), 2),
+        })
+    model_rows.sort(key=lambda row: (-row["mean_utility"], row["model"]))
+    eligible = []
+    for row in model_rows:
+        meta = model_meta.get(row["model"]) or {}
+        if (row["runs"] >= 2 and row["cost_known_runs"] == row["runs"]
+                and row["mean_score"] is not None
+                and row["mean_score"] >= float(target)
+                and not row["stall_rate"] and not meta.get("errors")
+                and not meta.get("rescued")
+                and row["mean_cost"] is not None):
+            eligible.append(row)
+    best_model = None
+    if eligible:
+        best = eligible[0]
+        runner = eligible[1] if len(eligible) > 1 else None
+        if runner is None:
+            best_model = dict(best)
+        elif (best["mean_utility"] >= runner["mean_utility"] + 0.3
+              and runner["mean_cost"] is not None
+              and best["mean_cost"] <= 1.25 * runner["mean_cost"]):
+            best_model = dict(best)
+    model_rows = model_rows[:max_models]
+    slice_scores = [
+        {"model": model, "count": entry["count"],
+         "mean_score": round(sum(entry["scores"]) / entry["count"], 2)}
+        for model, entry in sorted(slice_totals.items())
+    ]
+
     if not rows:
         return {"runs": 0, "best_count": None, "best": None,
                 "groups": [], "target": float(target),
-                "mean_waste": None, "waste_runs": 0}
+                "mean_waste": None, "waste_runs": 0,
+                "models": model_rows, "mixed_model_runs": mixed_runs,
+                "slice_scores": slice_scores, "best_model": best_model}
     waste_runs = sum(row["waste_runs"] for row in rows)
     mean_waste = (round(sum((row["mean_waste"] or 0.0) * row["waste_runs"]
                             for row in rows) / float(waste_runs), 4)
@@ -551,7 +768,9 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
                                       row["mean_seconds"], row["count"]))
     return {"runs": total, "best_count": best["count"], "best": best,
             "groups": rows, "target": float(target),
-            "mean_waste": mean_waste, "waste_runs": waste_runs}
+            "mean_waste": mean_waste, "waste_runs": waste_runs,
+            "models": model_rows, "mixed_model_runs": mixed_runs,
+            "slice_scores": slice_scores, "best_model": best_model}
 
 
 def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
@@ -600,7 +819,7 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
             "waves": _wave_sizes(count, concurrency),
             "history": {"runs": 0, "best_count": None, "best": None,
                         "groups": [], "target": DEFAULT_QUALITY_TARGET},
-            "agent_choice_reason": reason,
+            "agent_choice_reason": reason, "model_hint": None,
         }
 
     try:
@@ -622,7 +841,7 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
             "concurrency": concurrency, "signals": signals, "waves": [],
             "history": {"runs": 0, "best_count": None, "best": None,
                         "groups": [], "target": DEFAULT_QUALITY_TARGET},
-            "agent_choice_reason": reason,
+            "agent_choice_reason": reason, "model_hint": None,
         }
 
     if soft == 0 or default == 0:
@@ -635,7 +854,7 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
             "concurrency": concurrency, "signals": signals, "waves": [],
             "history": {"runs": 0, "best_count": None, "best": None,
                         "groups": [], "target": DEFAULT_QUALITY_TARGET},
-            "agent_choice_reason": reason,
+            "agent_choice_reason": reason, "model_hint": None,
         }
 
     cap = max(1, min(default, soft))
@@ -748,6 +967,14 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
         pieces.append("No comparable history yet.")
     if waste_note:
         pieces.append(waste_note)
+    model_hint = history.get("best_model")
+    if model_hint:
+        hint_cost = model_hint.get("mean_cost")
+        cost_text = ("$%.4f" % hint_cost if hint_cost is not None else "n/a")
+        pieces.append("Model hint: %s led comparable runs (mean utility %.2f, "
+                      "mean cost %s, %d runs)." % (
+                          model_hint["model"], model_hint["mean_utility"],
+                          cost_text, model_hint["runs"]))
     pieces.append("Waves at concurrency %d: %s." % (
         concurrency, " + ".join(str(item) for item in waves)))
     reason = " ".join(pieces)
@@ -756,6 +983,7 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
         "task_type": task_type, "size": size, "start_subagents": start,
         "concurrency": concurrency, "signals": signals, "waves": waves,
         "history": history, "agent_choice_reason": reason,
+        "model_hint": model_hint,
     }
 
 

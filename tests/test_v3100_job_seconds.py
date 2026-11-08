@@ -120,8 +120,8 @@ class JobMaxSecondsTests(unittest.TestCase):
         self.assertEqual(cfg.backup_reviewer_model, "examplevendor-large")
 
     def test_release_sanity(self):
-        # This slice must not bump the version; the lead owns 3.11.0.
-        self.assertEqual(SERVER_VERSION, "3.11.0")
+        # This slice must not bump the version; the lead owns 3.12.0.
+        self.assertEqual(SERVER_VERSION, "3.12.0")
         self.assertEqual(DEFAULTS["job_max_seconds"], 7200.0)
 
 

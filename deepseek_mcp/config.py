@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.11.0"
+SERVER_VERSION = "3.12.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -314,12 +314,76 @@ DEFAULTS = {
     "pipeline_max_pending_patches": 8,
     "pipeline_queue_scan": "head",
     "pipeline_patch_retention_days": 3,
+    # v3.12.0 S1/S2: builder target, mixed-model plan and model-aware records.
+    # Empty string means inherit (builder_* -> dsh_*).
+    "builder_model": "",
+    "builder_provider": "",
+    "builder_allow_unlisted_models": False,
+    "builder_model_max_slices": 8,
+    "slice_models": {},
+    "model_candidates_max": 3,
+    "model_plan_enforcement": "warn",
+    "model_prices": {},
+    "model_usage_max_models": 8,
+    "history_model_min_runs": 2,
+    "history_model_max": 6,
+    "failure_notes_models": "on",
+    "failure_notes_max_models": 6,
+    "failure_notes_model_min_runs": 2,
+    # v3.12.0 backup builder. Empty model disables it; 0 disables its ceiling.
+    "backup_builder_model": "",
+    "backup_builder_provider": "",
+    "backup_builder_max_cost_usd": 1.0,
+    "backup_builder_min_attempts": 2,
+    # v3.12.0 reviewer selection and gate scope.
+    "reviewers": [],
+    "reviewer_vendor": "",
+    "reviewer_provider": "",
+    "reviewer_model": "",
+    "reviewer_max_preflights": 8,
+    "reviewer_same_vendor_policy": "ask",
+    "gate_no_product_mode": "skip",
+    "gate_noproduct_globs": [
+        "logs/**", "**/logs/**", "**/*.log", "**/*.diff", "**/*.patch",
+        "**/*.rej", "**/*.orig", "repo-ref/**", "**/repo-ref/**",
+        ".dsh-tmp-*", ".dsh-model-overlay-*", ".pytest_cache/**", "**/__pycache__/**", ".mypy_cache/**",
+        ".ruff_cache/**", "htmlcov/**", "coverage/**", ".coverage",
+        "PLAN.json", "MODEL_AUDIT.json", "REVIEW*.md",
+        "QUALITY_REPORT*.md", "WASTE_REPORT.md",
+        "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.svg",
+        "**/*.mp4", "**/*.webm", "**/*.pdf", "**/*.zip",
+        "*.md", "docs/**", "LICENSE*",
+    ],
+    "gate_secret_skip_globs": [
+        "**/*.log", "**/*.diff", "**/*.patch", "**/*.rej", "**/*.orig",
+        "repo-ref/**", "**/repo-ref/**", ".dsh-tmp-*", ".dsh-model-overlay-*",
+        ".pytest_cache/**",
+        "**/__pycache__/**", ".mypy_cache/**", ".ruff_cache/**",
+        "htmlcov/**", "coverage/**", ".coverage",
+    ],
+    "gate_split_fixture_paths": [
+        "tests/test_v3110_gate.py", "tests/test_v3110_integration.py",
+        "tests/test_v3110_vendor.py", "tests/test_p3_vendor_error.py",
+        "tests/test_v340_render.py",
+    ],
+    "plan_optional_max_files": 1,
 }
 
 # Environment variable -> config key. New names are listed first; legacy v2
 # names keep working so existing MCP launch configs do not need editing.
 ENV_MAP = {
     "DSH_BUILDER_PRACTICES": "builder_practices",
+    "DSH_BUILDER_MODEL": "builder_model",
+    "DSH_BUILDER_PROVIDER": "builder_provider",
+    "DSH_BACKUP_BUILDER_MODEL": "backup_builder_model",
+    "DSH_BACKUP_BUILDER_PROVIDER": "backup_builder_provider",
+    "DSH_BACKUP_BUILDER_MAX_COST_USD": "backup_builder_max_cost_usd",
+    "DSH_REVIEWER_MAX_PREFLIGHTS": "reviewer_max_preflights",
+    "DSH_REVIEWER_VENDOR": "reviewer_vendor",
+    "DSH_REVIEWER_MODEL": "reviewer_model",
+    "DSH_REVIEWER_PROVIDER": "reviewer_provider",
+    "DSH_GATE_NO_PRODUCT_MODE": "gate_no_product_mode",
+    "DSH_PLAN_OPTIONAL_MAX_FILES": "plan_optional_max_files",
     "DSH_MAX_HARNESS_JOBS": "max_harness_jobs",
     "DEEPSEEK_MAX_HARNESS_JOBS": "max_harness_jobs",
     "DSH_RESERVE_RESUME_SLOT": "reserve_resume_slot",
@@ -556,7 +620,7 @@ ENV_MAP = {
     "DEEPSEEK_PIPELINE_PATCH_RETENTION_DAYS": "pipeline_patch_retention_days",
 }
 
-BOOL_KEYS = {"builder_practices", "quality", "independent_review", "child_progress",
+BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "independent_review", "child_progress",
              "render_probe", "transient_retry", "checkpoint", "dedupe_active",
              "provider_fallback", "trace", "browser_evidence",
              "workspace_progress", "live_scaling",
@@ -589,16 +653,36 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "failure_notes_max",
             "failure_notes_min_occurrences", "failure_notes_max_store",
             "pipeline_max_extra_jobs", "pipeline_max_pending_patches",
-            "pipeline_patch_retention_days"}
+            "pipeline_patch_retention_days",
+            "builder_model_max_slices", "model_candidates_max",
+            "model_usage_max_models", "history_model_min_runs",
+            "history_model_max", "failure_notes_max_models",
+            "failure_notes_model_min_runs", "backup_builder_min_attempts",
+            "reviewer_max_preflights", "plan_optional_max_files"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request"),
              "quality_convergence": ("observe", "auto"),
              "plan_contract": ("warn", "block", "off"),
              "failure_notes": ("on", "off"),
              "pipeline_install": ("auto", "manual", "off"),
-             "pipeline_queue_scan": ("head", "first_fit")}
+             "pipeline_queue_scan": ("head", "first_fit"),
+             "model_plan_enforcement": ("warn", "strict"),
+             "failure_notes_models": ("on", "off"),
+             "reviewer_same_vendor_policy": ("ask", "never"),
+             "gate_no_product_mode": ("skip", "off")}
+# New v3.12.0 enums never raise on an invalid value: they fall back to the
+# documented default so a bad env/config value cannot break startup.
+ENUM_FALLBACKS = {
+    "model_plan_enforcement": "warn",
+    "failure_notes_models": "on",
+    "reviewer_same_vendor_policy": "ask",
+    "gate_no_product_mode": "skip",
+}
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
-             "allowed_workspace_roots", "gate_secret_patterns"}
+             "allowed_workspace_roots", "gate_secret_patterns",
+             "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths"}
+# Dict-valued keys keep JSON objects intact (never comma-split the text).
+DICT_KEYS = {"slice_models", "model_prices"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "admission_heartbeat_seconds", "admission_lease_seconds",
               "review_test_timeout_seconds", "failure_notes_half_life_days",
@@ -619,7 +703,8 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds",
-              "gate_timeout_seconds", "pipeline_min_remaining_usd"}
+              "gate_timeout_seconds", "pipeline_min_remaining_usd",
+              "backup_builder_max_cost_usd"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path",
@@ -694,6 +779,8 @@ def _coerce(key, value):
         text = str(value).strip().lower()
         allowed = ENUM_KEYS[key]
         if text not in allowed:
+            if key in ENUM_FALLBACKS:
+                return ENUM_FALLBACKS[key]
             raise ValueError("%s must be one of: %s"
                              % (key, ", ".join(allowed)))
         return text
@@ -718,6 +805,18 @@ def _coerce(key, value):
                           RuntimeWarning)
             return min(1.0, max(0.0, number))
         return number
+    if key in DICT_KEYS:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("%s must be a JSON object" % key)
+            return parsed
+        raise ValueError("%s must be an object" % key)
     if key in LIST_KEYS:
         if isinstance(value, list):
             return list(value)

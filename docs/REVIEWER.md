@@ -2,15 +2,72 @@
 
 CrewForeman can use an independent reviewer from a different vendor. The reviewer scores the result from 0 to 10 and lists blocking defects. It is read-only by default and runs in a private home, so it does not share the builder's session state.
 
-## Reviewer wrapper
+## Reviewer routing (new in 3.12.0)
 
-No separate reviewer model setting ships. The reviewer runs the same `dsh_bin` (`DSH_BIN`) as the builder. CrewForeman gives each review run a private `DSH_HOME` under `<state_dir>/reviewer-homes/`.
+The connector, not a hand-edited wrapper, chooses the reviewer. `reviewer_model`
+and `reviewer_provider` select a model through a generated provider/model
+overlay; the key stays in the environment under the provider's `api_key_env`
+name. A per-job `reviewer_model` / `reviewer_provider` argument overrides the
+config for that job only.
 
-Point `DSH_BIN` at a wrapper that checks `DSH_HOME` (the private review home). On a review run, the wrapper can load a patch that selects another vendor's model. On other runs, it calls `dsh` unchanged. `dsh_provider` and `dsh_model` are shared, so changing them changes the builder too.
+For more than one candidate, set `reviewers` to an ordered list:
 
-A working example is the operator wrapper `dsh-reviewer-kimi.sh` plus `reviewer-kimi.patch.yml`. Set the `dsh` path and patch path inside the script, then point `DSH_BIN` at it. These files are operator examples, not package files or package settings.
+```json
+{"reviewers": [
+  {"name": "opus", "vendor": "Anthropic", "provider": "anthropic",
+   "model": "claude-opus-4-1", "enabled": true},
+  {"name": "kimi", "vendor": "Kimi (Moonshot)", "provider": "moonshot",
+   "model": "kimi-k3.1-pro", "api_key_env": "MOONSHOT_API_KEY"}
+]}
+```
 
-The reviewer path is used for the pre-flight READY ping and for the paid review. `review_preflight` defaults to `true`, and `review_preflight_timeout` defaults to 45 seconds.
+`dsh_bin` and `patch` are operator-only fields for a legacy wrapper; they are
+never accepted as tool arguments. A missing binary or unreadable patch is a
+candidate error, not a crash. `reviewer_max_preflights` (default 8) caps how
+many configured candidates are pinged.
+
+Selection runs after the deterministic gate and before any paid review. The
+connector resolves the vendor, runs the READY ping in configured order, and
+uses the first cross-vendor candidate that answers `READY`. Credit and auth
+failures move to the next candidate immediately; 5xx and dropped streams get
+at most two attempts. The chosen candidate's exact header is
+`Reviewed by: <vendor>/<model>`.
+
+## Legacy reviewer wrapper
+
+Existing `dsh_bin` wrapper setups (for example `dsh-reviewer-kimi.sh` and
+`dsh-reviewer-sonnet.sh`) keep working unchanged as the legacy path. When
+`reviewers` is empty, CrewForeman synthesizes the main candidate from
+`dsh_bin` + `reviewer_vendor`/`reviewer_model`, and a second candidate from
+`backup_dsh_bin`. The vendor comes from the explicit label, then the wrapper
+basename (`kimi` -> Kimi (Moonshot), `sonnet` -> Anthropic). A legacy wrapper
+loads its own key; no connector overlay is required for it.
+
+The reviewer path is used for the pre-flight READY ping and for the paid
+review. `review_preflight` defaults to `true`, and `review_preflight_timeout`
+defaults to 45 seconds. `review_preflight=false` disables only the redundant
+round preflight; selection still performs its own READY ping for `reviewers`
+candidates.
+
+## Same-vendor rule and the one question
+
+A reviewer must come from a different vendor than every builder model that may
+run for the job: the parent, every slice, every competing candidate (including
+losers), and `backup_builder_model` when configured. Unknown is fail-closed,
+never treated as different.
+
+If no cross-vendor candidate passes preflight, the job pauses with exactly one
+`needs_input` question. The options list the same-vendor models that answered
+READY, labelled `<vendor>/<model> (same vendor)`, then
+`Do not review; return the build as unreviewed`. A same-vendor candidate is
+started only after the user picks it, and the header then says exactly
+`same-vendor review (chosen by user)`. `reviewer_same_vendor_policy="never"`
+removes same-vendor options; it never silently chooses one.
+
+Resume the paused job with `resume_deepseek` and the `option` shown by
+`deepseek_job_status`. The connector re-preflights the chosen candidate and
+runs the paid review; it does not rerun the builder. Declining returns
+`ok_unreviewed` with `review_declined_by_user=true` and no invented score.
 
 ## Resumable reviews
 

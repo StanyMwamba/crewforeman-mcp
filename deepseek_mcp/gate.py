@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from . import review_context, safety
+from . import path_scope, review_context, safety
 from .api import redact_secrets
 
 ALGORITHM = "sha256"
@@ -53,7 +53,9 @@ _BUILTIN_RULES = (
     ("provider-api-key", re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), 0),
     ("generic-secret-assignment",
      re.compile(r"(?i)\b(api[_-]?key|secret|token|password|client[_-]?secret)"
-                r"\b\s*[:=]\s*['\"]?([^\s\"',;#]{8,})"), 2),
+                r"\b\s*[:=]\s*(?:['\"][^'\"\r\n]{8,}['\"]"
+                r"|(?:sk-|gh[pousr]_|AKIA|AIza|xox[abprs]-|-----BEGIN)"
+                r"[^\s\"',;#]{4,})"), 0),
 )
 
 
@@ -463,7 +465,117 @@ def _secret_rules(cfg):
     return rules
 
 
-def _secret_check(cfg, workspace, before, after, deadline):
+_SECRET_SKIP_DEFAULTS = (
+    "logs/**", "**/logs/**", "**/*.log", "**/*.diff", "**/*.patch",
+    "**/*.rej", "**/*.orig", "repo-ref/**", "**/repo-ref/**",
+    ".dsh-tmp-*", ".dsh-model-overlay-*",
+    "**/cache/**", "cache/**", "**/coverage/**", "coverage/**",
+)
+
+
+def _secret_skip_globs(cfg):
+    raw = _cfg(cfg, "gate_secret_skip_globs", None)
+    if raw is None:
+        return list(_SECRET_SKIP_DEFAULTS)
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(item) for item in raw if item]
+
+
+def _scan_rel_file(cfg, workspace, rel, rules, findings):
+    """Scan one repo-relative file. Returns (scanned, binary, large) counts."""
+    full = _safe_join(workspace, rel)
+    if full is None or not os.path.isfile(full) or os.path.islink(full):
+        return 0, 0, 0
+    try:
+        size = os.path.getsize(full)
+    except OSError:
+        return 0, 0, 0
+    if size > MAX_SCAN_BYTES:
+        return 0, 0, 1
+    try:
+        with open(full, "rb") as handle:
+            raw = handle.read(MAX_SCAN_BYTES + 1)
+    except OSError:
+        return 0, 0, 0
+    if len(raw) > MAX_SCAN_BYTES:
+        return 0, 0, 1
+    if b"\x00" in raw[:8192]:
+        return 0, 1, 0
+    text = raw.decode("utf-8", "replace")
+    lines = text.splitlines()
+    base = os.path.basename(rel)
+    if base == ".env" or (base.startswith(".env.") and base != ".env.example"):
+        _add_finding(findings, "dotenv-file", rel, 1, "", _allowlisted(lines, 0))
+    stop = False
+    for line_no, line in enumerate(lines, 1):
+        allow = _allowlisted(lines, line_no - 1)
+        for rule_id, pattern, group in rules:
+            for match in pattern.finditer(line):
+                value = match.group(group) if group else match.group(0)
+                _add_finding(findings, rule_id, rel, line_no,
+                             str(value or "")[:4], allow)
+                if len(findings) >= MAX_FINDINGS:
+                    stop = True
+                    break
+            if stop:
+                break
+        if stop:
+            break
+    return 1, 0, 0
+
+
+def _scan_paths(cfg, workspace, paths, rules, findings, deadline=None):
+    stats = {"scanned": 0, "binary": 0, "large": 0, "skipped": 0}
+    timed_out = False
+    for rel in sorted(set(str(path) for path in paths if path)):
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        scanned, binary, large = _scan_rel_file(
+            cfg, workspace, rel, rules, findings)
+        if not (scanned or binary or large):
+            stats["skipped"] += 1
+        stats["scanned"] += scanned
+        stats["binary"] += binary
+        stats["large"] += large
+        if len(findings) >= MAX_FINDINGS:
+            break
+    return stats, timed_out
+
+
+def scan_files(cfg, workspace, paths):
+    """Public scanner: return secret findings for explicit relative paths."""
+    findings = []
+    _scan_paths(cfg, os.path.abspath(str(workspace)), paths,
+                _secret_rules(cfg), findings)
+    return findings
+
+
+def scan_tree(cfg, root, skip=None):
+    """Public scanner: walk ``root`` and return findings (skip globs/dirs)."""
+    root = os.path.abspath(str(root))
+    skip = list(skip or (".git",))
+    paths = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        rel_dir = "" if rel_dir == "." else rel_dir
+        keep = []
+        for name in dirnames:
+            rel = (rel_dir + "/" + name) if rel_dir else name
+            if name in skip or path_scope.match_any(rel, skip):
+                continue
+            keep.append(name)
+        dirnames[:] = sorted(keep)
+        for name in sorted(filenames):
+            rel = (rel_dir + "/" + name) if rel_dir else name
+            if path_scope.match_any(rel, skip):
+                continue
+            paths.append(rel)
+    return scan_files(cfg, root, paths)
+
+
+def _secret_check(cfg, workspace, before, after, deadline, only_paths=None):
     started = time.monotonic()
     if not _as_bool(_cfg(cfg, "gate_secret_scan", True), True):
         return {
@@ -476,60 +588,24 @@ def _secret_check(cfg, workspace, before, after, deadline):
         }
     rules = _secret_rules(cfg)
     findings = []
-    scanned = skipped_binary = skipped_large = 0
-    timed_out = False
     paths = []
-    for change in _diff(before, after):
-        if change.get("change") in ("created", "modified"):
-            paths.append(str(change.get("path") or ""))
+    if only_paths is not None:
+        paths = [str(path) for path in only_paths if path]
+    else:
+        for change in _diff(before, after):
+            if change.get("change") in ("created", "modified"):
+                paths.append(str(change.get("path") or ""))
+    skip_globs = _secret_skip_globs(cfg)
+    scanned_paths = []
+    skipped_artifacts = 0
     for rel in sorted(set(path for path in paths if path)):
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        full = _safe_join(workspace, rel)
-        if full is None or not os.path.isfile(full) or os.path.islink(full):
+        if path_scope.is_split_fixture(rel, cfg) or path_scope.match_any(
+                rel, skip_globs):
+            skipped_artifacts += 1
             continue
-        try:
-            size = os.path.getsize(full)
-        except OSError:
-            continue
-        if size > MAX_SCAN_BYTES:
-            skipped_large += 1
-            continue
-        try:
-            with open(full, "rb") as handle:
-                raw = handle.read(MAX_SCAN_BYTES + 1)
-        except OSError:
-            continue
-        if len(raw) > MAX_SCAN_BYTES:
-            skipped_large += 1
-            continue
-        if b"\x00" in raw[:8192]:
-            skipped_binary += 1
-            continue
-        text = raw.decode("utf-8", "replace")
-        scanned += 1
-        lines = text.splitlines()
-        base = os.path.basename(rel)
-        if base == ".env" or (base.startswith(".env.")
-                              and base != ".env.example"):
-            _add_finding(findings, "dotenv-file", rel, 1, "",
-                         _allowlisted(lines, 0))
-        stop = False
-        for line_no, line in enumerate(lines, 1):
-            allow = _allowlisted(lines, line_no - 1)
-            for rule_id, pattern, group in rules:
-                for match in pattern.finditer(line):
-                    value = match.group(group) if group else match.group(0)
-                    _add_finding(findings, rule_id, rel, line_no,
-                                 str(value or "")[:4], allow)
-                    if len(findings) >= MAX_FINDINGS:
-                        stop = True
-                        break
-                if stop:
-                    break
-            if stop:
-                break
+        scanned_paths.append(rel)
+    stats, timed_out = _scan_paths(
+        cfg, workspace, scanned_paths, rules, findings, deadline)
     active = [item for item in findings if not item["allowlisted"]]
     if timed_out:
         status = "timed_out"
@@ -538,9 +614,11 @@ def _secret_check(cfg, workspace, before, after, deadline):
     else:
         status = "ok"
     summary = ("Secret scan: %d file(s) scanned, %d finding(s), "
-               "%d allowlisted, %d binary skipped, %d large skipped."
-               % (scanned, len(findings), len(findings) - len(active),
-                  skipped_binary, skipped_large))
+               "%d allowlisted, %d binary skipped, %d large skipped, "
+               "%d artifact/fixture skipped."
+               % (stats["scanned"], len(findings),
+                  len(findings) - len(active), stats["binary"],
+                  stats["large"], skipped_artifacts))
     return {
         "name": "secrets", "status": status, "command": None,
         "exit_code": None, "seconds": round(time.monotonic() - started, 4),
@@ -549,9 +627,10 @@ def _secret_check(cfg, workspace, before, after, deadline):
         "output_tail": summary,
         "tree_changed": False, "timed_out": timed_out,
         "skipped_reason": None, "findings": findings,
-        "files_scanned": scanned,
-        "files_skipped_binary": skipped_binary,
-        "files_skipped_large": skipped_large,
+        "files_scanned": stats["scanned"],
+        "files_skipped_binary": stats["binary"],
+        "files_skipped_large": stats["large"],
+        "files_skipped_artifact": skipped_artifacts,
     }
 
 
@@ -686,6 +765,17 @@ def _lint_check(cfg, workspace, deadline):
         "skipped_reason": "tree_mutated" if (changes and status == "failed")
                           else None,
         "findings": [],
+    }
+
+
+def _skipped_lint_check(reason):
+    return {
+        "name": "lint", "status": "skipped", "command": None,
+        "exit_code": None, "seconds": 0.0, "tests": 0, "failures": 0,
+        "errors": 0, "output_digest": _sha256_text(""),
+        "output_tail": "Lint skipped: %s" % reason,
+        "tree_changed": False, "timed_out": False,
+        "skipped_reason": reason, "findings": [],
     }
 
 
@@ -850,13 +940,78 @@ def run_gate(cfg, workspace, run, *, phase="pre_review", before=None):
         result["seconds"] = round(time.monotonic() - started, 4)
         return result
     deadline = started + total
+    baseline = before
     if before is None:
         before = _snapshot(workspace)
+    snapshot = _snapshot(workspace)
+    plan_rel = "PLAN.json"
+    try:
+        from . import plan_contract as _plan_contract
+        plan_rel = _plan_contract.plan_path(cfg)
+    except Exception:
+        pass
+    scope = path_scope.classify_changes(baseline, snapshot, cfg, plan_rel)
+    output_scope = path_scope.classify_outputs(run, cfg)
+    scope["product_outputs"] = bool(output_scope)
+    result["scope"] = scope.summary()
+    no_baseline = not bool(baseline)
+    no_baseline_scan = (no_baseline
+                        and str(_cfg(cfg, "gate_no_product_mode", "skip")
+                                or "skip").strip().lower() == "skip")
+    output_paths = []
+    if no_baseline_scan and isinstance(run, dict):
+        seen = set()
+        raw_outputs = (list(run.get("output_files") or [])
+                       + list(run.get("deliverable_files") or []))
+        for path in raw_outputs:
+            rel = path_scope.normalize_rel(path)
+            if not rel or rel in seen:
+                continue
+            # Patch/log/cache artifacts and known split fixtures are the only
+            # secret-scan skips; docs and config are still scanned.
+            if (path_scope.is_split_fixture(rel, cfg)
+                    or path_scope.match_any(rel, _secret_skip_globs(cfg))):
+                continue
+            seen.add(rel)
+            output_paths.append(rel)
+    no_product_mode = str(
+        _cfg(cfg, "gate_no_product_mode", "skip") or "skip").strip().lower()
+    if (not scope.product and no_product_mode == "skip"
+            and (scope.baseline_known or not scope.product_outputs)):
+        checks = []
+        try:
+            secret_check = _secret_check(
+                cfg, workspace, baseline, snapshot,
+                min(deadline, time.monotonic() + SECRET_BUDGET_SECONDS),
+                only_paths=(output_paths if no_baseline_scan else None))
+            checks.append(secret_check)
+            checks.append(_skipped_lint_check("no_product_code_change"))
+            checks.append(_skipped_test_check("no_product_code_change"))
+            for check in checks:
+                check["command"] = _redact_command(check.get("command"))
+                _sign_check(cfg, check)
+            if secret_check.get("status") in ("failed", "timed_out", "error"):
+                result["verdict"] = "failed"
+                result["blocked_review"] = True
+            else:
+                result["verdict"] = "skipped"
+                result["skip_reason"] = "no_product_code_change"
+                result["blocked_review"] = False
+        except Exception as exc:
+            result["verdict"] = "error"
+            result["blocked_review"] = True
+            result["gate_error"] = _safe_error(exc, workspace)
+        result["checks"] = checks
+        result["tree_sha256"] = _tree_sha(workspace) or initial_sha
+        result["checked_at"] = _iso_now()
+        result["seconds"] = round(time.monotonic() - started, 4)
+        return result
     checks = []
     try:
         secret_check = _secret_check(
-            cfg, workspace, before, _snapshot(workspace),
-            min(deadline, time.monotonic() + SECRET_BUDGET_SECONDS))
+            cfg, workspace, baseline, snapshot,
+            min(deadline, time.monotonic() + SECRET_BUDGET_SECONDS),
+            only_paths=(output_paths if no_baseline_scan else None))
         checks.append(secret_check)
         secrets_failed = secret_check.get("status") in (
             "failed", "timed_out", "error")

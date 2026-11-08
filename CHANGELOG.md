@@ -5,6 +5,60 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.12.0
+
+Configurable builders and reviewers, mixed-model teams, per-model cost and
+score learning, a backup builder, and a stricter reviewer-vendor rule. The
+deterministic gate and PLAN contract learn two exceptions.
+
+### Added
+
+- **Builder model routing (R1).** `builder_model` / `builder_provider` and the
+  per-job tool arguments select the builder through a workspace-local 0600
+  provider/model overlay. Keys stay in the environment (`apiKeyEnv` names
+  only), the overlay is deleted in a `finally` block, and the empty/default
+  target keeps the 3.11.0 argv byte-identical. Validation rejects injection
+  characters, unknown providers and unlisted models before a paid call.
+- **Reviewer model routing (R1b).** `reviewer_model` / `reviewer_provider` and
+  the per-job arguments choose the reviewer the same way. Existing
+  `dsh-reviewer-kimi.sh` / `dsh-reviewer-sonnet.sh` wrappers remain the legacy
+  path, including `backup_dsh_bin`.
+- **Mixed models and competing candidates (R2).** `slice_models` assigns a
+  model per slice (cap 8), `model_candidates` runs 2..N candidates per slice on
+  different models, and the existing candidate scorer picks the winner. The
+  builder writes `MODEL_AUDIT.json`; the connector records `verified`,
+  `partial`, `mismatch`, `unverified` or `ignored` and never claims an
+  unobserved model ran. `model_plan_enforcement` is `warn` or `strict`.
+- **Per-model cost and score (R3).** `run["model_usage"]` aggregates tokens,
+  estimated cost, `cost_known`, aggregate scores, wins/losses and an
+  `__other__` fold. Unpriced models keep `null`, never a fabricated number.
+  Team sizing gains a model axis (`model_hint`); `failure_notes` moves to
+  schema v2 with a sibling, idempotent `model_stats` map and a bounded note.
+- **Backup builder (R4).** `backup_builder_model` takes over only for
+  credit/budget, auth, 5xx-after-retries or repeated stream drops, under its
+  own `backup_builder_max_cost_usd` ceiling. It never switches after writes,
+  never recurses, and the exact header records
+  `backup builder: <vendor>/<model> (main failed: <class>)`.
+- **Reviewer vendor rule (R5).** `reviewers` is an ordered candidate list. The
+  first cross-vendor candidate whose READY preflight passes wins; otherwise the
+  job pauses with ONE `needs_input` question listing available same-vendor
+  models. A same-vendor review starts only when the user chooses it and carries
+  the exact label `same-vendor review (chosen by user)`. Declining returns
+  `ok_unreviewed` without inventing a score.
+- **Gate and PLAN scope (R6).** The generic secret rule now flags literal
+  key-shaped values only; ordinary identifiers assigned to calls, variables or
+  `int(...)` are not findings. A diff with no product change skips lint/tests
+  but still scans secrets; patch/log/cache artifacts and five known split
+  fixtures are handled by path; a no-baseline job classifies its outputs.
+  `PLAN.json` is `optional` for a tiny single-file job instead of `invalid`.
+
+### Documentation
+
+- TEAMS, REVIEWER, OPERATIONS, CLIENTS, STATUS, LIMITATIONS and
+  `config.example.json` document the new keys, records and status. README
+  keeps its 3.11.0 shape apart from the version, the Builder role and three
+  Guarantees lines.
+
 ## 3.11.0
 
 P3.5: a deterministic pre-review gate, written predictions, learned failure

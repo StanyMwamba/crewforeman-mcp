@@ -44,6 +44,16 @@ os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
 # or DSH_OS_SANDBOX=1 and keep covering the wrapper.
 os.environ.setdefault("DSH_OS_SANDBOX", "0")
 
+# The reviewer finalizer waits one second after the direct child exits so a
+# background child session can finish writing before the in-flight scan.  The
+# fake DSH used here writes every session/marker file synchronously before it
+# exits, so the wait only adds wall clock time; the connector's deterministic
+# gate gives the whole suite a 300 s budget.  Compress the wait for tests
+# only: the product default stays 1.0 s and the in-flight logic is untouched.
+from deepseek_mcp import harness as _harness  # noqa: E402
+
+_harness.REVIEWER_ACTIVITY_SETTLE_SECONDS = 0.01
+
 _PROBE_PREFIX = ".dsh-tmp-probe-"
 _TEST_OVERRIDE_VARS = ("DSH_TEST_TMPDIR", "DSH_TMPDIR")
 _ENV_VARS = ("TMPDIR", "TMP", "TEMP")

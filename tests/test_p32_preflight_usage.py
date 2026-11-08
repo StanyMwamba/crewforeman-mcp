@@ -74,7 +74,11 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(pre.get("status"), "error")
         self.assertIn("platform.moonshot.cn", run.get("review_error") or "")
         self.assertIn("moonshot", (pre.get("vendor") or "").lower())
-        self.assertEqual(run.get("review_status"), "error")
+        # 3.12.0: no cross-vendor reviewer passed, so the job pauses with ONE
+        # validated question instead of starting a paid review or failing open.
+        self.assertEqual(run.get("review_status"), "paused")
+        self.assertEqual(run.get("status"), "needs_input")
+        self.assertIsNotNone(run.get("reviewer_attention"))
         self.assertFalse([item for item in run.get("review_rounds") or []
                           if item.get("kind") == "review"])
         self.assertFalse((_root_dir / "ws" / "REVIEW.md").exists(),

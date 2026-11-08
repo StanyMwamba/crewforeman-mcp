@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.11.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.12.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -1034,3 +1034,105 @@ and 2 detached-caffeinate handle tests). Final stdlib-discovered total:
 - Work files live under `<state_dir>/work/<work_id>/`: `attempts.jsonl`, `events.jsonl` and `result.json`.
 - To follow a run, call `deepseek_job_status` with `run_id` and `events_since=0`, then pass the returned `next_seq` back as `events_since`. The reply adds new events, `stage`, `attention`, any pending `question` and `options`, `next_action`, `terminal` and `result`. An older `events_since` value receives retained events, not an error.
 - `task_completion="job"` (default) keeps the MCP task `working` until a final journal state. A pending question in one fenced `attention` JSON block (`question`, `options`, optional `evidence`) makes it `input_required`. `task_completion="request"` completes when the call returns.
+
+## Models, backup builder and gate scope (3.12.0)
+
+All new keys are additive; empty values reproduce 3.11.0. Configuration
+precedence remains defaults < config file < environment < per-job tool
+argument. This table is the operator-facing summary of the registry in
+`deepseek_mcp/config.py`.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `builder_model` | `""` | Parent builder model; empty inherits `dsh_model` |
+| `builder_provider` | `""` | Parent builder provider; empty inherits `dsh_provider` |
+| `builder_allow_unlisted_models` | `false` | Allow a model absent from `providers[].models` |
+| `builder_model_max_slices` | `8` | Cap on `slice_models` entries |
+| `slice_models` | `{}` | Default slice -> model map; a tool argument wins |
+| `model_candidates_max` | `3` | Extra competing candidates per job |
+| `model_plan_enforcement` | `warn` | `warn` degrades; `strict` stops before review |
+| `model_prices` | `{}` | USD/M-token builder rows: `{input, cache_read, output}` |
+| `reviewer_prices` | `{}` | Same shape, reviewer executions only |
+| `model_usage_max_models` | `8` | Named rows before the `__other__` fold |
+| `history_model_min_runs` | `2` | Floor before a model can be `best_model` |
+| `history_model_max` | `6` | Model history rows kept in sizing history |
+| `failure_notes_models` | `on` | Feed per-model learning into `failure_notes` |
+| `failure_notes_max_models` | `6` | Model rows per task type |
+| `failure_notes_model_min_runs` | `2` | Model note floor |
+| `backup_builder_model` | `""` | Backup builder model; empty disables |
+| `backup_builder_provider` | `""` | Optional provider; empty derives |
+| `backup_builder_max_cost_usd` | `1.0` | Independent backup ceiling; `0` disables |
+| `backup_builder_min_attempts` | `2` | Attempts before a 5xx/stream switch |
+| `reviewers` | `[]` | Ordered reviewer candidates (see REVIEWER.md) |
+| `reviewer_provider` | `""` | Reviewer provider for `reviewer_model` |
+| `reviewer_model` | `""` | Reviewer model; empty keeps the legacy wrapper |
+| `reviewer_vendor` | `""` | Legacy reviewer vendor label |
+| `reviewer_max_preflights` | `8` | Candidate preflight cap |
+| `reviewer_same_vendor_policy` | `ask` | `ask` offers consent; `never` removes it |
+| `gate_no_product_mode` | `skip` | `skip` a no-product diff; `off` restores 3.11.0 |
+| `gate_noproduct_globs` | artifact list | Paths that never require lint/tests |
+| `gate_secret_skip_globs` | patch/log list | Paths never secret-scanned |
+| `gate_split_fixture_paths` | 5 fixture paths | Known fake-credential fixtures |
+| `plan_optional_max_files` | `1` | Tiny-job PLAN threshold; `0` disables |
+
+Environment aliases exist for the common ones: `DSH_BUILDER_MODEL`,
+`DSH_BUILDER_PROVIDER`, `DSH_BACKUP_BUILDER_MODEL`,
+`DSH_BACKUP_BUILDER_PROVIDER`, `DSH_BACKUP_BUILDER_MAX_COST_USD`,
+`DSH_REVIEWER_VENDOR`, `DSH_REVIEWER_MODEL`, `DSH_REVIEWER_PROVIDER`,
+`DSH_REVIEWER_MAX_PREFLIGHTS`, `DSH_GATE_NO_PRODUCT_MODE` and
+`DSH_PLAN_OPTIONAL_MAX_FILES`. Invalid values for the new enums fall back to
+the documented default rather than aborting startup.
+
+### Cost and case records
+
+`run["model_usage"]` is rebuilt at terminal serialization. It holds named
+`<provider>/<model>` rows with roles, executions, token buckets, estimated
+cost, `cost_known`, cost source, aggregate scores (no score lists), wins and
+losses, an `__other__` fold, `unpriced_models`, `unattributed_scores` and
+`totals`. If any contributing model is unpriced, that row and the total are
+`null`; the connector never zero-fills, proxies the parent price or splits a
+total by token share. `model_prices` prices builders; `reviewer_prices` prices
+reviewer/revision executions and is never applied to a builder.
+
+`MODEL_AUDIT.json` is required when a model plan is supplied. The connector
+cross-checks requested pairs, observed model ids and existing files and records
+`model_plan.status` as `verified`, `partial`, `mismatch`, `unverified` or
+`ignored`. A missing audit is never verified. `model_plan_enforcement="warn"`
+sets `run["degraded"]=true` and adds `MODEL_PLAN_NOT_EXECUTED`; `strict` stops
+the run before review.
+
+`run["backup_builder"]` records `used`, `status`, vendor, model, reason class,
+redacted `main_error`, attempts, ceiling, settlement and the header line. The
+binary path is never stored. `run["builder_vendors"]` is the sorted canonical
+vendor set used by the reviewer rule.
+
+### Gate scope and PLAN exceptions
+
+The gate classifies every changed path as `product`, `artifact`,
+`split_fixture` or `plan`. With `gate_no_product_mode="skip"` (default), a diff
+with no product change runs the secret scan and skips lint/tests with
+`skipped_reason="no_product_code_change"`; a real secret still fails and blocks
+review. Artifacts such as `logs/**`, `*.patch`, `*.diff`, `PLAN.json`,
+`REVIEW*.md`, report files, caches, media and docs never require lint/tests.
+The five known split fixtures are skipped by the secret scan but still count as
+a test change, so a fixture-only edit runs the suite. `gate_no_product_mode="off"`
+restores 3.11.0 exactly.
+
+With no pre-builder baseline, the gate classifies `output_files` and
+`deliverable_files` and records `baseline_missing`. A job with no product output
+takes the same skipped branch.
+
+`plan_optional_max_files` (default 1, `0` disables) turns an absent or invalid
+`PLAN.json` into `status="optional"`, `blocking=false`,
+`note="plan: optional (tiny job)"` only when 1..N product files changed.
+Reasons are `tiny_job_absent_plan`, `tiny_job_invalid_plan` and
+`tiny_job_plan_not_in_snapshot`. A valid plan is always compared; a real
+mismatch still blocks in `block` mode.
+
+### New status
+
+`needs_input` is a non-terminal pause: one validated question is waiting for a
+client answer. It is held by the work journal, is not returned by
+`final_status`, and is resolved with `resume_deepseek` plus the `option` shown
+by `deepseek_job_status`. Declining a reviewer question ends `ok_unreviewed`
+with `review_declined_by_user=true` and `quality_score=null`.

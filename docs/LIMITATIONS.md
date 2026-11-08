@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.11.0)
+# Known limitations and failure modes (3.12.0)
 
 Only limitations that remain in this version are listed here.
 
@@ -9,7 +9,10 @@ Only limitations that remain in this version are listed here.
 | Windows | Windows behaviour is exercised with fakes and the CI matrix; it has not had the same manual field use as macOS. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Report a failing case with the run id. |
 | Resume | Resume can only continue from a checkpoint boundary. Work done by a DSH process killed mid-tool-call is repeated. | Skeleton and checkpoints are written before each phase; finished revisions are reused. |
 | Live scaling | The candidate score is a deterministic heuristic, not a model review. It can misjudge unusually formatted output. | Threshold, max extra waves and the whole-job budget are configurable; set `live_scaling=false` to disable. |
-| Reviewer | By default the reviewer is a fresh Harness process that uses the same provider and model family as the builder. A separately configured reviewer wrapper can use another vendor (see `docs/REVIEWER.md`). | Treat the default `REVIEW.md` as independent-in-process, not independent-in-model. |
+| Reviewer | The reviewer is a fresh Harness process; `reviewer_model`/`reviewers` can put it on another vendor, but a legacy `dsh_bin` wrapper that does not set a vendor label is fail-closed and pauses once. | Configure `reviewers` (see `docs/REVIEWER.md`); the same-vendor question is explicit and labelled. |
+| Mixed models | A child model override inside the parent `workflow` cannot be enforced or killed mid-flight by the connector. `MODEL_AUDIT.json` evidence is cross-checked, but unsupported overrides degrade to `unverified`, never `verified`. | Use `model_plan_enforcement="strict"` to stop rather than degrade; pin the whole-job cost ceiling. |
+| Model prices | A model with no `model_prices`/`reviewer_prices` row and no built-in price has unknown cost. | Record the price row; the run keeps `cost_known=false` and never fabricates a number. |
+| Backup builder | One switch per run, never recursive; a backup cannot start after the failed builder wrote files. | Inspect `run["backup_builder"]`; the header names the class and model. |
 | Traces | Export is optional and best effort. A broken OTLP/Langfuse endpoint is logged; it never fails the run. | Traces and timelines remain on disk under the state directory. |
 | Retention | Cleanup is off by default (`retention_days=0`) and never removes the newest `keep_runs`/`keep_jobs`. | Use `deepseek_maintenance` with `dry_run` first. |
 | Browser | `take_screenshot` needs an installed Chrome/Edge or an OS screenshot helper and, on macOS, Screen Recording permission. | Returns `unsupported` with the missing dependency; it does not install anything. |

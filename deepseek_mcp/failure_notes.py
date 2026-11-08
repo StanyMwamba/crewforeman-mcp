@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - api is available in supported builds
     def redact_secrets(text):
         return str(text or "")
 
-VERSION = 1
+VERSION = 2
 TASK_TYPES = ("simple", "code", "creative", "research", "unknown")
 _ALIASES = {
     "document": "creative",
@@ -47,6 +47,9 @@ DEFAULTS = {
     "failure_notes_min_occurrences": 2,
     "failure_notes_max_store": 200,
     "failure_notes_store": "",
+    "failure_notes_models": "on",
+    "failure_notes_max_models": 6,
+    "failure_notes_model_min_runs": 2,
 }
 _SEEN_CAP = 512
 _MIN_WEIGHT = 0.05
@@ -69,6 +72,8 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b")
 _ABS_PATH_RE = re.compile(r"^(~|[a-z]:[\\/]|/|\\\\)", re.IGNORECASE)
 _SIG_RE = re.compile(r"^sig:[0-9a-f]{12}$")
 _TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
+_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
+_MODEL_GLOBAL_CAP = 48
 
 
 def _bucket_labels():
@@ -86,7 +91,8 @@ _BUCKETS = _bucket_labels()
 
 
 def _empty():
-    return {"version": VERSION, "task_types": {}, "seen": {}, "updated": ""}
+    return {"version": VERSION, "task_types": {}, "model_stats": {},
+            "seen": {}, "model_seen": {}, "updated": ""}
 
 
 def _cfg(cfg, name, default):
@@ -114,6 +120,13 @@ def _int_cfg(cfg, name, default, minimum=0):
         return max(minimum, int(_cfg(cfg, name, default)))
     except (TypeError, ValueError):
         return default
+
+
+def _models_enabled(cfg):
+    value = _cfg(cfg, "failure_notes_models", "on")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("off", "0", "false", "no", "disabled")
 
 
 def _float_cfg(cfg, name, default, minimum):
@@ -236,6 +249,94 @@ def _normalise_label(raw):
     return "sig:" + hashlib.sha256(lower.encode("utf-8")).hexdigest()[:12]
 
 
+def _model_label(raw):
+    """Sanitize a provider/model label; return ``None`` when unsafe."""
+    try:
+        text = _redacted(str(raw or "")).strip()
+    except Exception:
+        return None
+    if not text or len(text) > 80:
+        return None
+    lower = text.lower()
+    if ("://" in lower or lower.startswith("www.") or "@" in text
+            or "\\" in text or ".." in text or "\x00" in text):
+        return None
+    if re.search(r"[\x00-\x1f\x7f\s]", text):
+        return None
+    if _URL_RE.search(lower) or _EMAIL_RE.search(lower):
+        return None
+    if _ABS_PATH_RE.match(text) or text.startswith("/") or text.startswith("~"):
+        return None
+    if text.count("/") > 1 or not _MODEL_RE.match(text):
+        return None
+    return text
+
+
+def _coerce_model_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+    try:
+        runs = max(0, int(entry.get("runs") or 0))
+        weight = float(entry.get("weight") or 0.0)
+        scored_runs = max(0, int(entry.get("scored_runs") or 0))
+        score_sum = float(entry.get("score_sum") or 0.0)
+        blocking = max(0, int(entry.get("blocking") or 0))
+        cost_sum = float(entry.get("cost_sum") or 0.0)
+        cost_known_runs = max(0, int(entry.get("cost_known_runs") or 0))
+    except (TypeError, ValueError):
+        return None
+    values = (weight, score_sum, cost_sum)
+    if any(value < 0 or value != value for value in values):
+        return None
+    last_seen = _parse_time(entry.get("last_seen"))
+    first_seen = _parse_time(entry.get("first_seen")) or last_seen
+    if last_seen is None:
+        return None
+    return {
+        "runs": runs, "weight": weight, "scored_runs": scored_runs,
+        "score_sum": score_sum, "blocking": blocking,
+        "cost_sum": cost_sum, "cost_known_runs": cost_known_runs,
+        "first_seen": _iso(first_seen or last_seen),
+        "last_seen": _iso(last_seen),
+    }
+
+
+def _prune_models(data, cfg, now):
+    """Decay model rows, drop weight < .05, cap per type and globally."""
+    half_life = _half_life(cfg)
+    per_type = _int_cfg(cfg, "failure_notes_max_models", 6)
+    kept = []
+    for task_type, models in (data.get("model_stats") or {}).items():
+        if not isinstance(models, dict):
+            continue
+        for label, entry in models.items():
+            clean = _stored_model_key(label)
+            coerced = _coerce_model_entry(entry)
+            if clean is None or coerced is None:
+                continue
+            decayed = _decay_entry(coerced, now, half_life)
+            if decayed.get("weight", 0.0) >= _MIN_WEIGHT:
+                kept.append((task_type, clean, decayed))
+    kept.sort(key=lambda row: (-float(row[2].get("weight") or 0.0),
+                               -int(row[2].get("runs") or 0),
+                               -( _parse_time(row[2].get("last_seen"))
+                                  or dt.datetime.min.replace(
+                                      tzinfo=dt.timezone.utc)).timestamp(),
+                               row[0], row[1]))
+    clean_types = {}
+    for task_type, label, entry in kept[:_MODEL_GLOBAL_CAP]:
+        bucket = clean_types.setdefault(task_type, {})
+        if len(bucket) < per_type:
+            bucket[label] = entry
+    data["model_stats"] = clean_types
+    return data
+
+
+def _stored_model_key(value):
+    text = str(value or "").strip()
+    return text if _MODEL_RE.match(text) and _model_label(text) == text else None
+
+
 def _stored_key(value):
     text = str(value or "").strip().lower()
     if text in _BUCKETS:
@@ -311,12 +412,13 @@ def _coerce_entry(key, entry):
 
 
 def _coerce_store(data):
-    if not isinstance(data, dict) or data.get("version") != VERSION:
+    if not isinstance(data, dict) or data.get("version") not in (1, VERSION):
         raise ValueError("bad failure notes schema")
     task_types = data.get("task_types")
     seen = data.get("seen")
     if not isinstance(task_types, dict) or not isinstance(seen, dict):
         raise ValueError("bad failure notes schema")
+    is_v1 = data.get("version") == 1
     clean_types = {}
     for task_type, kinds in task_types.items():
         key = _task_type(task_type)
@@ -337,10 +439,38 @@ def _coerce_store(data):
         when = _parse_time(stamp)
         if _TOKEN_RE.match(text) and when is not None:
             clean_seen[text] = _iso(when)
+    clean_models = {}
+    clean_model_seen = {}
+    if not is_v1:
+        model_stats = data.get("model_stats")
+        if isinstance(model_stats, dict):
+            for task_type, models in model_stats.items():
+                key = _task_type(task_type)
+                if key == "unknown" and str(task_type).strip().lower() != "unknown":
+                    continue
+                if not isinstance(models, dict):
+                    continue
+                bucket = clean_models.setdefault(key, {})
+                for label, entry in models.items():
+                    clean = _stored_model_key(label)
+                    coerced = _coerce_model_entry(entry)
+                    if clean is not None and coerced is not None:
+                        bucket[clean] = coerced
+                if not bucket:
+                    clean_models.pop(key, None)
+        raw_model_seen = data.get("model_seen")
+        if isinstance(raw_model_seen, dict):
+            for token, stamp in raw_model_seen.items():
+                text = str(token or "")
+                when = _parse_time(stamp)
+                if _TOKEN_RE.match(text) and when is not None:
+                    clean_model_seen[text] = _iso(when)
     return {
         "version": VERSION,
         "task_types": clean_types,
+        "model_stats": clean_models,
         "seen": clean_seen,
+        "model_seen": clean_model_seen,
         "updated": str(data.get("updated") or ""),
     }
 
@@ -467,6 +597,7 @@ def _prune_nested(data, cfg, now):
     for _weight, _count, _when, task_type, kind, entry in ranked:
         clean.setdefault(task_type, {})[kind] = entry
     data["task_types"] = clean
+    _prune_models(data, cfg, now)
     data["updated"] = _iso(now)
     return data
 
@@ -540,9 +671,91 @@ def record(task_type, kinds, run_id, round_no, cfg, now=None):
                     bucket[label] = decayed
                 _prune_nested(data, cfg, when)
                 data["seen"] = _trim_seen(data.get("seen", {}), token, when)
+                # Defect-only stores keep the 3.11 version so old readers can
+                # still consume them; model learning upgrades the store to v2.
+                if not data.get("model_stats") and not data.get("model_seen"):
+                    data["version"] = 1
                 _write(path, data)
                 result["written"] = True
                 result["recorded"] = len(labels)
+                return result
+        except _LockTimeout:
+            result["skipped"] = "lock_timeout"
+            return result
+    except Exception:
+        result["written"] = False
+        return result
+
+
+def record_model_run(task_type, model, utility, score, cost, cost_known,
+                     run_id, cfg, now=None):
+    """Record one model outcome idempotently by ``(run_id, "model")``."""
+    result = {"written": False, "recorded": 0}
+    try:
+        if not (_enabled(cfg) and _models_enabled(cfg)):
+            return result
+        label = _model_label(model)
+        if label is None:
+            return result
+        tt = _task_type(task_type)
+        if tt == "unknown" and str(task_type).strip().lower() != "unknown":
+            return result
+        when = _now(now)
+        path = _store_path(cfg)
+        token = _token(run_id, "model")
+        try:
+            with _Lock(_lock_path(path)):
+                data = _read(path)
+                if token in data.get("model_seen", {}):
+                    result["duplicate"] = True
+                    return result
+                half_life = _half_life(cfg)
+                bucket = data["model_stats"].setdefault(tt, {})
+                entry = bucket.get(label)
+                if entry is None:
+                    entry = {"runs": 0, "weight": 0.0, "scored_runs": 0,
+                             "score_sum": 0.0, "blocking": 0, "cost_sum": 0.0,
+                             "cost_known_runs": 0, "first_seen": _iso(when),
+                             "last_seen": _iso(when)}
+                decayed = _decay_entry(entry, when, half_life)
+                decayed["runs"] = int(decayed.get("runs") or 0) + 1
+                decayed["weight"] = float(decayed.get("weight") or 0.0) + 1.0
+                if score is not None:
+                    try:
+                        decayed["scored_runs"] = int(
+                            decayed.get("scored_runs") or 0) + 1
+                        decayed["score_sum"] = (float(
+                            decayed.get("score_sum") or 0.0) + float(score))
+                    except (TypeError, ValueError):
+                        pass
+                if cost_known and cost is not None:
+                    try:
+                        decayed["cost_sum"] = (float(
+                            decayed.get("cost_sum") or 0.0) + float(cost))
+                        decayed["cost_known_runs"] = int(
+                            decayed.get("cost_known_runs") or 0) + 1
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    target = float(getattr(quality, "DEFAULT_QUALITY_TARGET", 8.0))
+                except (TypeError, ValueError):
+                    target = 8.0
+                if utility is not None:
+                    try:
+                        if float(utility) < target:
+                            decayed["blocking"] = int(
+                                decayed.get("blocking") or 0) + 1
+                    except (TypeError, ValueError):
+                        pass
+                decayed["first_seen"] = entry.get("first_seen") or _iso(when)
+                bucket[label] = decayed
+                _prune_nested(data, cfg, when)
+                data["model_seen"] = _trim_seen(
+                    data.get("model_seen", {}), token, when)
+                _write(path, data)
+                result["written"] = True
+                result["recorded"] = 1
+                result["model"] = label
                 return result
         except _LockTimeout:
             result["skipped"] = "lock_timeout"
@@ -635,6 +848,70 @@ def _store_counts(data, tt):
             "observations": observations}
 
 
+def _model_line(tt, cfg, data, now):
+    """Return the single bounded model sentence, or "" when none applies."""
+    try:
+        if not _models_enabled(cfg):
+            return ""
+        min_runs = _int_cfg(cfg, "failure_notes_model_min_runs", 2, 1)
+        max_models = _int_cfg(cfg, "failure_notes_max_models", 6)
+        bucket = (data.get("model_stats") or {}).get(tt) or {}
+        rows = []
+        for label, entry in bucket.items():
+            if _stored_model_key(label) is None:
+                continue
+            runs = int(entry.get("runs") or 0)
+            scored = int(entry.get("scored_runs") or 0)
+            if runs < min_runs or scored <= 0:
+                continue
+            mean_score = float(entry.get("score_sum") or 0.0) / scored
+            known = int(entry.get("cost_known_runs") or 0)
+            mean_cost = (float(entry.get("cost_sum") or 0.0) / known
+                         if known else None)
+            rows.append((mean_score, runs, label, mean_cost))
+        if not rows or max_models <= 0:
+            return ""
+        rows.sort(key=lambda row: (-row[0], -row[1], row[2]))
+        mean_score, runs, label, mean_cost = rows[0]
+        utility = mean_score
+        cost_text = ("$%.4f" % mean_cost if mean_cost is not None else "n/a")
+        return ("Model: %s mean utility %.2f, mean cost %s (%d runs)."
+                % (label, utility, cost_text, runs))
+    except Exception:
+        return ""
+
+
+def _model_meta_rows(tt, cfg, data, now):
+    try:
+        max_models = _int_cfg(cfg, "failure_notes_max_models", 6)
+        bucket = (data.get("model_stats") or {}).get(tt) or {}
+        half_life = _half_life(cfg)
+        rows = []
+        for label, entry in bucket.items():
+            if _stored_model_key(label) is None:
+                continue
+            decayed = _decay_entry(entry, now, half_life)
+            runs = int(decayed.get("runs") or 0)
+            scored = int(decayed.get("scored_runs") or 0)
+            known = int(decayed.get("cost_known_runs") or 0)
+            rows.append({
+                "model": label,
+                "runs": runs,
+                "mean_utility": (round(float(decayed.get("score_sum") or 0.0)
+                                       / scored, 2) if scored else None),
+                "mean_score": (round(float(decayed.get("score_sum") or 0.0)
+                                     / scored, 2) if scored else None),
+                "mean_cost": (round(float(decayed.get("cost_sum") or 0.0)
+                                    / known, 4) if known else None),
+                "cost_known_runs": known,
+            })
+        rows.sort(key=lambda row: (-(row["mean_utility"] or -1.0),
+                                   row["model"]))
+        return rows[:max(0, max_models)]
+    except Exception:
+        return []
+
+
 def _build_note(tt, cfg, now):
     data, candidates = _injectable(tt, cfg, now)
     max_bullets = _int_cfg(cfg, "failure_notes_max", 3)
@@ -656,6 +933,12 @@ def _build_note(tt, cfg, now):
         if len(candidate) > _NOTE_LIMIT:
             break
         text = candidate
+    if injected:
+        line = _model_line(tt, cfg, data, now)
+        if line:
+            candidate = text + "\n" + line
+            if len(candidate) <= _NOTE_LIMIT:
+                text = candidate
     return text, injected, data
 
 
@@ -686,13 +969,14 @@ def note_meta(task_type, cfg, now=None):
             "injected": injected,
             "note_chars": len(text) if injected else 0,
             "store_counts": _store_counts(data, tt),
+            "models": _model_meta_rows(tt, cfg, data, when),
             "updated": _iso(when),
         }
     except Exception:
         return {"task_type": tt, "injected": [], "note_chars": 0,
                 "store_counts": {"total": 0, "task_type": 0,
                                  "observations": 0},
-                "updated": ""}
+                "models": [], "updated": ""}
 
 
 def _round_number(entry, index):

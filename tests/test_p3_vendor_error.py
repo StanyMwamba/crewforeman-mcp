@@ -124,8 +124,13 @@ class RunLevelVendorTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, env, clear=False):
                 cfg = load_config(config_path=root / "config.json", env=env)
-                cfg._values.update({"dsh_provider": "kimi",
-                                    "dsh_model": "kimi-k2"})
+                # 3.12.0: the reviewer is selected independently of the
+                # builder. Keep the builder on DeepSeek and route a Kimi
+                # wrapper candidate so the same-vendor rule does not pause.
+                cfg._values["reviewers"] = [{
+                    "name": "kimi", "vendor": "Kimi (Moonshot)",
+                    "dsh_bin": str(fake),
+                }]
                 _text, run, _path = harness.run_harness(args, cfg)
         self.assertEqual(run["builder"]["status"], "ok")
         self.assertIsNotNone(run.get("review_error"))

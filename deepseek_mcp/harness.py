@@ -28,19 +28,27 @@ from . import checkpoints
 from . import health
 from . import concurrency
 from . import events as events_mod
+from . import failure_notes as failure_notes_mod
 from . import observability
 from . import platforms
 from . import progress
 from . import render
+from . import model_overlay
+from . import model_policy
+from . import model_usage as model_usage_mod
+from . import path_scope
 from . import review_context
 from . import review_progress as review_progress_mod
 from . import reviewer_backup as reviewer_backup_mod
+from . import reviewer_vendor
 from . import safety
 from . import scaling
+from . import slices as slices_mod
 from . import spend as spend_mod
 from . import status as status_mod
 from . import transport as transport_mod
 from . import work as work_mod
+from . import builder_backup
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
                       build_review_task, build_revision_task,
                       build_score_reprompt_task, choose_agents,
@@ -64,6 +72,11 @@ STOP_GRACE_SECONDS = 2.0
 # long: a grandchild may flush one last event, but a silent or flooding
 # grandchild must never hold the reader open indefinitely.
 EXIT_DRAIN_SECONDS = 1.0
+# A reviewer's background child may still be writing its session log when the
+# direct child exits, so its final activity scan is delayed by one short
+# settle window.  Product runs keep the proven 1 s window; the unit suite
+# compresses it because its fake children write synchronously before exiting.
+REVIEWER_ACTIVITY_SETTLE_SECONDS = 1.0
 # A rescue finisher is deliberately short, and never gets zero seconds just
 # because the builder used the whole per-process max_seconds budget.
 FINISHER_MAX_SECONDS = 480.0
@@ -909,6 +922,12 @@ def _result_text(run, path):
     retry = run.get("builder_retry") or {}
     if retry and retry.get("status") != "skipped":
         head += " | retried once: %s" % (retry.get("reason") or "transient")
+    backup_builder = run.get("backup_builder") or {}
+    if backup_builder.get("used"):
+        head += " | backup builder: %s/%s (main failed: %s)" % (
+            backup_builder.get("vendor") or "unknown",
+            backup_builder.get("model") or "unknown",
+            backup_builder.get("reason_class") or "none")
     if run.get("subagents"):
         head += " | subagents %d (%s, concurrency %s)" % (
             run["subagents"], run.get("subagent_reason") or "", run.get("concurrency", "?"))
@@ -925,7 +944,9 @@ def _result_text(run, path):
             if run.get("self_score") is not None:
                 head += " | self_score %.2f/10" % run["self_score"]
             head += " | review rounds %s" % run.get("quality_rounds_used", 0)
-            if run.get("reviewed_by") == "backup":
+            if run.get("review_header"):
+                head += " | " + str(run.get("review_header"))
+            elif run.get("reviewed_by") == "backup":
                 head += " | " + (
                     run.get("reviewed_by_line")
                     or "Reviewed by: backup (unknown/unknown)")
@@ -933,6 +954,8 @@ def _result_text(run, path):
             head += " (QUALITY_REPORT.md missing)"
         if run.get("review_status") == "error":
             head += " (review error: %s)" % (run.get("review_error") or "unknown")
+        if run.get("review_declined_by_user"):
+            head += " | review declined by user"
     metrics = run.get("metrics") or {}
     metric_bits = []
     if metrics.get("slices_overlap_warnings"):
@@ -1255,7 +1278,8 @@ def _stash_old(workspace, name, run_id, round_no=None):
 def _noise_output(rel):
     low = str(rel).replace("\\", "/").lower()
     base = low.rsplit("/", 1)[-1]
-    if "/.dsh-tmp-" in "/" + low or base.startswith(".chrome-probe-"):
+    if ("/.dsh-tmp-" in "/" + low or "/.dsh-model-overlay-" in "/" + low
+            or base.startswith(".chrome-probe-")):
         return True
     return (base.startswith(("quality_report.previous-", "review.previous-", ".fake"))
             or base in (".ds_store",) or base.endswith((".pyc", ".pyo", ".tmp")))
@@ -1264,7 +1288,7 @@ def _noise_output(rel):
 def _deliverable_files(workspace, output_files):
     """Filter builder/revision outputs down to reviewable deliverables."""
     excluded_names = {"quality_report.md", "review.md", "review.partial.md",
-                      "review.partial.json"}
+                      "review.partial.json", "model_audit.json"}
     excluded_prefixes = ("quality_report.previous-", "review.previous-",
                          "review.partial", ".fake",
                          ".git/", "__pycache__/", ".ds_store")
@@ -1278,6 +1302,8 @@ def _deliverable_files(workspace, output_files):
         if low.startswith(excluded_prefixes) or "/__pycache__/" in low:
             continue
         if base.endswith((".pyc", ".pyo", ".tmp")):
+            continue
+        if "/.dsh-model-overlay-" in "/" + low:
             continue
         if rel not in files:
             files.append(rel)
@@ -1680,6 +1706,115 @@ def _append_score_to_review(workspace, score, blocking, report_text):
         return report_text
 
 
+def _apply_model_competition(run, workspace, cfg, prompt, requested):
+    """Score per-slice candidate files and copy the winner over its target.
+
+    The builder owns candidate creation; the connector only scores files that
+    exist, records bounded evidence, and applies the highest score. A missing
+    audit or file is recorded as unverified, never guessed.
+    """
+    if not requested:
+        return
+    workspace = Path(workspace)
+    audit = None
+    try:
+        path = workspace / "MODEL_AUDIT.json"
+        if path.is_file() and path.stat().st_size <= 262144:
+            audit = json.loads(path.read_text(encoding="utf-8",
+                                               errors="replace"))
+    except Exception:
+        audit = None
+    audit_slices = {}
+    if isinstance(audit, dict):
+        for item in (audit.get("slices") or [])[:16]:
+            if isinstance(item, dict):
+                audit_slices[str(item.get("slice") or "")] = item
+    try:
+        plan = slices_mod.inspect(str(workspace))
+    except Exception:
+        plan = {}
+    targets = {}
+    for item in plan.get("slices") or []:
+        if isinstance(item, dict) and item.get("name") and item.get("files"):
+            name = str(item["name"]).strip()
+            targets.setdefault(name, str(item["files"][0]))
+            targets.setdefault(re.sub(r"(?i)^slice\s+", "", name),
+                               str(item["files"][0]))
+    run.setdefault("model_competition", {})
+    for name in sorted(requested):
+        models = requested[name]
+        audit_slice = audit_slices.get(name) or {}
+        rows = []
+        candidates = []
+        for index, model in enumerate(models[:8]):
+            spec = model if isinstance(model, dict) else {}
+            tag = "%s-%d" % (name, index + 1)
+            file_name = ""
+            for item in (audit_slice.get("candidates") or []):
+                if not isinstance(item, dict):
+                    continue
+                if (str(item.get("provider") or "") == str(
+                        spec.get("provider") or "")
+                        and str(item.get("model") or "") == str(
+                            spec.get("model") or "")):
+                    file_name = str(item.get("file") or "")
+                    tag = str(item.get("tag") or tag)
+                    break
+            if not file_name:
+                for pattern in ("candidates/%s--*.md" % name,
+                                "candidates/%s--*.py" % name,
+                                "candidates/%s--*" % name):
+                    found = sorted(workspace.glob(pattern))
+                    if found:
+                        file_name = str(found[0].relative_to(workspace))
+                        break
+            full = workspace / file_name if file_name else None
+            error = None if (full and full.is_file()) else "missing_candidate_file"
+            rows.append({"tag": tag, "provider": spec.get("provider", ""),
+                         "model": spec.get("model", ""), "file": file_name,
+                         "error": error})
+            if error is None:
+                candidates.append({"name": tag, "answer": "",
+                                   "files": [file_name], "error": None})
+        scored = scaling.score_candidates(
+            candidates, prompt, threshold=float(
+                cfg.get("live_scaling_threshold", 7.0) or 7.0))
+        by_name = {item.get("name"): item for item in scored.get(
+            "per_candidate") or [] if isinstance(item, dict)}
+        for row in rows:
+            row["score"] = (by_name.get(row["tag"]) or {}).get("score")
+        ranked = sorted(
+            [row for row in rows if row.get("score") is not None],
+            key=lambda row: (-float(row["score"]), row["tag"]))
+        winner = ranked[0] if ranked else None
+        target = targets.get(name)
+        applied = False
+        if winner and target:
+            source = workspace / winner["file"]
+            destination = workspace / target
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(str(source), str(destination))
+                applied = True
+            except Exception as exc:
+                run.setdefault("model_competition_errors", []).append(
+                    api.redact_secrets(str(exc))[:200])
+        record = {
+            "slice": name,
+            "winner": winner.get("tag") if winner else None,
+            "candidates": rows[:8],
+            "scored_by": "scaling.score_candidates",
+            "applied": applied,
+            "target": target,
+        }
+        run["model_competition"][name] = record
+        if winner:
+            label = "%s/%s" % (winner.get("provider") or "unknown",
+                               winner.get("model") or "unknown")
+            run.setdefault("model_competition_scores", []).append(
+                {"label": label, "score": winner.get("score")})
+
+
 def _apply_execution(run, execution, include_outputs=True):
     run.update(
         answer=execution.get("answer"),
@@ -2071,7 +2206,8 @@ def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
         "cost_known": cost is not None,
         "usage_unknown_reason": (
             None if cost is not None else "SDK live usage unavailable"),
-        "models": [cfg.get("dsh_model")] if cfg.get("dsh_model") else None,
+        "models": ([cfg.get("dsh_model")]
+                   if cfg.get("dsh_model") else None),
         "usage": usage if usage.get("input_tokens") is not None else None,
         "stalled": False, "stalled_step": None, "stall_elapsed": None,
         "stall_seconds": _stall_seconds(cfg),
@@ -2088,7 +2224,8 @@ def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
 
 def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                    session_id, started, output_slack, cancel_check=None,
-                   live_usage_cb=None, dsh_bin=None):
+                   live_usage_cb=None, dsh_bin=None, model_spec=None,
+                   patch=None):
     """Run one task through the documented SDK JSON-RPC transport.
 
     Returns an execution dict on success/failure, or ``{"_sdk_unavailable": ...}``
@@ -2098,7 +2235,12 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
     signals the process group through :class:`transport.Cancelled`.
     """
     dsh = Path(os.path.expanduser(dsh_bin or cfg.dsh_bin))
-    env = safety.scrubbed_env(keep=("DEEPSEEK_API_KEY",))
+    keep = ["DEEPSEEK_API_KEY"]
+    if model_spec is not None:
+        key_env = str(getattr(model_spec, "api_key_env", "") or "")
+        if key_env and key_env not in keep:
+            keep.append(key_env)
+    env = safety.scrubbed_env(keep=tuple(keep))
     env.setdefault("NO_COLOR", "1")
     env.update(safety.dsh_env(policy))
     reviewer_home = _reviewer_home(cfg, workspace, policy, label)
@@ -2114,8 +2256,11 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
         env["TMP"] = tmpdir
         env["TEMP"] = tmpdir
     extra_writes = [str(reviewer_home)] if reviewer_home else []
+    sdk_argv = [str(dsh), "--profile", "sdk"]
+    if patch:
+        sdk_argv += ["--patch", str(patch)]
     command, sandbox_meta = safety.wrap_command(
-        [str(dsh), "--profile", "sdk"], policy, workspace, tmpdir,
+        sdk_argv, policy, workspace, tmpdir,
         extra_writes=extra_writes,
         dsh_home=str(reviewer_home) if reviewer_home else None)
     client = None
@@ -2150,8 +2295,10 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
         result = client.run(
             task, timeout=float(limit) if limit else float(cfg.timeout),
             session_id=session_id, resume=bool(session_id),
-            provider=str(cfg.get("dsh_provider") or "deepseek-official"),
-            model=str(cfg.get("dsh_model") or "deepseek-flash"),
+            provider=str(getattr(model_spec, "provider", "")
+                         or cfg.get("dsh_provider") or "deepseek-official"),
+            model=str(getattr(model_spec, "model", "")
+                      or cfg.get("dsh_model") or "deepseek-flash"),
             reasoning_effort=str(cfg.get("reasoning") or "max"),
             cancel_check=cancel_check,
             usage_observer=(_observe_sdk_usage
@@ -2269,7 +2416,9 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
         "cost_source": "sdk_usage" if cost is not None else "unknown",
         "cost_known": cost is not None,
         "usage_unknown_reason": None if cost is not None else "SDK usage unavailable",
-        "models": [cfg.get("dsh_model")] if cfg.get("dsh_model") else None,
+        "models": ([str(getattr(model_spec, "model", "")
+                          or cfg.get("dsh_model"))]
+                   if (model_spec is not None or cfg.get("dsh_model")) else None),
         "usage": usage if usage.get("input_tokens") is not None else None,
         "stalled": False, "stalled_step": None, "stall_elapsed": None,
         "stall_seconds": _stall_seconds(cfg),
@@ -2301,7 +2450,9 @@ def _workspace_signature(workspace, limit=4000):
     try:
         for current, dirs, names in os.walk(str(workspace)):
             dirs[:] = [name for name in dirs
-                       if name not in skip_dirs and not name.startswith(".dsh-tmp-")]
+                       if name not in skip_dirs
+                       and not name.startswith((".dsh-tmp-",
+                                                ".dsh-model-overlay-"))]
             for name in names:
                 path = os.path.join(current, name)
                 rel = os.path.relpath(path, str(workspace)).replace("\\", "/")
@@ -2319,11 +2470,11 @@ def _workspace_signature(workspace, limit=4000):
     return tuple(sorted(entries))
 
 
-def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
-                  exclude_logs=None, clock=None, output_slack=2.0,
-                  policy=None, session_id=None, cancel_check=None,
-                  transport_name=None, add_dirs=None, live_usage_cb=None,
-                  dsh_bin=None):
+def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
+                       exclude_logs=None, clock=None, output_slack=2.0,
+                       policy=None, session_id=None, cancel_check=None,
+                       transport_name=None, add_dirs=None, live_usage_cb=None,
+                       dsh_bin=None, model_spec=None, patch=None):
     """Run one Harness process and return its parsed result.
 
     ``limit`` is a per-process wall-clock limit. ``clock`` is injectable for the
@@ -2343,7 +2494,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
                                     label, policy, session_id, started,
                                     output_slack, cancel_check=cancel_check,
                                     live_usage_cb=live_usage_cb,
-                                    dsh_bin=dsh_bin)
+                                    dsh_bin=dsh_bin, model_spec=model_spec,
+                                    patch=patch)
         if "_sdk_unavailable" not in sdk_result:
             sdk_result["sandbox"] = policy
             return sdk_result
@@ -2358,11 +2510,19 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
     # Permission is selected through the documented DSH_PERMISSION_MODE
     # deployment override; --permission-mode/--approval-policy/--add-dir are
     # rejected by its argument parser.
-    cmd = [str(dsh), "--profile", "headless", "--json"]
+    cmd = [str(dsh), "--profile", "headless"]
+    if patch:
+        cmd += ["--patch", str(patch)]
+    cmd += ["--json"]
     if session_id:
         cmd += ["--session-id", str(session_id)]
     cmd.append(task)
-    env = safety.scrubbed_env(keep=("DEEPSEEK_API_KEY",))
+    keep = ["DEEPSEEK_API_KEY"]
+    if model_spec is not None:
+        key_env = str(getattr(model_spec, "api_key_env", "") or "")
+        if key_env and key_env not in keep:
+            keep.append(key_env)
+    env = safety.scrubbed_env(keep=tuple(keep))
     env.setdefault("NO_COLOR", "1")
     env.update(safety.dsh_env(policy))
     # Chrome/macOS resolve temporary directories through TMPDIR.  Inside the
@@ -2757,7 +2917,7 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
         try:
             activity.scan()
             if _phase_kind(label) == "reviewer":
-                time.sleep(1.0)
+                time.sleep(REVIEWER_ACTIVITY_SETTLE_SECONDS)
             final_activity = activity.scan()
             child_state["active"] = int(final_activity.get("active") or 0)
             child_sessions_in_flight = bool(final_activity.get("changed"))
@@ -2884,6 +3044,73 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
 
 NO_BALANCE_MESSAGE = ("DeepSeek account balance is empty: top up at "
                       "platform.deepseek.com, then run the task again.")
+
+
+def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
+                  exclude_logs=None, clock=None, output_slack=2.0,
+                  policy=None, session_id=None, cancel_check=None,
+                  transport_name=None, add_dirs=None, live_usage_cb=None,
+                  dsh_bin=None, model_spec=None, patch=None, role=None):
+    """Execute one phase, creating and removing a model overlay when needed.
+
+    The default target is explicitly allowed to stay byte-identical to 3.11.0:
+    no overlay is generated when the requested target equals
+    ``(cfg.dsh_provider, cfg.dsh_model)``.  A per-execution overlay keeps the
+    file lifetime as short as possible and guarantees cleanup even on failure.
+    """
+    target = model_spec
+    if target is None:
+        try:
+            target = model_policy.resolve_target(cfg)
+        except Exception:
+            target = None
+    overlay = None
+    effective_patch = patch
+    try:
+        if (model_spec is not None
+                and not model_policy.is_default_target(model_spec, cfg)):
+            overlay = model_overlay.create_overlay(workspace, model_spec, cfg)
+            effective_patch = overlay.path
+        result = _execute_once_impl(
+            cfg, workspace, task, limit=limit, progress_cb=progress_cb,
+            label=label, exclude_logs=exclude_logs, clock=clock,
+            output_slack=output_slack, policy=policy, session_id=session_id,
+            cancel_check=cancel_check, transport_name=transport_name,
+            add_dirs=add_dirs, live_usage_cb=live_usage_cb, dsh_bin=dsh_bin,
+            model_spec=target, patch=effective_patch)
+        if isinstance(result, dict):
+            result["role"] = str(role or label)
+            if target is not None:
+                try:
+                    result["model_spec"] = target.as_dict()
+                    result["provider"] = target.provider
+                    result["vendor"] = target.vendor
+                except Exception:
+                    pass
+            if overlay is not None:
+                result["model_overlay"] = {
+                    "sha256": overlay.sha256,
+                    "provider": getattr(model_spec, "provider", ""),
+                    "model": getattr(model_spec, "model", ""),
+                }
+        return result
+    except Exception as exc:
+        return {
+            "status": "error", "answer": None, "exit_code": None,
+            "error": api.redact_secrets("model overlay/execution failed: %s"
+                                        % (exc,)),
+            "tools_used": {}, "events": 0, "output_files": [],
+            "seconds": 0.0, "stderr_tail": "", "session_logs": [],
+            "tokens_in": None, "cache_read_tokens": None, "tokens_out": None,
+            "total_tokens": None, "estimated_cost_usd": None,
+            "cost_source": "unknown", "cost_known": False,
+            "models": [getattr(target, "model", None)] if target else None,
+            "stalled": False, "timed_out": False, "stop_reason": "error",
+            "transport": "headless", "role": str(role or label),
+        }
+    finally:
+        if overlay is not None:
+            overlay.cleanup()
 
 
 def _is_no_balance(*executions):
@@ -3324,7 +3551,8 @@ def _finalize_work(run, cfg):
     text = run.get("answer")
     if text is None:
         text = run.get("error") or ""
-    convergence_attention = run.get("convergence_attention")
+    convergence_attention = (run.get("convergence_attention")
+                             or run.get("reviewer_attention"))
     if (log_obj is not None and events_mod.validate_attention(text) is None
             and isinstance(convergence_attention, dict)
             and convergence_attention.get("question")):
@@ -3405,7 +3633,9 @@ def _job_spec_for_checkpoint(run, args, workspace):
             "reviewer_sandbox", "transport", "add_dirs", "max_seconds",
             "job_max_seconds", "job_max_cost_usd", "live_scaling",
             "live_scaling_threshold", "live_scaling_max_extra_waves",
-            "review_preflight", "review_preflight_timeout")
+            "review_preflight", "review_preflight_timeout",
+            "builder_model", "builder_provider", "slice_models",
+            "model_candidates", "reviewer_model", "reviewer_provider")
     spec = {}
     for key in keys:
         if key in args:
@@ -4096,6 +4326,135 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         _finalize_work(run, cfg)
         raise RuntimeError(run["error"] + _saved_note(run, path))
 
+    # R1: resolve and validate the builder target before the first paid call.
+    # The default target is exactly (dsh_provider, dsh_model), so an empty
+    # configuration keeps the 3.11.0 argv byte-identical.
+    builder_target = None
+    slice_models = {}
+    model_candidates = {}
+    model_plan_section = None
+    model_plan_requested = bool(args.get("slice_models")
+                                or args.get("model_candidates")
+                                or cfg.get("slice_models"))
+    try:
+        explicit_target = bool(args.get("builder_provider")
+                               or args.get("builder_model"))
+        saved_target = args.get("_saved_builder_model")
+        if saved_target and not explicit_target:
+            builder_target = model_policy.ModelTarget(
+                provider=str(saved_target.get("provider") or ""),
+                model=str(saved_target.get("model") or ""),
+                vendor=str(saved_target.get("vendor") or ""),
+                base_url=str(saved_target.get("base_url") or ""),
+                api=str(saved_target.get("api") or ""),
+                api_key_env=str(saved_target.get("api_key_env")
+                                or "DEEPSEEK_API_KEY"),
+                source=str(saved_target.get("source") or "config"))
+        else:
+            builder_target = model_policy.resolve_target(
+                cfg, args.get("builder_provider") or "",
+                args.get("builder_model") or "",
+                source="job" if explicit_target else "config")
+        if saved_target and explicit_target:
+            if (str(saved_target.get("provider") or "")
+                    != builder_target.provider
+                    or str(saved_target.get("model") or "")
+                    != builder_target.model):
+                raise model_policy.BuilderModelError(
+                    "builder_model_changed_on_resume",
+                    "the resumed job's builder target differs from the "
+                    "recorded target")
+        raw_slices = args.get("slice_models")
+        if raw_slices is None:
+            raw_slices = cfg.get("slice_models") or {}
+        slice_models, slice_errors = model_policy.validate_slice_models(
+            cfg, raw_slices)
+        raw_candidates = args.get("model_candidates") or {}
+        model_candidates, candidate_errors = (
+            model_policy.validate_model_candidates(cfg, raw_candidates))
+        errors = list(slice_errors) + list(candidate_errors)
+        if errors:
+            raise model_policy.BuilderModelError(
+                errors[0].get("code") or "builder_model_invalid",
+                str(errors[0].get("message") or "invalid model plan"))
+        if model_candidates and args.get("job_max_cost_usd") is None:
+            run["model_plan_budget_warning"] = "no_whole_job_ceiling"
+        parent_entry = {
+            "role": "builder", "slice": None,
+            "provider": builder_target.provider,
+            "model": builder_target.model, "vendor": builder_target.vendor,
+            "source": builder_target.source, "verified": False,
+        }
+        run["builder_model"] = builder_target.as_dict()
+        run["builder_models"] = [parent_entry]
+        for name in sorted(slice_models):
+            entry = slice_models[name]
+            target = model_policy.resolve_target(
+                cfg, entry.get("provider", ""), entry.get("model", ""),
+                source="plan")
+            run["builder_models"].append({
+                "role": "slice", "slice": name,
+                "provider": target.provider, "model": target.model,
+                "vendor": target.vendor, "source": "plan",
+                "verified": False,
+            })
+        for name in sorted(model_candidates):
+            for index, entry in enumerate(model_candidates[name]):
+                target = model_policy.resolve_target(
+                    cfg, entry.get("provider", ""), entry.get("model", ""),
+                    source="plan")
+                run["builder_models"].append({
+                    "role": "competitor", "slice": name,
+                    "provider": target.provider, "model": target.model,
+                    "vendor": target.vendor, "source": "plan",
+                    "verified": False,
+                })
+        backup_model = str(cfg.get("backup_builder_model") or "").strip()
+        if backup_model:
+            backup_provider = str(cfg.get("backup_builder_provider") or "")
+            try:
+                backup_target = model_policy.resolve_target(
+                    cfg, backup_provider, backup_model, source="backup")
+                run["builder_models"].append({
+                    "role": "backup", "slice": None,
+                    "provider": backup_target.provider,
+                    "model": backup_target.model,
+                    "vendor": backup_target.vendor, "source": "backup",
+                    "verified": False,
+                })
+            except model_policy.BuilderModelError as exc:
+                run["backup_builder_model_error"] = exc.message
+        run["builder_models"] = run["builder_models"][:8]
+        if model_plan_requested:
+            model_plan_section = model_policy.build_model_plan_section(
+                builder_target, slice_models, model_candidates)
+            run["model_plan"] = {
+                "version": 1,
+                "status": "pending",
+                "parent": {"provider": builder_target.provider,
+                           "model": builder_target.model},
+                "midflight_kill": False,
+                "slices": [
+                    {"slice": name,
+                     "provider": slice_models[name]["provider"],
+                     "model": slice_models[name]["model"]}
+                    for name in sorted(slice_models)
+                ],
+                "enforcement": str(cfg.get("model_plan_enforcement")
+                                   or "warn"),
+            }
+            if (model_candidates and args.get("job_max_cost_usd") is None):
+                run["model_plan"]["budget_warning"] = "no_whole_job_ceiling"
+    except AttributeError:
+        # A very old/partial config namespace: keep the default path working.
+        builder_target = None
+    except model_policy.BuilderModelError as exc:
+        run.update(status="error", error="%s: %s" % (exc.code, exc.message),
+                   status_detail=exc.message, seconds=0)
+        path = save_run(run, cfg)
+        _finalize_work(run, cfg)
+        raise RuntimeError(run["error"] + _saved_note(run, path))
+
     # P2-1: one authority envelope authorizes every phase of this job. A direct
     # grant is opened only here; resume/rescue/reviewer/revision phases inherit
     # it as a continuation. The reviewer is read-only unless an operator
@@ -4413,6 +4772,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               project_map_hint=project_map_hint,
                               plan_block=plan_block,
                               failure_note=failure_note or None)
+    if model_plan_section:
+        task = task.rstrip() + "\n\n" + model_plan_section
     # The audit copy of the builder task must not duplicate the private map
     # body into the run record; the state directory owns that body.
     audit_task = task
@@ -4665,7 +5026,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 transport_name=run["transport"],
                                 session_id=args.get("resume_session_id"),
                                 cancel_check=cancel_check,
-                                live_usage_cb=live_cb)
+                                live_usage_cb=live_cb,
+                                model_spec=builder_target,
+                                role="builder")
         executions.append(builder)
         used_logs.update(builder.get("session_logs") or [])
         _cost_settle(run, cost_ledger, "builder", builder, job_budget,
@@ -4796,7 +5159,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             add_dirs=run["add_dirs"],
                             transport_name=run["transport"],
                             cancel_check=cancel_check,
-                            live_usage_cb=retry_live_cb)
+                            live_usage_cb=retry_live_cb,
+                            model_spec=builder_target,
+                            role="builder")
                         executions.append(retried)
                         used_logs.update(retried.get("session_logs") or [])
                         _cost_settle(run, cost_ledger, "builder-retry",
@@ -4811,6 +5176,127 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "limit_seconds": retry_limit,
                         }
                         builder = retried
+    backup_settings = builder_backup.configured(cfg)
+    if (backup_settings and args.get("_prior_builder") is None
+            and not builder_backup.uses_backup_once(
+                (run.get("backup_builder") or {}).get("used"))):
+        guard = builder_backup.side_effect_guard_result(
+            builder_before, workspace, builder.get("tools_used"))
+        attempts = 2 if (run.get("builder_retry") or {}).get(
+            "status") not in (None, "skipped") else 1
+        spent_before, known_before = _running_cost(executions)
+        whole_remaining = None
+        if job_budget.max_cost_usd is not None and known_before:
+            whole_remaining = max(
+                0.0, float(job_budget.max_cost_usd) - float(spent_before or 0.0))
+        decision = builder_backup.switch_decision(
+            builder, cfg, attempts=attempts, writes=not guard["clean"],
+            used=False, remaining_seconds=job_budget.remaining_seconds(),
+            ceiling=job_budget.max_cost_usd, spent=spent_before,
+            cost_known=known_before)
+        if decision.get("switch"):
+            backup_target = None
+            try:
+                backup_target = model_policy.resolve_target(
+                    cfg, backup_settings.get("provider") or "",
+                    backup_settings.get("model") or "", source="backup")
+            except model_policy.BuilderModelError as exc:
+                decision = {"switch": False,
+                            "reason_class": exc.code}
+            if decision.get("switch"):
+                ceiling = builder_backup.effective_ceiling(
+                    backup_settings.get("max_cost_usd"),
+                    whole_remaining, cost_known=known_before)
+                if ceiling is None or ceiling <= 0:
+                    decision = {"switch": False,
+                                "reason_class": ("cost_unknown"
+                                                 if ceiling is None
+                                                 else "budget")}
+            if decision.get("switch"):
+                admission = _cost_admit(
+                    run, cfg, cost_ledger, "builder-backup",
+                    run.get("subagents") or 1, job_budget.phase_limit(limit),
+                    job_budget)
+                if admission and admission.get("error"):
+                    decision = {"switch": False,
+                                "reason_class": "budget"}
+                    run["backup_builder"] = builder_backup.record(
+                        backup_target,
+                        decision.get("reason_class"),
+                        status="skipped", attempts=attempts,
+                        ceiling_usd=ceiling,
+                        main_error=builder.get("error") or "")
+                else:
+                    backup_live = None
+                    if job_budget.max_cost_usd is not None:
+                        try:
+                            backup_live = budget_mod.LiveCostGuard(
+                                limit=min(float(job_budget.max_cost_usd),
+                                          float(ceiling)),
+                                reserved=(admission or {}).get(
+                                    "estimate", {}).get("cost_usd") or 0.0,
+                                prior_committed=0.0, prior_known=True,
+                                model=backup_target.model)
+                        except Exception:
+                            backup_live = None
+
+                    def backup_cb(event, parsed, _guard=backup_live):
+                        if _guard is None:
+                            return None
+                        usage = _usage_from_event(event)
+                        if not usage:
+                            return None
+                        if _guard.observe(usage, _model_from_event(event)):
+                            return "budget"
+                        return None
+
+                    backup_exec = _execute_once(
+                        cfg, workspace, task,
+                        limit=job_budget.phase_limit(limit),
+                        progress_cb=progress_cb, label="builder backup",
+                        exclude_logs=used_logs, policy=builder_policy,
+                        add_dirs=run["add_dirs"],
+                        transport_name=run["transport"],
+                        cancel_check=cancel_check,
+                        live_usage_cb=backup_cb,
+                        model_spec=backup_target, role="backup_builder")
+                    executions.append(backup_exec)
+                    used_logs.update(backup_exec.get("session_logs") or [])
+                    _cost_settle(run, cost_ledger, "builder-backup",
+                                 backup_exec, job_budget,
+                                 operation_id=(admission or {}).get(
+                                     "reservation", {}).get("id"))
+                    settled = backup_exec.get("estimated_cost_usd")
+                    settled_known = bool(backup_exec.get("cost_known"))
+                    status_value = ("ok" if backup_exec.get("status") == "ok"
+                                    else "failed")
+                    run["backup_builder"] = builder_backup.record(
+                        backup_target, decision.get("reason_class"),
+                        status=status_value,
+                        main_error=builder.get("error") or "",
+                        attempts=attempts, ceiling_usd=ceiling,
+                        cost_usd=settled, cost_known=settled_known)
+                    if status_value == "ok":
+                        builder = backup_exec
+                        for entry in run.get("builder_models") or []:
+                            if entry.get("role") == "backup":
+                                entry["verified"] = True
+                    else:
+                        builder = backup_exec
+                        run["backup_builder_error"] = (
+                            builder_backup.error_message(backup_exec, cfg))
+                        run["error"] = run["backup_builder_error"]
+        elif decision.get("reason_class"):
+            run["backup_builder"] = builder_backup.record(
+                backup_settings, decision.get("reason_class"),
+                status="skipped", attempts=attempts,
+                main_error=builder.get("error") or "")
+    if model_candidates:
+        try:
+            _apply_model_competition(run, workspace, cfg, prompt,
+                                     model_candidates)
+        except Exception as exc:
+            run["model_competition_error"] = api.redact_secrets(str(exc))[:300]
     builder_health = _health_record(health_board, "builder", builder,
                                     label="builder")
     _health_attention(run, cfg, "builder", builder_health)
@@ -4843,6 +5329,53 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     stop_reason=builder.get("stop_reason"),
                     output_files=len(builder.get("output_files") or []))
     _apply_execution(run, builder)
+    if model_plan_requested:
+        # R2: the builder writes MODEL_AUDIT.json; the connector verifies the
+        # requested pairs against existing files and never invents a score.
+        audit_data = None
+        audit_path = Path(workspace) / "MODEL_AUDIT.json"
+        try:
+            if audit_path.is_file() and audit_path.stat().st_size <= 262144:
+                audit_data = json.loads(audit_path.read_text(
+                    encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            run["model_plan_audit_error"] = api.redact_secrets(str(exc))[:300]
+        requested = {}
+        for name in sorted(slice_models):
+            requested[name] = slice_models[name]
+        for name in sorted(model_candidates):
+            if name not in requested and model_candidates[name]:
+                requested[name] = model_candidates[name][0]
+        existing_files = list(run.get("output_files") or [])
+        existing_files += list(run.get("deliverable_files") or [])
+        audit_result = model_policy.validate_model_audit(
+            audit_data, cfg, requested, existing_files)
+        enforcement = str(cfg.get("model_plan_enforcement") or "warn")
+        run.setdefault("model_plan", {})["version"] = 1
+        run["model_plan"].update({
+            "status": audit_result.get("status"),
+            "slices": audit_result.get("slices") or [],
+            "unmatched": audit_result.get("unmatched") or [],
+            "audit_present": audit_data is not None,
+            "enforcement": enforcement,
+            "note": ("model plan verified" if audit_result.get("status") == "verified"
+                     else "model plan not verified; see model_plan"),
+        })
+        for entry in run.get("builder_models") or []:
+            if entry.get("role") == "builder":
+                entry["verified"] = audit_result.get("status") == "verified"
+        if audit_result.get("status") != "verified":
+            if enforcement == "strict":
+                run.update(status="error", stop_reason="model_plan_unverified",
+                           error="model plan was not executed as requested",
+                           status_detail="model_plan_unverified")
+                run["review_status"] = "disabled"
+                path = _save_terminal(run, cfg, history_runs, trace,
+                                      cancel_check)
+                raise RuntimeError(run["error"] + _saved_note(run, path))
+            run["degraded"] = True
+            run.setdefault("quality_findings", []).append(
+                "MODEL_PLAN_NOT_EXECUTED")
     # A live budget stop is an interruption.  Do not finish the builder phase
     # first: ``finish`` would mark it failed/done and ``interrupted()`` only
     # rewrites phases that are still running.  The budget branch below calls
@@ -5050,7 +5583,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 progress_cb=progress_cb, label="finisher", exclude_logs=used_logs,
                 output_slack=0.0, policy=rescue_policy,
                 add_dirs=run["add_dirs"], transport_name=run["transport"],
-                cancel_check=cancel_check, live_usage_cb=rescue_live_cb)
+                cancel_check=cancel_check, live_usage_cb=rescue_live_cb,
+                model_spec=builder_target, role="builder")
             executions.append(finisher)
             used_logs.update(finisher.get("session_logs") or [])
             _cost_settle(run, cost_ledger, "rescue", finisher, job_budget,
@@ -5360,7 +5894,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     progress_cb=progress_cb, label="wave %d builder" % wave_number,
                     exclude_logs=used_logs, policy=scaling_policy,
                     add_dirs=run["add_dirs"], transport_name=run["transport"],
-                    cancel_check=cancel_check, live_usage_cb=wave_live_cb)
+                    cancel_check=cancel_check, live_usage_cb=wave_live_cb,
+                    model_spec=builder_target, role="builder")
                 executions.append(extra)
                 used_logs.update(extra.get("session_logs") or [])
                 _cost_settle(run, cost_ledger, "live-wave", extra, job_budget,
@@ -5955,7 +6490,228 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 run["stop_reason"] = "budget"
                 run["status_detail"] = status_mod.STATUS_MEANING["budget_exceeded"]
                 start_round = rounds + 1
-        for round_no in range(start_round, rounds + 1):
+        # R5/R1b: choose the reviewer before any paid review. The selection
+        # itself is a READY preflight; first configured cross-vendor candidate
+        # that passes wins. A same-vendor candidate is never started silently.
+        selected_reviewer = None
+        selected_spec = None
+        reviewer_paused = False
+        reviewer_declined = False
+        reviewer_same_vendor = False
+        legacy_reviewer_mode = False
+        try:
+            target_specs = []
+            if isinstance(run.get("builder_model"), dict):
+                target_specs.append(run["builder_model"])
+            for entry in run.get("builder_models") or []:
+                if isinstance(entry, dict):
+                    target_specs.append(entry)
+            builder_vendors, vendor_unknown = reviewer_vendor.builder_vendor_set(
+                cfg, targets=target_specs, run=run)
+            run["builder_vendors"] = builder_vendors
+            candidates = list(reviewer_vendor.legacy_candidates(cfg))
+            if cfg.get("reviewers") and (cfg.get("backup_dsh_bin")
+                                         or cfg.get("reviewer_vendor")
+                                         or cfg.get("reviewer_model")):
+                run["reviewer_config_legacy_ignored"] = True
+            job_provider = str(args.get("reviewer_provider")
+                               or cfg.get("reviewer_provider") or "").strip()
+            job_model = str(args.get("reviewer_model")
+                            or cfg.get("reviewer_model") or "").strip()
+            if job_model:
+                job_vendor = (str(cfg.get("reviewer_vendor") or "").strip()
+                              or reviewer_vendor.canonical_vendor(job_provider)
+                              or reviewer_vendor.canonical_vendor(job_model)
+                              or "unknown")
+                candidates.insert(0, {
+                    "name": "job-reviewer", "vendor": job_vendor,
+                    "provider": job_provider, "model": job_model,
+                    "dsh_bin": str(cfg.get("dsh_bin") or ""),
+                    "patch": "", "api_key_env": "", "enabled": True,
+                    "legacy_wrapper": False, "error": None,
+                })
+
+            def _spec_for(candidate):
+                provider = str(candidate.get("provider") or "")
+                model = str(candidate.get("model") or "")
+                if not model:
+                    # A legacy wrapper may carry only a provider label; it
+                    # loads its own key/profile, so do not synthesize a target.
+                    return None
+                return model_policy.resolve_target(
+                    cfg, provider, model, source="reviewer",
+                    allow_legacy=True)
+
+            def _preflight(candidate):
+                spec = None
+                try:
+                    spec = _spec_for(candidate)
+                except model_policy.BuilderModelError as exc:
+                    return {"status": "error", "error": exc.code,
+                            "answer": None}
+                try:
+                    result = _execute_once(
+                        cfg, workspace,
+                        ("Reply with exactly READY and nothing else. Do not use "
+                         "tools, do not read or write files, do not run commands."),
+                    limit=max(1.0, min(float(cfg.get("review_preflight_timeout",
+                                                     45.0) or 45.0),
+                                       float(job_budget.remaining_seconds()
+                                             or 45.0))),
+                    progress_cb=progress_cb,
+                    label="reviewer selection preflight",
+                    exclude_logs=used_logs, policy=reviewer_policy,
+                    add_dirs=run["add_dirs"],
+                    transport_name=run["transport"],
+                    cancel_check=cancel_check,
+                    dsh_bin=(candidate.get("dsh_bin") or None),
+                    patch=(candidate.get("patch") or None),
+                        model_spec=spec, role="reviewer")
+                except BaseException:
+                    raise
+                reviewer_executions.append(result)
+                used_logs.update(result.get("session_logs") or [])
+                return result
+
+            pending = (run.get("reviewer_attention")
+                       or args.get("_saved_reviewer_attention"))
+            if pending and (args.get("attention_option")
+                            or args.get("attention_answer")):
+                kind, chosen = reviewer_vendor.resolve_choice(
+                    pending, answer=args.get("attention_answer"),
+                    option=args.get("attention_option"))
+                if kind == "decline":
+                    reviewer_declined = True
+                elif kind == "same_vendor" and isinstance(chosen, dict):
+                    label = "%s/%s" % (chosen.get("vendor"), chosen.get("model"))
+                    for candidate in candidates:
+                        match = "%s/%s" % (
+                            reviewer_vendor.canonical_vendor(
+                                candidate.get("vendor")) or "unknown",
+                            candidate.get("model") or "unknown")
+                        if match == label:
+                            selected_reviewer = candidate
+                            reviewer_same_vendor = True
+                            break
+                    if selected_reviewer is None:
+                        reviewer_paused = True
+                        run["reviewer_attention"] = pending
+            legacy_reviewer_mode = not bool(cfg.get("reviewers")) and not job_model
+            if not reviewer_declined and selected_reviewer is None and not reviewer_paused:
+                if vendor_unknown:
+                    reviewer_paused = True
+                    run["reviewer_attention"] = reviewer_vendor.build_attention(
+                        candidates, builder_vendors, round_no=start_round,
+                        policy=str(cfg.get("reviewer_same_vendor_policy")
+                                   or "ask"))
+                    run["reviewer_attention_reason"] = "builder_vendor_unknown"
+                elif legacy_reviewer_mode:
+                    # 3.11 compatibility: a legacy dsh_bin wrapper (and its
+                    # optional backup_dsh_bin) keeps its existing main-then-
+                    # backup preflight flow, but only when the configured
+                    # wrapper vendor is known and differs from every builder.
+                    main_candidate = next(
+                        (item for item in candidates
+                         if item.get("name") == "main"), candidates[0])
+                    main_vendor = reviewer_vendor.canonical_vendor(
+                        main_candidate.get("vendor"))
+                    if (main_vendor is None
+                            or main_vendor in set(builder_vendors)):
+                        reviewer_paused = True
+                        run["reviewer_attention"] = (
+                            reviewer_vendor.build_attention(
+                                candidates, builder_vendors,
+                                round_no=start_round,
+                                policy=str(cfg.get(
+                                    "reviewer_same_vendor_policy") or "ask")))
+                        run["reviewer_attention_reason"] = (
+                            "builder_vendor_unknown" if main_vendor is None
+                            else "same_vendor_reviewer")
+                    else:
+                        selected_reviewer = main_candidate
+                        run["reviewer_choice"] = {
+                            "status": "selected",
+                            "vendor": main_vendor,
+                            "model": main_candidate.get("model"),
+                            "same_vendor": False,
+                            "chosen_by_user": False,
+                            "reason": "legacy_wrapper",
+                        }
+                        # Keep the 3.11 header/result shape for legacy runs.
+                        run["reviewed_by"] = "main"
+                else:
+                    selected = reviewer_vendor.select_candidate(
+                        candidates, builder_vendors, _preflight,
+                        policy=str(cfg.get("reviewer_same_vendor_policy")
+                                   or "ask"),
+                        max_preflights=int(cfg.get("reviewer_max_preflights",
+                                                   8) or 8))
+                    run["reviewer_config_errors"] = (
+                        reviewer_vendor.reviewer_config_errors(
+                            selected.get("candidates") or []))
+                    if selected.get("status") == "selected":
+                        selected_reviewer = selected.get("candidate")
+                    else:
+                        reviewer_paused = True
+                        run["reviewer_attention"] = selected.get("attention")
+            if reviewer_declined:
+                review_status = "declined"
+                run["review_declined_by_user"] = True
+                run["review_status"] = "declined"
+                review_error = "review declined by user"
+            elif reviewer_paused:
+                review_status = "paused"
+                run["status"] = "needs_input"
+                run["review_status"] = "paused"
+                run["review_in_flight"] = False
+                run["reviewer_choice"] = {
+                    "status": "paused",
+                    "same_vendor": False,
+                    "chosen_by_user": False,
+                    "reason": run.get("reviewer_attention_reason")
+                    or "no_cross_vendor_reviewer",
+                    "candidates": (run.get("reviewer_attention") or {}).get(
+                        "evidence", {}).get("candidates", []),
+                }
+                _persist(run, cfg, "reviewer-paused")
+            elif selected_reviewer is not None:
+                reviewer_vendor.assert_reviewer_eligible(
+                    selected_reviewer, builder_vendors,
+                    chosen_by_user=reviewer_same_vendor,
+                    same_vendor=reviewer_same_vendor)
+                selected_spec = _spec_for(selected_reviewer)
+                run["reviewer_choice"] = {
+                    "status": "selected",
+                    "vendor": reviewer_vendor.canonical_vendor(
+                        selected_reviewer.get("vendor")),
+                    "model": selected_reviewer.get("model"),
+                    "same_vendor": bool(reviewer_same_vendor),
+                    "chosen_by_user": bool(reviewer_same_vendor),
+                    "reason": None,
+                }
+                if not legacy_reviewer_mode:
+                    run["review_header"] = reviewer_vendor.review_header(
+                        selected_reviewer,
+                        same_vendor_choice=reviewer_same_vendor)
+                run["reviewed_by"] = "main"
+        except reviewer_vendor.ReviewerVendorConflict as exc:
+            reviewer_paused = True
+            run["status"] = "needs_input"
+            run["reviewer_attention"] = reviewer_vendor.build_attention(
+                candidates, builder_vendors, round_no=start_round,
+                policy=str(cfg.get("reviewer_same_vendor_policy") or "ask"))
+            run["reviewer_attention_reason"] = exc.reason
+            review_status = "paused"
+            run["review_status"] = "paused"
+            run["review_in_flight"] = False
+            _persist(run, cfg, "reviewer-paused")
+        except Exception as exc:
+            run["reviewer_choice_error"] = api.redact_secrets(str(exc))[:300]
+        if reviewer_paused:
+            start_round = rounds + 1
+        for round_no in (range(start_round, rounds + 1)
+                         if not reviewer_paused and not reviewer_declined
+                         else []):
             score_missing = False
             reused = prior_reviews.get(round_no) if round_no == skip_review_round else None
             if reused is not None:
@@ -6206,9 +6962,25 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 # A provider that cannot answer a one-word prompt must not be
                 # handed the paid review.
                 review_preflight_record = None
-                # 3.10.0: optional backup reviewer. Empty by default, so the
-                # historical single-reviewer path is byte-for-byte unchanged.
-                reviewer_backup = reviewer_backup_mod.configured(cfg)
+                # 3.12.0: the new reviewers[] path owns all candidate
+                # routing. Legacy dsh_bin installs keep the 3.11 main-then-
+                # backup flow, but only after the vendor gate above allowed it.
+                reviewer_backup = (reviewer_backup_mod.configured(cfg)
+                                   if legacy_reviewer_mode
+                                   and not reviewer_paused else None)
+                if reviewer_backup is not None:
+                    backup_candidate = reviewer_vendor.normalize_candidate({
+                        "name": "legacy-backup",
+                        "vendor": cfg.get("backup_reviewer_vendor") or "",
+                        "model": cfg.get("backup_reviewer_model") or "",
+                        "dsh_bin": reviewer_backup.get("bin") or "",
+                    }, cfg)
+                    try:
+                        reviewer_vendor.assert_reviewer_eligible(
+                            backup_candidate, run.get("builder_vendors") or [])
+                    except reviewer_vendor.ReviewerVendorConflict as exc:
+                        reviewer_backup = None
+                        run["reviewer_backup_blocked"] = exc.reason
                 review_backup_used = False
                 review_backup_reason = None
                 review_backup_dsh = None
@@ -6256,7 +7028,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             exclude_logs=used_logs, policy=reviewer_policy,
                             add_dirs=run["add_dirs"],
                             transport_name=run["transport"],
-                            cancel_check=cancel_check)
+                            cancel_check=cancel_check, role="reviewer",
+                            dsh_bin=((selected_reviewer or {}).get("dsh_bin")
+                                     or None),
+                            patch=((selected_reviewer or {}).get("patch")
+                                   or None),
+                            model_spec=selected_spec)
                         reviewer_executions.append(preflight)
                         used_logs.update(preflight.get("session_logs") or [])
                         _answered = (
@@ -6341,7 +7118,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 add_dirs=run["add_dirs"],
                                 transport_name=run["transport"],
                                 cancel_check=cancel_check,
-                                dsh_bin=reviewer_backup["bin"])
+                                dsh_bin=reviewer_backup["bin"],
+                                role="reviewer")
                             reviewer_executions.append(_backup_preflight)
                             used_logs.update(
                                 _backup_preflight.get("session_logs") or [])
@@ -6385,6 +7163,64 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                     str(_backup_preflight.get("error")
                                         or "backup pre-flight did not answer "
                                            "READY"))[:500]
+                    if not _answered and reviewer_backup is None and not reviewer_paused:
+                        # R5: no eligible cross-vendor reviewer passed. Pause
+                        # with ONE question instead of failing silently or
+                        # starting a same-vendor backup.
+                        reviewer_paused = True
+                        review_status = "paused"
+                        run["status"] = "needs_input"
+                        run["review_status"] = "paused"
+                        run["review_in_flight"] = False
+                        run["reviewer_attention"] = (
+                            reviewer_vendor.build_attention(
+                                candidates,
+                                run.get("builder_vendors") or [],
+                                round_no=round_no,
+                                policy=str(cfg.get(
+                                    "reviewer_same_vendor_policy") or "ask")))
+                        run["reviewer_attention_reason"] = (
+                            run.get("reviewer_backup_blocked")
+                            or "no_cross_vendor_reviewer")
+                        _pre_text = " ".join(str(preflight.get(key) or "")
+                                             for key in ("error",
+                                                         "stderr_tail",
+                                                         "status_detail"))
+                        if _KIMI_RE.search(_pre_text):
+                            _pre_family = "kimi"
+                            _pre_exec = dict(preflight, provider="kimi")
+                        elif _ANTHROPIC_RE.search(_pre_text):
+                            _pre_family = "anthropic"
+                            _pre_exec = dict(preflight, provider="anthropic")
+                        elif _OPENAI_RE.search(_pre_text):
+                            _pre_family = "openai"
+                            _pre_exec = dict(preflight, provider="openai")
+                        else:
+                            _pre_family = provider_family(
+                                execution=preflight, cfg=cfg)
+                            _pre_exec = preflight
+                        _pre_message = provider_error_message(
+                            _pre_exec, cfg, role="reviewer")
+                        run["reviewer_preflight"] = {
+                            "status": "error",
+                            "error": api.redact_secrets(str(
+                                preflight.get("error") or ""))[:500],
+                            "message": _pre_message,
+                            "vendor": ((review_backup_identity or {}).get(
+                                "vendor") or _provider_label(_pre_family)),
+                            "model": (review_backup_identity or {}).get(
+                                "model"),
+                            "seconds": preflight.get("seconds"),
+                            "attempts": preflight_attempt,
+                        }
+                        run["review_error"] = _pre_message
+                        run["reviewer_choice"] = {
+                            "status": "paused", "same_vendor": False,
+                            "chosen_by_user": False,
+                            "reason": run["reviewer_attention_reason"],
+                        }
+                        _persist(run, cfg, "review-%d_paused" % round_no)
+                        break
                     if not _answered:
                         if review_backup_identity is not None:
                             # Attribute the failure to the reviewer that
@@ -6575,7 +7411,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         cancel_check=cancel_check,
                         live_usage_cb=review_live_cb,
                         dsh_bin=(review_backup_dsh
-                                 if review_backup_used else None))
+                                 if review_backup_used
+                                 else (selected_reviewer or {}).get("dsh_bin")),
+                        patch=((selected_reviewer or {}).get("patch")
+                               if not review_backup_used else None),
+                        model_spec=selected_spec,
+                        role="reviewer")
                     reviewer_executions.append(review)
                     used_logs.update(review.get("session_logs") or [])
                     _review_answer_text = str(review.get("answer") or "")
@@ -7105,6 +7946,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     run["review_partial"] = review_progress.snapshot()
                 except Exception:
                     pass
+                # R3: attach the parseable score to the reviewer execution so
+                # the per-model aggregate attributes it to the reviewer model.
+                if score is not None:
+                    review["quality_score"] = score
                 if checkpoint and str(review.get("stop_reason")) != "budget":
                     try:
                         checkpoint.finish(
@@ -7152,8 +7997,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     # without reclassifying the merged text.
                     review_error = str(review.get("error"))
                 else:
+                    review_view = dict(review)
+                    if selected_reviewer is not None:
+                        review_view["provider"] = (
+                            selected_reviewer.get("vendor")
+                            or selected_reviewer.get("provider") or "")
+                        review_view["model"] = (
+                            selected_reviewer.get("model") or "")
                     review_error = (
-                        provider_error_message(review, cfg, role="reviewer")
+                        provider_error_message(review_view, cfg,
+                                               role="reviewer")
                         if _is_no_balance(review) or review.get("error")
                         else "reviewer run failed")
                 if str(review.get("stop_reason")) == "budget":
@@ -7372,7 +8225,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 add_dirs=run["add_dirs"],
                 transport_name=run["transport"],
                 cancel_check=cancel_check,
-                live_usage_cb=revision_live_cb)
+                live_usage_cb=revision_live_cb,
+                model_spec=builder_target, role="revision")
             reviewer_executions.append(revision)
             used_logs.update(revision.get("session_logs") or [])
             _cost_settle(run, cost_ledger, "revision", revision, job_budget,
@@ -7562,6 +8416,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         if item.get("kind") == "review"), None)
     _collect_team_artifacts(run, workspace, getattr(cfg, "state_dir", None))
     final_blocking = int((last_review or {}).get("blocking_defects") or 0)
+    reviewer_pending = bool(run.get("reviewer_attention"))
     current_status = run.get("status")
     hard_stop = current_status in ("cancelled", "deadline_exceeded",
                                    "budget_exceeded", "no_balance", "error")
@@ -7570,9 +8425,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     review_recorded = bool(review_entries)
     run["review_recorded"] = review_recorded if independent else None
     forced_review_error = False
-    if independent and not hard_stop and not gate_blocked:
+    if (independent and not hard_stop and not gate_blocked
+            and not reviewer_pending):
         in_flight = bool(run.get("review_in_flight"))
-        unrecorded = (review_status != "disabled" and not review_recorded)
+        unrecorded = (review_status not in ("disabled", "declined")
+                      and not review_recorded)
         if in_flight or unrecorded:
             # Never return a success-shaped status for a review that was
             # requested but had no durable round, or whose phase was still
@@ -7602,7 +8459,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             run["review_in_flight"] = False
             run["review_passed"] = False
             forced_review_error = True
-    if not hard_stop and not forced_review_error:
+    if reviewer_pending:
+        run["status"] = "needs_input"
+        run["status_detail"] = status_mod.STATUS_MEANING.get(
+            "needs_input", "waiting for the client's answer")
+        run["review_passed"] = None
+        run["review_in_flight"] = False
+    if not hard_stop and not forced_review_error and not reviewer_pending:
         run["status"], status_detail, review_passed = status_mod.final_status(
             builder_status="ok_rescued" if run.get("rescued") else "ok",
             review_status=review_status,
@@ -7769,6 +8632,41 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             except Exception:
                 pass
 
+    # R3: rebuild the bounded per-model aggregate at terminal serialization.
+    # This is the one code path for a fresh run and a resumed run.
+    try:
+        usage_executions = list(executions) + list(reviewer_executions)
+        usage_aggregate = model_usage_mod.ModelUsage(
+            max_models=int(cfg.get("model_usage_max_models", 8) or 8),
+            prices=(cfg.get("model_prices")
+                    if isinstance(cfg.get("model_prices"), dict) else {}),
+            reviewer_prices=(cfg.get("reviewer_prices")
+                             if isinstance(cfg.get("reviewer_prices"),
+                                           dict) else {}))
+        for execution in usage_executions:
+            usage_aggregate.add_execution(execution)
+        for item in run.get("model_competition_scores") or []:
+            try:
+                usage_aggregate.add_score(item.get("label"),
+                                          item.get("score"),
+                                          source="candidate", win=True)
+            except Exception:
+                pass
+        run["model_usage"] = usage_aggregate.finish()
+        # R3: feed the model axis into the bounded failure-note store. The
+        # token is (run_id, "model"), so a resume/rebuild never double-counts.
+        for label, row in (run["model_usage"].get("models") or {}).items():
+            if not isinstance(row, dict) or label == "__other__":
+                continue
+            scores = row.get("scores") or {}
+            score = scores.get("mean") if isinstance(scores, dict) else None
+            failure_notes_mod.record_model_run(
+                run.get("task_type") or "unknown", label,
+                float(score) if score is not None else 0.0,
+                score, row.get("estimated_cost_usd"),
+                bool(row.get("cost_known")), run.get("id") or "", cfg)
+    except Exception as exc:
+        run["model_usage_error"] = api.redact_secrets(str(exc))[:300]
     if checkpoint:
         try:
             if (run.get("status") == "budget_exceeded"
@@ -7803,6 +8701,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     if isinstance(convergence_attention, dict) and convergence_attention.get("question"):
         text = text.rstrip() + "\n\n```attention\n%s\n```\n" % json.dumps(
             convergence_attention, ensure_ascii=False, sort_keys=True)
+    reviewer_attention = run.get("reviewer_attention")
+    if (isinstance(reviewer_attention, dict)
+            and reviewer_attention.get("question")):
+        text = text.rstrip() + "\n\n```attention\n%s\n```\n" % json.dumps(
+            reviewer_attention, ensure_ascii=False, sort_keys=True)
     warnings = []
     if run.get("rescued"):
         warnings.append(_rescue_warning(run))
@@ -8020,6 +8923,13 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         if ((manifest.get("phases") or {}).get(str(name)) or {}).get("status") != "done":
             next_phase = str(name)
             break
+    reviewer_pending_saved = bool(saved.get("reviewer_attention"))
+    if (reviewer_pending_saved and next_phase is None
+            and (args.get("answer") is not None
+                 or args.get("option") is not None)):
+        # The paused reviewer question has an answer; re-enter run_harness so
+        # the chosen candidate is re-preflighted and the paid review runs.
+        next_phase = "review-1"
 
     # P3-2: a convergence stop finalized the run with the repeated defect
     # signature unanswered. ``resume_with_scope`` must reopen one
@@ -8272,6 +9182,11 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }
+    if saved.get("builder_model"):
+        resume_args["_saved_builder_model"] = dict(saved["builder_model"])
+    if saved.get("reviewer_attention"):
+        resume_args["_saved_reviewer_attention"] = dict(
+            saved["reviewer_attention"])
     if saved_review_partial:
         resume_args["_review_partial"] = saved_review_partial
     if saved_baseline_dir:

@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from deepseek_mcp import pipeline
 
@@ -199,11 +200,19 @@ class PipelineTests(unittest.TestCase):
     def test_non_git_not_eligible(self):
         plain = self.root / "plain"
         plain.mkdir()
-        self.assertFalse(pipeline.is_pipeline_eligible(self.cfg, str(plain)))
-        prepared = pipeline.prepare_args(
-            self.cfg, {"workspace": str(plain), "write_set": ["src/"]},
-            {"run_id": "n1"},
-        )
+        # The suite scratch root can sit inside the checkout itself (the
+        # connector gate falls back to repo/.dsh-tmp-tests when its ambient
+        # TMPDIR is unusable). Stop git discovery at the fixture root so this
+        # directory is genuinely outside every worktree; otherwise git finds
+        # the enclosing checkout and correctly reports not_worktree_root.
+        with mock.patch.dict(
+                os.environ, {"GIT_CEILING_DIRECTORIES": str(self.root)}):
+            self.assertFalse(
+                pipeline.is_pipeline_eligible(self.cfg, str(plain)))
+            prepared = pipeline.prepare_args(
+                self.cfg, {"workspace": str(plain), "write_set": ["src/"]},
+                {"run_id": "n1"},
+            )
         self.assertFalse(prepared["eligible"])
         self.assertEqual(prepared["unavailable_reason"], "not_git_repo")
 

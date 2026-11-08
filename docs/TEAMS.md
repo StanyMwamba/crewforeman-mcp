@@ -101,6 +101,58 @@ above `WASTE_NUDGE_THRESHOLD` (0.35), the automatic start is reduced by up to
 reason names the nudge. A lower or absent ratio changes nothing, and an explicit
 `subagents` count is never nudged.
 
+## Mixed models and competing candidates (new in 3.12.0)
+
+`builder_model` / `builder_provider` set the parent builder. Empty values
+inherit `dsh_model` / `dsh_provider`, so the default stays DeepSeek. A per-job
+`builder_model` / `builder_provider` argument wins for that job only. The
+connector writes a workspace-local 0600 provider/model overlay, passes it as
+`--patch`, keeps the key in the environment, and deletes the overlay in a
+`finally` block. No overlay is generated for the default target, so the 3.11.0
+argv is byte-identical.
+
+`slice_models` maps a slice name to `"provider/model"` or
+`{provider, model}`; the connector validates every entry, caps the map at
+`builder_model_max_slices` (8), and injects a deterministic `## Model plan`
+section. Each child agent sets `provider` and `model` explicitly. The builder
+writes `MODEL_AUDIT.json`; the connector cross-checks requested pairs, observed
+models and existing files. A missing or ignored audit is `unverified`, never
+`verified`; `model_plan_enforcement="warn"` marks the run degraded and
+`strict` stops it before review.
+
+`model_candidates` maps a slice to 2..N model specs. Each candidate is a child
+on that model and writes `candidates/<slice>--<tag>.<ext>`. The connector
+scores the files with the existing candidate scorer, picks the highest score
+(lower known cost, then configured order on a tie), copies the winner over the
+slice's first `Writes:` path from `SLICES.md`, and records
+`model_competition`. The cap is `model_candidates_max` (3 extra candidates per
+job). A competition without a whole-job cost ceiling records
+`budget_warning="no_whole_job_ceiling"`; the connector cannot kill one child
+inside the parent workflow, so `model_plan.midflight_kill=false` is recorded.
+
+## Backup builder model (new in 3.12.0)
+
+`backup_builder_model` (empty disables) names a second builder model. It uses
+the same `dsh_bin` and the normal model overlay; no separate binary or wrapper
+is needed. `backup_builder_provider` is optional, and
+`backup_builder_max_cost_usd` (default 1.0, `0` disables) is an independent
+ceiling; the whole-job ceiling can only make it smaller.
+
+The switch table is deliberately narrow: credit/budget and auth switch
+immediately; service unavailable (5xx) and dropped streams switch only after
+`backup_builder_min_attempts` (2) and a RetryPolicy allowance; stalls,
+timeouts, cancellations, low or missing scores and gate/review/revision
+outcomes never switch. A builder that already wrote files is skipped with
+`reason="side_effects"` because rerunning would mix partial artifacts. The
+backup is never recursive and never switches twice.
+
+The result header says
+`| backup builder: <vendor>/<model> (main failed: <reason class>)`, and
+`run["backup_builder"]` records status, class, redacted main error, attempts,
+ceiling and settlement. The switch is not sticky: later waves and revisions
+use the configured main builder again. The backup builder's vendor joins the
+reviewer's builder-vendor set because it may have built the job.
+
 ## Pipelined builds (new in 3.11.0)
 
 A job may declare a `write_set` (repo-relative prefixes or globs) or a `slice`
@@ -139,6 +191,15 @@ pre-flight list to the next builder prompt and never change the score.
 | `review_preflight` | true | READY ping before a paid review |
 | `review_preflight_timeout` | 45 | Pre-flight timeout in seconds |
 | `independent_review` | true | Independent review for real work |
+| `builder_model` | "" | Parent builder model; empty inherits `dsh_model` |
+| `builder_provider` | "" | Parent builder provider; empty inherits `dsh_provider` |
+| `slice_models` | {} | Per-slice model map, capped at 8 |
+| `model_candidates` (tool) | {} | Competing candidates per slice, capped at 3 extras |
+| `model_plan_enforcement` | warn | `warn` degrades, `strict` stops on an unverified plan |
+| `backup_builder_model` | "" | Backup builder model; empty disables |
+| `backup_builder_max_cost_usd` | 1.0 | Backup phase's own ceiling; 0 disables |
+| `reviewers` | [] | Ordered reviewer candidates; empty keeps the legacy wrapper |
+| `reviewer_same_vendor_policy` | ask | `ask` offers same-vendor choices; `never` removes them |
 
 The score target is 8.5/10. A reviewer is a model: its score is judgement, not proof.
 

@@ -20,6 +20,7 @@ def make_cfg(state_dir, **overrides):
         "gate_lint_command": "",
         "gate_secret_scan": True,
         "gate_secret_patterns": [],
+        "gate_no_product_mode": "off",
         "gate_timeout_seconds": 30.0,
         "gate_max_revisions": 2,
         "gate_max_output_chars": 4000,

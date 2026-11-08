@@ -1,4 +1,4 @@
-# Run Status Vocabulary (v3.11.0)
+# Run Status Vocabulary (v3.12.0)
 
 `status.py` defines one flat vocabulary for terminal run status. A status is
 always a lowercase string; there is no enum and no `None`.
@@ -15,11 +15,18 @@ always a lowercase string; there is no enum and no `None`.
 | `deadline_exceeded` | Stopped because the wall-clock deadline was reached. |
 | `budget_exceeded` | Stopped because the cost budget was exhausted. |
 | `gate_failed` | The deterministic gate (F1) failed after its revision cap; the paid reviewer was never called. `review_status` is `skipped` and `quality_score` is `None`. |
+| `needs_input` | Non-terminal pause: one validated question is waiting for a client answer. The work item is held, not finished. Resume with the option shown by `deepseek_job_status`. |
 
 `SUCCESS_STATUSES` contains `ok`, `ok_rescued`, `ok_unreviewed`,
 `ok_below_gate` (the run produced usable output, even if not fully gated).
 `FAILURE_STATUSES` contains `error`, `no_balance`, `cancelled`,
-`deadline_exceeded`, `budget_exceeded`, `gate_failed`.
+`deadline_exceeded`, `budget_exceeded`, `gate_failed`. `needs_input` is in
+`STATUSES` but in neither set: it is a non-terminal hold. `final_status` never
+returns it.
+
+A reviewer question is a `needs_input` pause. Declining it ends
+`ok_unreviewed` with `review_declined_by_user=true`, `review_status="declined"`
+and `quality_score=null`; no score or `REVIEW.md` is invented.
 
 ## Mapping and precedence
 
@@ -33,10 +40,11 @@ target=8.5, rescued=False, cancelled=False, stop_reason=None)` returns
 4. builder status `no_balance` -> `no_balance`
 5. builder status other than `ok`/`ok_rescued` -> `error`
 6. `gate_status="gate_failed"` (gate exhausted its revision cap) -> `gate_failed`
-7. review status `error` -> `ok_unreviewed`
-8. a decisive review that did not pass -> `ok_below_gate`
-9. rescued output -> `ok_rescued`
-10. otherwise -> `ok`
+7. review status `declined` -> `ok_unreviewed` (detail "review declined by user")
+8. review status `error` -> `ok_unreviewed`
+9. a decisive review that did not pass -> `ok_below_gate`
+10. rescued output -> `ok_rescued`
+11. otherwise -> `ok`
 
 A gate *crash* is not `gate_failed`: it stays `error` with
 `stop_reason="gate_error"` because the gate could not produce a verdict.

@@ -1,7 +1,7 @@
-"""Documentation invariants for the current release (3.11.0) plus 3.10.0 Part B.
+"""Documentation invariants for the current release (3.12.0) plus 3.10.0 Part B.
 
 Focused checks only: README's public shape is fixed, the three product docs
-describe the Part B efficiency work, and the current release is 3.11.0.
+describe the Part B efficiency work, and the current release is 3.12.0.
 """
 
 import re
@@ -74,22 +74,32 @@ class ReadmeInvariants(unittest.TestCase):
         self.assertLessEqual(len(self.text.splitlines()), 110)
         self.assertNotIn("$", self.text)
 
-    def test_one_new_guarantees_bullet_per_3110_feature(self):
+    def test_at_most_three_new_guarantees_bullets(self):
         current = _guarantees_bullets(self.text)
         head = _guarantees_bullets(self.head)
         self.assertGreaterEqual(len(current), len(head))
         added = [bullet for bullet in current if bullet not in head]
-        # The backup-reviewer line was edited in 3.11.0 (vendor attribution);
-        # the four feature lines are new.
-        mine = [bullet for bullet in added if "backup reviewer" not in bullet.lower()]
-        self.assertEqual(len(mine), 4, added)
-        text = " ".join(mine).lower()
-        for token in ("gate", "plan.json", "failure notes", "write-set"):
+        self.assertEqual(len(added), 3, added)
+        text = " ".join(added).lower()
+        for token in ("model", "cost", "reviewer"):
             self.assertIn(token, text)
+        # The reviewer backup + quota-attribution sentence stays one line.
+        reviewer = [line for line in current if "backup reviewer" in line.lower()]
+        self.assertEqual(len(reviewer), 1, reviewer)
 
     def test_roles_table_and_bold_line_unchanged(self):
         self.assertIsNotNone(_roles_table(self.head))
-        self.assertEqual(_roles_table(self.text), _roles_table(self.head))
+        head_rows = [row for row in _roles_table(self.head).splitlines()
+                     if row.startswith("|")]
+        rows = [row for row in _roles_table(self.text).splitlines()
+                if row.startswith("|")]
+        self.assertEqual(rows[0], head_rows[0])
+        self.assertEqual(rows[1], "|---|---|---|")
+        self.assertIn("| Builder | Harness, any model (default DeepSeek) | "
+                      "Sizes the team, builds in waves, revises on notes. |",
+                      rows)
+        # Reviewer and client rows are byte-identical.
+        self.assertEqual(rows[-2:], head_rows[-2:])
         self.assertIsNotNone(_roles_bold_line(self.head))
         self.assertEqual(_roles_bold_line(self.text), _roles_bold_line(self.head))
 
@@ -100,7 +110,7 @@ class ReadmeInvariants(unittest.TestCase):
         self.assertEqual(len(_mermaid_blocks(self.text)), 2)
 
     def test_version_line_is_current(self):
-        self.assertIn("3.11.0", self.text.splitlines()[2])
+        self.assertIn("3.12.0", self.text.splitlines()[2])
 
 
 class TeamsDoc(unittest.TestCase):
@@ -163,7 +173,7 @@ class ChangelogDoc(unittest.TestCase):
             self.assertIn(token, body)
 
     def test_version_is_current(self):
-        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.11.0")
+        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.12.0")
         self.assertNotIn("## 3.11.1", self.text)
 
 

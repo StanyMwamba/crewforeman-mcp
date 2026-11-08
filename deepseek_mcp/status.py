@@ -20,6 +20,7 @@ STATUSES = (
     "deadline_exceeded",
     "budget_exceeded",
     "gate_failed",
+    "needs_input",
 )
 
 # Convenience groupings for clients and dashboards.  A successful status means
@@ -41,6 +42,7 @@ STATUS_MEANING = {
     "deadline_exceeded": "the whole-job deadline stopped the run before it finished.",
     "budget_exceeded": "the whole-job estimated-cost budget stopped the run before it finished.",
     "gate_failed": "the deterministic gate exhausted its revision budget; the paid reviewer was not called.",
+    "needs_input": "the job paused on one validated question and is waiting for a client answer; resume it.",
 }
 
 
@@ -72,6 +74,8 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "error", STATUS_MEANING["error"], None
     if gate_status == "gate_failed":
         return "gate_failed", STATUS_MEANING["gate_failed"], None
+    if review_status == "declined":
+        return ("ok_unreviewed", "review declined by user", False)
     if review_recorded is False and review_status != "disabled":
         return ("error",
                 "review was requested but no review round was recorded",

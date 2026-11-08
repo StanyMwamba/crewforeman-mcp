@@ -199,6 +199,14 @@ def _infer_vendor(path):
     base = os.path.basename(_text(path)).lower()
     if not base:
         return None
+    # 3.12 delegates to the canonical map; keep the 3.11 markers as fallback.
+    try:
+        from .reviewer_vendor import canonical_vendor
+        vendor = canonical_vendor(base)
+        if vendor:
+            return vendor
+    except Exception:
+        pass
     for marker, vendor in _VENDOR_MARKERS:
         if marker in base:
             return vendor
@@ -214,6 +222,70 @@ def configured(cfg):
     vendor = _text(_value(cfg, "backup_reviewer_vendor")).strip() or None
     model = _text(_value(cfg, "backup_reviewer_model")).strip() or None
     return {"bin": expanded, "vendor": vendor, "model": model}
+
+
+def backup_candidate(cfg):
+    """Return the 3.11 backup reviewer as a normalized 3.12 candidate.
+
+    ``None`` when no backup binary is configured.  Vendor inference is
+    delegated to :mod:`deepseek_mcp.reviewer_vendor`; the legacy bin only
+    becomes a candidate, never an automatic launch.
+    """
+    settings = configured(cfg)
+    if settings is None:
+        return None
+    raw = {
+        "name": "backup",
+        "vendor": _text(_value(cfg, "backup_reviewer_vendor")).strip(),
+        "model": _text(_value(cfg, "backup_reviewer_model")).strip(),
+        "dsh_bin": settings["bin"],
+        "legacy_wrapper": True,
+    }
+    try:
+        from .reviewer_vendor import normalize_candidate
+        candidate = normalize_candidate(raw, cfg)
+    except Exception:
+        return None
+    if not candidate.get("model"):
+        candidate["model"] = _text(_value(cfg, "dsh_model")).strip()
+    return candidate
+
+
+def backup_eligibility(cfg, builder_vendors, chosen_by_user=False):
+    """Return ``(candidate, error)`` for the legacy post-failure backup.
+
+    A same-vendor backup is eligible only with ``chosen_by_user=True``; an
+    unknown vendor is never eligible.  ``error`` is a bounded code or None.
+    """
+    candidate = backup_candidate(cfg)
+    if candidate is None:
+        return None, "not_configured"
+    if candidate.get("error"):
+        return candidate, _text(candidate.get("error"))
+    try:
+        from .reviewer_vendor import (ReviewerVendorConflict,
+                                      assert_reviewer_eligible,
+                                      canonical_vendor)
+        same = canonical_vendor(candidate.get("vendor")) in {
+            canonical_vendor(item) for item in (builder_vendors or ())
+        }
+        assert_reviewer_eligible(
+            candidate, builder_vendors, chosen_by_user=chosen_by_user,
+            same_vendor=bool(same and chosen_by_user))
+    except ReviewerVendorConflict as exc:
+        return candidate, getattr(exc, "reason", "reviewer_vendor_conflict")
+    except Exception:
+        return candidate, "reviewer_vendor_unknown"
+    return candidate, None
+
+
+def eligible_backup(cfg, builder_vendors, chosen_by_user=False):
+    """Return the backup candidate only when the vendor rule allows it."""
+    candidate, error = backup_eligibility(
+        cfg, builder_vendors, chosen_by_user=chosen_by_user)
+    if candidate is None or error is not None:
+        return None
+    return candidate
 
 
 def identity(cfg, execution=None):

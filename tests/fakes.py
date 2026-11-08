@@ -140,6 +140,9 @@ def maybe_session_log():
 
 if os.environ.get("FAKE_DSH_LOG"):
     Path(os.environ["FAKE_DSH_LOG"]).write_text(task, encoding="utf-8")
+if os.environ.get("FAKE_DSH_ARGV"):
+    Path(os.environ["FAKE_DSH_ARGV"]).write_text(
+        json.dumps(sys.argv), encoding="utf-8")
 
 maybe_session_log()
 if os.environ.get("FAKE_DSH_ENV_OUT"):
@@ -147,6 +150,9 @@ if os.environ.get("FAKE_DSH_ENV_OUT"):
         "TMPDIR": os.environ.get("TMPDIR"),
         "HOME": os.environ.get("HOME"),
     }), encoding="utf-8")
+if task.lstrip().startswith("Reply with exactly READY"):
+    emit({"type": "final", "text": "READY"})
+    sys.exit(0)
 emit({"type": "tool_call", "name": "bash"})
 emit({"type": "tool_call", "name": "read"})
 if mode == "flaky":
@@ -388,6 +394,9 @@ def base_env(root, fake_dsh=None, sessions=None, base_url=None):
         # P3-2: existing suites are not charged/perturbed by the reviewer
         # pre-flight; tests that exercise it opt in explicitly.
         "DSH_REVIEW_PREFLIGHT": "0",
+        # The fake reviewer wrapper is a cross-vendor candidate; a real
+        # dsh-reviewer-kimi.sh is inferred from its basename instead.
+        "DSH_REVIEWER_VENDOR": "Kimi (Moonshot)",
         # The fake DSH writes session/marker files outside its workspace.  The
         # unit suite is not a sandbox test, so keep the OS wrapper off here as
         # well as in tests/__init__.py; sandbox tests opt in explicitly.
