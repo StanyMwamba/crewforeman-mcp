@@ -194,7 +194,7 @@ def run(command, timeout, config=None):
         init_id, result = client.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": "crewforeman-mcp-smoke", "version": "3.9.3"},
+            "clientInfo": {"name": "crewforeman-mcp-smoke", "version": "3.9.4"},
         })
         _require(isinstance(result.get("protocolVersion"), str)
                  and result["protocolVersion"],

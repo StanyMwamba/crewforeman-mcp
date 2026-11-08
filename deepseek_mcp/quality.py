@@ -1525,15 +1525,83 @@ def build_review_task(prompt, deliverable_files, skill=None,
     return "".join(parts)
 
 
+
+REPROMPT_REPORT_CHARS = 12000
+
+
+def build_score_reprompt_task(report_text, round_no=1, include_report=True,
+                              fresh=False):
+    """Ask the same reviewer for the two contract lines it omitted.
+
+    The reply contract is deliberately rigid: ``Final quality score: X/10`` and
+    ``Blocking defects: N`` - two lines, no new review.  ``fresh`` is used only
+    when the original reviewer session is gone and a short follow-up call must
+    carry the report text instead.  The report is head+tail truncated so the
+    score/blocking lines and the defect list both survive.
+    """
+    try:
+        number = int(round_no)
+    except (TypeError, ValueError):
+        number = 1
+    report = str(report_text or "").strip()
+    if len(report) > REPROMPT_REPORT_CHARS:
+        half = REPROMPT_REPORT_CHARS // 2
+        omitted = len(report) - (2 * half)
+        report = (report[:half].rstrip()
+                  + "\n\n[... %d characters of the review report omitted by "
+                    "the connector for this follow-up ...]\n\n" % omitted
+                  + report[-half:].lstrip())
+    if fresh:
+        head = (
+            "SCORE REPROMPT - fresh reviewer fallback - review round %d.\n\n"
+            "The reviewer session that produced the report below is no longer "
+            "available. You are a fresh reviewer asked for ONE thing only: read "
+            "the report and state the 0-10 score its own findings support and "
+            "the blocking-defect count it lists. Do not review the repository, "
+            "open files, run tests, start subagents or rewrite the report.\n\n")
+    else:
+        head = (
+            "SCORE REPROMPT (connector follow-up) - review round %d.\n\n"
+            "You already finished the independent review below. This is NOT a "
+            "new review: do not re-read files, do not re-run tests, do not "
+            "inspect the workspace, do not start subagents and do not repeat "
+            "the report. Do not change your findings.\n\n")
+    task = head % number + (
+        "Reply with EXACTLY these two lines and nothing else (no heading, no "
+        "bullets, no code fence, no commentary):\n\n"
+        "Final quality score: X/10\n"
+        "Blocking defects: N\n\n"
+        "X must be the 0-10 score supported by the review below and must be "
+        "consistent with its findings. N must be the number of blocking defects "
+        "actually listed under '## Blocking defects' in the report (0 if none "
+        "were listed). Do not invent a defect to explain a score."
+    )
+    if fresh:
+        task += (" If the report does not state an explicit number, derive X "
+                 "from the findings it reports (verdict, severity and evidence) "
+                 "without re-reviewing the repository. Do not default to 0 or "
+                 "10, and do not guess a number the report does not support.")
+    task += "\n"
+    if include_report and report:
+        task += ("\n## Your review report (verbatim, already complete)\n\n"
+                 "<<<REVIEW\n%s\nREVIEW>>>\n" % report)
+    return task
+
+
 def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
                         skill=None, quality_target=DEFAULT_QUALITY_TARGET,
                         round_no=1, escalation=None, task_type=None,
-                        scope_note=None):
+                        scope_note=None, score_missing=False):
     """Task text for a connector-owned REVISION run after a failed review.
 
     ``scope_note`` is the operator's manual ``resume_with_scope`` note after a
     P3-2 convergence stop; it narrows the resumed revision instead of letting
     the same historical defect signature stop the cycle before it starts.
+
+    ``score_missing`` marks a review that finished without a parsable
+    ``Final quality score: X/10``.  The brief then says the review was
+    unscored, lists only the reviewer's real defects, and tells the next round
+    to re-review instead of fixing a defect that does not exist.
     """
     files = list(deliverable_files or [])
     parts = [
@@ -1543,6 +1611,20 @@ def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
         "REVIEW.md; the reviewer owns that file.\n\n"
         "## Original brief\n\n%s\n" % (prompt or "").strip(),
     ]
+    if score_missing:
+        parts.append(
+            "\n\n## Unscored review (score missing)\n\n"
+            "The independent reviewer's report for round %d did not contain a "
+            "parseable `Final quality score: X/10` line, so this round has no "
+            "numeric quality score. The missing score is a reviewer reporting "
+            "failure, not a 0/10 and not a defect in the deliverables. Fix only "
+            "the real blocking defects listed below; do not invent or fix a "
+            "defect just to explain the missing score. If no real blocking "
+            "defect is listed, change nothing and say the deliverables already "
+            "passed. The next round runs a fresh independent review, which must "
+            "report `Final quality score: X/10` and `Blocking defects: N` "
+            "before the run can be accepted.\n" % int(round_no)
+        )
     if skill and skill.get("content"):
         parts.append(
             "\n\n## Skill checklist\n\n%s\n" % skill["content"].strip()
@@ -1635,6 +1717,106 @@ def _read_report(workspace):
 _TARGET_LINE_RE = re.compile(
     r"target|threshold|minimum|at least|required|goal|>=\s*\d|\u2265", re.IGNORECASE)
 
+_VISUAL_IMPACT_RE = re.compile(r"visual\s+impact", re.IGNORECASE)
+_SCORE_NUM = r"(\d{1,2}(?:[.,]\d+)?)"
+_SCORE_DENOM = r"(?:/\s*10(?!\d)|out\s+of\s+10\b)"
+_SCORE_DECOR = " \t*_`|:=\u2013\u2014-"
+_SCORE_BULLET_RE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)")
+
+# Words that may introduce a score label without turning it into a category
+# score ("The final quality score", "Reviewer's score").  A prefix with any
+# other word is a sub-score label ("Test coverage score", "Code quality
+# score") or quoted/borrowed text and must not become the official score.
+_SCORE_LABEL_LEAD_WORDS = frozenset({
+    "a", "an", "the", "this", "that", "my", "our", "your", "their", "its",
+    "i", "we", "review", "review's", "reviews", "reviewer", "reviewer's",
+    "reviewers", "reviewers'", "report", "report's", "independent",
+    "final", "overall",
+})
+_SCORE_QUOTE_RE = re.compile(r"[\"\u201c\u201d>]")
+
+# Generic table column headers do not turn a row into a category row
+# ("| Criterion | Score | 9/10 |").  Any other preceding word ("Test
+# coverage", "Code quality") does.
+_SCORE_TABLE_HEADER_WORDS = frozenset({
+    "metric", "criterion", "criteria", "item", "label", "name", "dimension",
+    "measure", "field", "value", "category", "area", "aspect",
+})
+
+# A closing bare ``N/10`` is the official score only in an overall-score or
+# summary context.  Under ``## Tests``/``## Fix list``/... it is a sub-score
+# or an item value, never the review score.
+_SCORE_SECTION_FORMS = (
+    r"(?:(?:final|overall)\s+)?quality(?:\s+score)?",
+    r"(?:(?:final|overall)\s+)?score",
+    r"(?:final|overall)",
+    r"rating",
+    r"scoring",
+)
+
+# A parenthetical qualifier may only be dropped when it explicitly says the
+# label is the overall 0-10 score.  ``Score (test coverage)`` is a different
+# metric and must not collapse to ``Score``.
+_SCORE_OVERALL_QUALIFIER_RE = re.compile(
+    r"(?:overall|final|"
+    r"out\s+of\s+(?:10|ten)|"
+    r"[01]\s*[-\u2013\u2014]\s*10|"
+    r"[01]\s+to\s+10|"
+    r"10[-\s]point(?:\s+scale)?|"
+    r"scale\s*[01]\s*[-\u2013\u2014]\s*10)",
+    re.IGNORECASE,
+)
+
+
+def _strip_overall_qualifiers(text):
+    """Drop ``(...)`` groups only when each names the overall score.
+
+    Returns ``None`` when any group is a category/unknown qualifier so callers
+    reject ``Score (test coverage)`` instead of reading it as ``Score``.
+    """
+    value = text or ""
+    for body in re.findall(r"\(([^)]*)\)", value):
+        body = re.sub(r"[*_`]", "", body).strip()
+        body = re.sub(r"\s+", " ", body)
+        if not _SCORE_OVERALL_QUALIFIER_RE.fullmatch(body):
+            return None
+    cleaned = re.sub(r"\([^)]*\)", " ", value)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _score_section_is_overall(section, allow_summary=False):
+    """True when a heading names the overall score, not a category sub-score."""
+    text = re.sub(r"[*_`]", "", section or "").strip().lower()
+    text = text.strip(" :=\t-\u2013\u2014|")
+    text = _strip_overall_qualifiers(text)
+    if text is None:
+        return False
+    text = text.strip(" :=\t-\u2013\u2014|")
+    if not text:
+        return False
+    forms = list(_SCORE_SECTION_FORMS)
+    if allow_summary:
+        forms.extend([
+            r"(?:(?:final|overall)\s+)?summary",
+            r"(?:final\s+)?verdict",
+            r"(?:final\s+)?conclusion",
+            r"(?:overall\s+)?assessment",
+            r"(?:overall\s+)?evaluation",
+            r"bottom\s+line",
+            r"review\s+summary",
+        ])
+    return any(re.fullmatch(form, text) for form in forms)
+
+# Strongest label first.  Strength 3 = explicit final/overall quality score,
+# 2 = final/overall score (or table label "Final"), 1 = bare "Score:".
+_SCORE_LABEL_PATTERNS = (
+    (3, re.compile(r"\b(?:final|overall)\s+quality\s+score\b", re.IGNORECASE)),
+    (3, re.compile(r"\bquality\s+score\b", re.IGNORECASE)),
+    (2, re.compile(r"\b(?:final|overall)\s+score\b", re.IGNORECASE)),
+    (2, re.compile(r"\b(?:final|overall)\b", re.IGNORECASE)),
+    (1, re.compile(r"\bscore\b", re.IGNORECASE)),
+)
+
 
 def _line_at(text, position):
     start = text.rfind("\n", 0, position) + 1
@@ -1645,6 +1827,11 @@ def _line_at(text, position):
 
 
 def _last_score(pattern, text, skip_targets=False, first_on_final_line=False):
+    """3.9.3 helper, unchanged: used by ``visual_impact_score``.
+
+    Keep this behaviour byte-compatible; the stricter official-score logic
+    lives in ``extract_quality_score`` below.
+    """
     matches = []
     for match in re.finditer(pattern, text, re.IGNORECASE):
         try:
@@ -1667,28 +1854,363 @@ def _last_score(pattern, text, skip_targets=False, first_on_final_line=False):
     return matches[-1][1]
 
 
+def _score_coerce(raw):
+    """Return a 0-10 float, or None when the token is out of range."""
+    try:
+        value = float(str(raw).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= value <= 10.0:
+        return value
+    return None
+
+
+def _score_rest_ok(rest):
+    """True when the text after a value is decoration/qualifier, not prose.
+
+    ``"9/10 near the end"`` and ``"9.0/10 pt"`` fail; ``"9/10"``,
+    ``"9/10."``, ``"9/10 (required: 8.5)"``, ``"9/10 — excellent"`` and
+    ``"9/10 Target: 9.5/10"`` pass.
+    """
+    text = (rest or "").strip()
+    stripped = text.strip(_SCORE_DECOR + ".;,!")
+    if not stripped:
+        return True
+    if _TARGET_LINE_RE.search(stripped):
+        return True
+    if text[:1] in ("(", "["):
+        return True
+    if text[:1] in ("-", "\u2013", "\u2014", ",", ";", ":"):
+        return True
+    if re.match(r"^(?:overall|final|total|rating)\b", stripped, re.IGNORECASE):
+        return True
+    return False
+
+
+def _score_after_label(line, label_match):
+    """Parse the first value that follows a score label on ``line``."""
+    tail = (line or "")[label_match.end():]
+    # A signed value is never a valid 0-10 score ("-1/10" must not read as
+    # 1/10).  A spaced dash remains usable as a label/value separator.
+    if re.match(r"^[ \t]*[:=][ \t]*[\u2013\u2014-]\s*\d", tail):
+        return None
+    if re.match(r"^[ \t]*[\u2013\u2014-]\d", tail):
+        return None
+    tail = tail.lstrip(_SCORE_DECOR)
+    connector = re.match(
+        r"(?:is|was|were|of|at|rated|scored)\b[\s*_`:=]*", tail, re.IGNORECASE)
+    if connector:
+        tail = tail[connector.end():]
+    # ``Final quality score (out of 10): 9/10`` is an overall label; a
+    # category qualifier in the same position ("(test coverage)") is not.
+    qualifier = re.match(r"^[ \t]*\(([^)]*)\)", tail)
+    if qualifier:
+        body = re.sub(r"[*_`]", "", qualifier.group(1)).strip()
+        body = re.sub(r"\s+", " ", body)
+        if not _SCORE_OVERALL_QUALIFIER_RE.fullmatch(body):
+            return None
+        tail = tail[qualifier.end():].lstrip(_SCORE_DECOR)
+    match = re.match(r"\s*" + _SCORE_NUM + r"\s*" + _SCORE_DENOM + r"?", tail,
+                     re.IGNORECASE)
+    if not match:
+        return None
+    rest = tail[match.end():]
+    if re.match(r"\s*/\s*\d", rest):  # e.g. 9.5/100
+        return None
+    value = _score_coerce(match.group(1))
+    if value is None or not _score_rest_ok(rest):
+        return None
+    return value
+
+
+def _score_label_allowed(line, match):
+    """True when ``match`` starts a whole score label, not a category sub-score.
+
+    ``Final quality score``, ``The final score`` and ``**Score:**`` are whole
+    labels.  ``Test coverage score``, ``Code quality score`` and quoted text
+    such as ``> Final quality score: 9/10`` are not: their prefix contains a
+    category word, a quote or a blockquote marker.
+    """
+    prefix = (line or "")[:match.start()]
+    if _SCORE_QUOTE_RE.search(prefix):
+        return False
+    cleaned = prefix.strip()
+    cleaned = _SCORE_BULLET_RE.sub("", cleaned)
+    cleaned = cleaned.strip(_SCORE_DECOR + "()[]{}")
+    cleaned = cleaned.lstrip("#").strip()
+    if not cleaned:
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", cleaned)
+    if not words or len(words) > 3:
+        return False
+    return all(word.lower() in _SCORE_LABEL_LEAD_WORDS for word in words)
+
+
+def _score_label_strength(cell):
+    """Classify an exact table label cell; 0 means "not a score label"."""
+    value = re.sub(r"[*_`]", "", cell or "").strip().lower()
+    value = _strip_overall_qualifiers(value)
+    if value is None:
+        return 0
+    value = value.strip(" :=\t-\u2013\u2014|")
+    if not value or _VISUAL_IMPACT_RE.search(value):
+        return 0
+    if re.fullmatch(r"(?:final|overall)\s+quality\s+score", value):
+        return 3
+    if re.fullmatch(r"quality\s+score", value):
+        return 3
+    if re.fullmatch(r"quality", value):
+        # Two-row tables ("| Criterion | Score |" then "| Quality | 8.5/10 |").
+        return 2
+    if re.fullmatch(r"(?:final|overall)\s+score", value):
+        return 2
+    if re.fullmatch(r"(?:final|overall)", value):
+        return 2
+    if re.fullmatch(r"score", value):
+        return 1
+    return 0
+
+
+def _score_cell_value(cell):
+    """Parse one table cell; a bare number counts only in a pure number cell."""
+    value = (cell or "").strip().strip("*_` ").strip()
+    if not value or _VISUAL_IMPACT_RE.search(value):
+        return None
+    match = re.match(_SCORE_NUM + r"\s*" + _SCORE_DENOM + r"?", value,
+                     re.IGNORECASE)
+    if not match:
+        return None
+    rest = value[match.end():]
+    if re.match(r"\s*/\s*\d", rest):
+        return None
+    number = _score_coerce(match.group(1))
+    if number is None or not _score_rest_ok(rest):
+        return None
+    if not re.search(r"/\s*10|out\s+of\s+10", match.group(0), re.IGNORECASE):
+        if not re.fullmatch(r"\d{1,2}(?:\.\d+)?", value):
+            return None
+    return number
+
+
+def _score_table_context_cell(cell):
+    """True when a table cell names a category, target or visual sub-score.
+
+    A score that follows such a cell belongs to that metric, not to the overall
+    review ("| Visual impact | Score: 6/10 |").  Empty/decorative cells,
+    overall lead words ("Final", "Reviewer") and generic column headers
+    ("Criterion", "Metric") do not create category context.
+    """
+    text = re.sub(r"[*_`]", "", cell or "").strip()
+    text = text.strip(" :=\t-\u2013\u2014|")
+    if not text:
+        return False
+    if _VISUAL_IMPACT_RE.search(text) or _TARGET_LINE_RE.search(text):
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
+    if not words:
+        return False
+    if len(words) > 3:
+        return True
+    return not all(word.lower() in _SCORE_LABEL_LEAD_WORDS
+                   or word.lower() in _SCORE_TABLE_HEADER_WORDS
+                   for word in words)
+
+
+def _score_table_candidate(line):
+    """Return ``(value, strength)`` from a pipe-table row, else None."""
+    body = (line or "").strip()
+    if body.count("|") < 2:
+        return None
+    cells = [cell.strip() for cell in body.strip("|").split("|")]
+    for index, cell in enumerate(cells):
+        # Row context is part of the label: a preceding category/target cell
+        # ("| Visual impact | Score: 6/10 |") means this is a sub-score, not
+        # the official review score.  This applies to both branches below.
+        if any(_score_table_context_cell(prev) for prev in cells[:index]):
+            continue
+        strength = _score_label_strength(cell)
+        if strength:
+            for other in cells[index + 1:index + 3]:
+                if re.match(r"^[\s*_`]*\d", other):
+                    # A numeric cell is the value even when it carries an
+                    # annotation ("8.8/10 (target: 9.0)").
+                    value = _score_cell_value(other)
+                    if value is not None:
+                        return value, strength
+                    continue
+                # A category/target cell between the label and the value
+                # redefines the metric; a later number is not the overall score.
+                if _score_table_context_cell(other):
+                    break
+                value = _score_cell_value(other)
+                if value is not None:
+                    return value, strength
+        # Label and value in the same cell (e.g. "| Score: 9/10 |").
+        for pattern_strength, pattern in _SCORE_LABEL_PATTERNS:
+            match = pattern.search(cell)
+            if not match:
+                continue
+            prefix = cell[:match.start()]
+            if _VISUAL_IMPACT_RE.search(prefix) or _TARGET_LINE_RE.search(prefix):
+                break
+            if not _score_label_allowed(cell, match):
+                break
+            value = _score_after_label(cell, match)
+            if value is not None:
+                return value, pattern_strength
+            break
+    return None
+
+
+def _score_line_candidate(line):
+    """Return ``(value, strength)`` from a non-table line, else None."""
+    for strength, pattern in _SCORE_LABEL_PATTERNS:
+        for match in pattern.finditer(line):
+            prefix = line[:match.start()]
+            if _VISUAL_IMPACT_RE.search(prefix) or _TARGET_LINE_RE.search(prefix):
+                continue
+            if not _score_label_allowed(line, match):
+                continue
+            value = _score_after_label(line, match)
+            if value is not None:
+                return value, strength
+    return None
+
+
+def _score_is_score_heading(section):
+    heading = (section or "").lower()
+    if not heading:
+        return False
+    if _VISUAL_IMPACT_RE.search(heading):
+        return False
+    if re.search(r"blocking|defect|fix\s*list|\bissues\b|target|threshold|minimum",
+                 heading):
+        return False
+    return _score_section_is_overall(heading)
+
+
+def _score_standalone_value(line):
+    """A bare ``N/10`` value: no prose before or after it."""
+    value = (line or "").strip()
+    value = _SCORE_BULLET_RE.sub("", value).strip()
+    value = value.strip("*_`| ").strip()
+    value = value.strip(".;:!,").strip()
+    if not value:
+        return None
+    match = re.match(_SCORE_NUM + r"\s*" + _SCORE_DENOM, value, re.IGNORECASE)
+    if not match:
+        return None
+    if not _score_rest_ok(value[match.end():]):
+        return None
+    return _score_coerce(match.group(1))
+
+
+def _score_heading_text(line):
+    """Return a heading's text for Markdown or bold pseudo-headings.
+
+    ``## Score`` and a value-less ``**Score:**`` both open a section.  A bold
+    line that contains a digit is a score statement, not a heading.
+    """
+    atx = re.match(r"^#{1,6}\s*(.*?)\s*#*$", line)
+    if atx:
+        return atx.group(1).strip()
+    bold = re.fullmatch(r"\*{1,2}([^*]+?)\*{1,2}:?", line)
+    if not bold:
+        bold = re.fullmatch(r"_{1,2}([^_]+?)_{1,2}:?", line)
+    if bold and not re.search(r"\d", bold.group(1)):
+        return bold.group(1).strip()
+    return None
+
+
+def _score_final_line_allowed(section):
+    """Whether a bare final ``N/10`` belongs to an overall-score section.
+
+    A report can close with `9.0/10` under `## Score`, `## Summary`, `## Verdict`
+    or no heading at all.  A value under `## Visual impact`, `## Target`,
+    `## Threshold`, `## Tests`, `## Fix list` or another item heading is a
+    sub-score/target/item value, never the official score.
+    """
+    heading = (section or "").lower().strip()
+    if not heading:
+        return True
+    if _VISUAL_IMPACT_RE.search(heading):
+        return False
+    if re.search(r"target|threshold|minimum|at\s+least|required|goal", heading):
+        return False
+    return _score_section_is_overall(heading, allow_summary=True)
+
+
+def _score_scan_text(text):
+    """Classify one text into labelled candidates and safe fallbacks."""
+    labelled = {3: [], 2: [], 1: []}
+    fallback = []
+    section = ""
+    last_line = ""
+    last_section = ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        heading = _score_heading_text(line)
+        if heading is not None:
+            # A heading can itself carry the score (``## Score: 9/10``).
+            # Whole-label checks still reject category headings.
+            if re.match(r"^#{1,6}\s", line):
+                candidate = _score_line_candidate(line)
+                if candidate is not None:
+                    labelled[candidate[1]].append(candidate[0])
+                    last_line = line
+                    last_section = section
+                    continue
+            section = heading.lower()
+            continue
+        if re.fullmatch(r"[-*_=]{3,}", line):
+            continue
+        last_line = line
+        last_section = section
+        if line.startswith("|") and line.count("|") >= 2:
+            table = _score_table_candidate(line)
+            if table is not None:
+                labelled[table[1]].append(table[0])
+            continue
+        candidate = _score_line_candidate(line)
+        if candidate is not None:
+            labelled[candidate[1]].append(candidate[0])
+            continue
+        if _score_is_score_heading(section):
+            value = _score_standalone_value(line)
+            if value is not None:
+                fallback.append(value)
+    if last_line and _score_final_line_allowed(last_section):
+        # A final standalone `N/10` is the reviewer's closing score line, but
+        # not when it sits under a visual-impact/target/threshold heading.
+        value = _score_standalone_value(last_line)
+        if value is not None:
+            fallback.append(value)
+    return labelled, fallback
+
+
 def extract_quality_score(workspace=None, final_text=None):
     """Read the final quality score from QUALITY_REPORT.md, then the final text.
 
-    Explicit "Final quality score" statements are trusted first, so a later
-    target/threshold note or a table's target column cannot override them.
+    Explicit "final quality score"/"final score"/"Score:" statements win, with
+    the last one in document order.  A bare ``N/10`` is trusted only inside a
+    Score/Quality section or on the final standalone line, so unrelated text
+    ("checked 3/10 images", "font is 9.0/10 pt") and visual-impact sub-scores
+    cannot become the official score.  Target/threshold lines are skipped.
     """
     texts = [text for text in (_read_report(workspace), final_text or "") if text]
-    priority = (
-        r"final\s+quality\s+score\s*\|?\s*[:=\-]?\s*\|?\s*(\d+(?:\.\d+)?)",
-        r"(?:overall|final)\s+score\s*[:\-]?\s*(\d+(?:\.\d+)?)",
-        r"score\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*/\s*10",
-    )
-    for pattern in priority:
-        for text in texts:
-            score = _last_score(pattern, text, skip_targets=False)
-            if score is not None:
-                return round(score, 2)
-    for text in texts:
-        score = _last_score(r"(\d+(?:\.\d+)?)\s*/\s*10", text,
-                            skip_targets=True, first_on_final_line=True)
-        if score is not None:
-            return round(score, 2)
+    if not texts:
+        return None
+    scans = [_score_scan_text(text) for text in texts]
+    for strength in (3, 2, 1):
+        for labelled, _fallback in scans:
+            values = labelled.get(strength) or []
+            if values:
+                return round(values[-1], 2)
+    for _labelled, fallback in scans:
+        if fallback:
+            return round(fallback[-1], 2)
     return None
 
 
@@ -1779,6 +2301,16 @@ def visual_impact_score(text):
         text or "", skip_targets=True)
 
 
+_LEGACY_SYNTHETIC_SCORE_RE = re.compile(
+    r"independent\s+reviewer\s+did\s+not\s+report\s+a\s+0\s*[-\u2013\u2014]\s*10\s+score",
+    re.IGNORECASE)
+
+
+def _is_legacy_synthetic_score_defect(text):
+    """True for the 3.9.3 connector-invented blocking defect, not reviewer text."""
+    return bool(_LEGACY_SYNTHETIC_SCORE_RE.search(str(text or "")))
+
+
 def parse_review(report_text="", final_text="", task_type=None,
                  prefer_sections=False):
     """Parse an independent REVIEW.md/final answer.
@@ -1818,6 +2350,17 @@ def parse_review(report_text="", final_text="", task_type=None,
             except ValueError:
                 pass
     blocking_lines = _section_bullets(combined, ("blocking defect", "blocking"))
+    # 3.9.3 persisted a connector-invented blocking defect when the score line
+    # was missing.  It is not reviewer evidence: drop it (and its contribution
+    # to an explicit count) so an old partial/report cannot keep a workspace
+    # permanently blocked.
+    legacy_blocking = [item for item in blocking_lines
+                       if _is_legacy_synthetic_score_defect(item)]
+    if legacy_blocking:
+        blocking_lines = [item for item in blocking_lines
+                          if item not in legacy_blocking]
+        if blocking is not None and not prefer_sections:
+            blocking = max(0, int(blocking) - len(legacy_blocking))
     if prefer_sections:
         # The merged report is authoritative on resume.  The reviewer's
         # trailing "Blocking defects: N" summary may still reflect the
@@ -1827,6 +2370,8 @@ def parse_review(report_text="", final_text="", task_type=None,
     elif blocking is None:
         blocking = len(blocking_lines)
     defects = blocking_lines or _section_bullets(combined, ("defect", "issues"))
+    defects = [item for item in defects
+               if not _is_legacy_synthetic_score_defect(item)]
     fixes = _section_bullets(combined, ("fix list", "fixes", "required changes"))
     if not fixes:
         fixes = defects

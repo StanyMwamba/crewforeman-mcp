@@ -216,6 +216,25 @@ if mode == "plain":
     print("plain final text", flush=True)
     sys.exit(0)
 
+if "SCORE REPROMPT" in task:
+    state["reprompt"] = int(state.get("reprompt", 0)) + 1
+    save_state()
+    emit({"type": "session", "version": 4, "id": "session-" + str(os.getpid()),
+          "cwd": str(workspace.resolve())})
+    reprompt_mode = os.environ.get("FAKE_DSH_REVIEW_REPROMPT", "ok")
+    if reprompt_mode == "error":
+        emit({"type": "error", "message": "fake score reprompt failure"})
+        sys.exit(1)
+    if reprompt_mode == "missing":
+        emit({"type": "final", "text": "Score unavailable. No parsable score."})
+        sys.exit(0)
+    if reprompt_mode == "score_only":
+        emit({"type": "final", "text": "Final quality score: 9.2/10"})
+        sys.exit(0)
+    emit({"type": "final", "text": "## Score\nFinal quality score: 9.2/10\n"
+          "Blocking defects: 0"})
+    sys.exit(0)
+
 if "INDEPENDENT REVIEWER" in task:
     if os.environ.get("FAKE_DSH_FAIL_REVIEW"):
         emit({"type": "error", "message": os.environ.get(
@@ -226,8 +245,50 @@ if "INDEPENDENT REVIEWER" in task:
     index = int(state.get("review", 0))
     review_score = scores[min(index, len(scores) - 1)] if scores else os.environ.get(
         "FAKE_DSH_REVIEW_SCORE", score or "8.6")
+    missing_flags = [item.strip() for item in os.environ.get(
+        "FAKE_DSH_REVIEW_MISSING_SCORE", "").split(",") if item.strip()]
+    score_missing = bool(missing_flags) and missing_flags[
+        min(index, len(missing_flags) - 1)] == "1"
+    # A complete, otherwise-unscored report that closes with a category score
+    # heading: the parser must not read ``## Score (test coverage)`` as overall.
+    category_score = os.environ.get("FAKE_DSH_REVIEW_CATEGORY_SCORE") == "1"
+    # A complete, otherwise-unscored report whose only number is a category /
+    # target / visual-impact row in a pipe table.
+    table_score = os.environ.get("FAKE_DSH_REVIEW_TABLE_SCORE", "").strip()
     state["review"] = index + 1
     save_state()
+    emit({"type": "session", "version": 4, "id": "session-" + str(os.getpid()),
+          "cwd": str(workspace.resolve())})
+    if score_missing or category_score or table_score:
+        visual = os.environ.get("FAKE_DSH_REVIEW_VISUAL_IMPACT", "").strip()
+        blocking_missing = os.environ.get(
+            "FAKE_DSH_REVIEW_MISSING_BLOCKING", "").strip()
+        extended = ""
+        if visual:
+            extended += "\n## Visual impact\n" + visual + "/10\n"
+        report = (
+            "# Independent review\n\n## Score\nPending.\n\n"
+            "## Blocking defects\n" +
+            ("- Blocking: fake reviewer found a missing fact in "
+             "deliverable.md\n" if blocking_missing else "None\n") +
+            "\n## Non-blocking defects\n"
+            "- Minor: fake non-blocking typo in deliverable.md\n\n"
+            "## Fix list\n" + ("1. Fix the fake blocking issue in "
+                               "deliverable.md\n" if blocking_missing
+                               else "None\n") + extended)
+        if category_score:
+            report += "\n## Score (test coverage)\n10/10\n"
+        elif table_score:
+            row = {
+                "visual": "| Visual impact | Score: 9/10 |",
+                "target": "| Target | Final quality score: 9.5/10 |",
+                "test_coverage": "| Test coverage | Score | 10/10 |",
+                "code_quality": "| Code quality | Score: 9.0/10 |",
+            }[table_score]
+            report += "\n## Score details\n\n" + row + "\n"
+        (workspace / "REVIEW.md").write_text(report, encoding="utf-8")
+        emit({"type": "final", "text": "REVIEW.md written. Score unavailable."})
+        sys.exit(0)
     raw_blocking = os.environ.get("FAKE_DSH_REVIEW_BLOCKING", "")
     blockings = [item.strip() for item in raw_blocking.split(",") if item.strip()]
     if blockings:
@@ -257,10 +318,10 @@ if "REVISION agent" in task:
     emit({"type": "final", "text": "Revision applied. Final quality score: 8.0/10"})
     sys.exit(0)
 
-(workspace / "deliverable.md").write_text("# Fake deliverable\\n", encoding="utf-8")
+(workspace / "deliverable.md").write_text("# Fake deliverable\n", encoding="utf-8")
 if score:
     (workspace / "QUALITY_REPORT.md").write_text(
-        "# Quality report\\n\\n- checklist: ok\\n- Final quality score: " + score + "/10\\n",
+        "# Quality report\n\n- checklist: ok\n- Final quality score: " + score + "/10\n",
         encoding="utf-8")
 emit({"type": "final", "text": "Deliverable written. Final quality score: " + (score or "8.6") + "/10"})
 sys.exit(int(os.environ.get("FAKE_DSH_EXIT", "0")))

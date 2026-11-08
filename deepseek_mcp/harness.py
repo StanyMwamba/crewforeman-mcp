@@ -41,7 +41,8 @@ from . import status as status_mod
 from . import transport as transport_mod
 from . import work as work_mod
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
-                      build_review_task, build_revision_task, choose_agents,
+                      build_review_task, build_revision_task,
+                      build_score_reprompt_task, choose_agents,
                       convergence_decision, extract_quality_score, parse_review,
                       persist_signatures, plan_escalation, quality_default,
                       recurring_lessons)
@@ -764,7 +765,10 @@ def _result_text(run, path):
         head += " | single agent"
     if run.get("quality_used") or run.get("independent_review"):
         score = run.get("quality_score")
-        head += " | quality %s/10" % ("%.2f" % score if score is not None else "not reported")
+        if score is None:
+            head += " | quality not reported (unscored review)"
+        else:
+            head += " | quality %.2f/10" % score
         if run.get("independent_review"):
             head += " (independent)"
             if run.get("self_score") is not None:
@@ -798,6 +802,8 @@ def _result_text(run, path):
                                       "%s s" % entry.get("seconds", "?"))
             if entry.get("score") is not None:
                 bit += ", score %.2f/10" % entry["score"]
+            elif entry.get("score_missing"):
+                bit += ", score_missing"
             if entry.get("kind") == "review":
                 bit += ", %d blocking defect(s)" % int(entry.get("blocking_defects") or 0)
             if entry.get("status") and entry.get("status") != "ok":
@@ -1025,6 +1031,245 @@ def _sum_executions(executions):
         "total_tokens": total_tokens,
         "models": models,
     }
+
+
+_REPROMPT_MIN_SECONDS = 15.0
+_REPROMPT_BLOCKING_RE = re.compile(
+    r"(?im)^[\s>*_`\-]*blocking\s+defects?\s*[*_`]*\s*[:=]\s*[*_`]*\s*(\d{1,3})\b")
+
+
+def _reprompt_bounded_limit(limit, remaining, minimum=_REPROMPT_MIN_SECONDS):
+    """Return ``(call_limit, has_time)`` for one score re-prompt call."""
+    if remaining is None:
+        return limit, True
+    if remaining < minimum:
+        return None, False
+    cap = max(10.0, float(remaining) - 5.0)
+    if limit is None:
+        return cap, True
+    try:
+        return min(float(limit), cap), True
+    except (TypeError, ValueError):
+        return cap, True
+
+
+def _reprompt_reply_fields(answer):
+    """Parse the rigid two-line re-prompt answer; never fabricate a field.
+
+    Returns ``(score, blocking)``.  Either element is ``None`` when its
+    contract line is missing: a score-only reply must not be recorded as
+    ``Blocking defects: 0``.  The caller keeps the report-derived blocking
+    count in that case.
+    """
+    text = str(answer or "")
+    if not text.strip():
+        return None, None
+    score = extract_quality_score(None, text)
+    match = _REPROMPT_BLOCKING_RE.search(text)
+    blocking = None
+    if match:
+        try:
+            blocking = int(match.group(1))
+        except ValueError:
+            blocking = None
+    return score, blocking
+
+
+def _reprompt_record(executions, method, session_id, error=None,
+                     fallback_used=False, session_error=None,
+                     skipped_reason=None):
+    """Normalise the one/two re-prompt executions into the journal record."""
+    executions = [item for item in executions if isinstance(item, dict)]
+    totals = _sum_executions(executions) if executions else {
+        "estimated_cost_usd": 0.0, "cost_known": True,
+        "tokens_in": 0, "cache_read_tokens": 0, "tokens_out": 0,
+        "total_tokens": 0, "models": {},
+    }
+    last = executions[-1] if executions else {}
+    answer = str(last.get("answer") or "")
+    score, blocking = _reprompt_reply_fields(answer)
+    logs = []
+    for item in executions:
+        for name in item.get("session_logs") or []:
+            if name not in logs:
+                logs.append(name)
+    record = {
+        "attempted": bool(executions),
+        "method": method,
+        "status": last.get("status") if executions else "skipped",
+        "error": api.redact_secrets(str(
+            error if error is not None
+            else (last.get("error") if executions else "") or "")),
+        "seconds": round(sum(float(item.get("seconds") or 0)
+                             for item in executions), 3),
+        "tokens_in": totals.get("tokens_in") or 0,
+        "cache_read_tokens": totals.get("cache_read_tokens") or 0,
+        "tokens_out": totals.get("tokens_out") or 0,
+        "total_tokens": totals.get("total_tokens") or 0,
+        "estimated_cost_usd": totals.get("estimated_cost_usd"),
+        "cost_known": totals.get("cost_known", True),
+        "models": totals.get("models") or {},
+        "usage": last.get("usage"),
+        "session_id": (last.get("transport_session_id")
+                       or (executions[0].get("transport_session_id")
+                           if executions else None)
+                       or session_id),
+        "session_logs": logs,
+        "score": score,
+        "blocking": blocking,
+        "contract_complete": bool(score is not None and blocking is not None),
+        "fallback_used": bool(fallback_used),
+        "reply": answer[:400],
+    }
+    if session_error:
+        record["session_error"] = api.redact_secrets(str(session_error))
+    if skipped_reason:
+        record["skipped_reason"] = skipped_reason
+    return record
+
+
+def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
+                           policy=None, transport_name=None, limit=None,
+                           cancel_check=None, budget=None, used_logs=None):
+    """One score re-prompt for one reviewer report.
+
+    Resume the same reviewer session when it has an id; only a non-ok/dead
+    session may fall back to ONE short fresh reviewer call carrying the report.
+    The caller records the returned dict and appends it to
+    ``reviewer_executions`` when ``attempted`` is true.
+    """
+    review = review if isinstance(review, dict) else {}
+    session_id = review.get("transport_session_id")
+    report = str(report_text or review.get("answer") or "")
+    remaining = None
+    if budget is not None:
+        try:
+            remaining = budget.remaining_seconds()
+        except Exception:
+            remaining = None
+    call_limit, has_time = _reprompt_bounded_limit(limit, remaining)
+    if not has_time:
+        return _reprompt_record(
+            [], "skipped", session_id,
+            error="insufficient job budget for a score re-prompt",
+            skipped_reason="insufficient job budget for a score re-prompt")
+    if policy is None:
+        try:
+            policy = safety.resolve({}, cfg, reviewer=True)
+        except Exception:
+            policy = review.get("sandbox")
+    transport_name = (transport_name or review.get("transport")
+                      or cfg.get("dsh_transport") or "headless")
+    logs = used_logs if used_logs is not None else set()
+    executions = []
+    session_error = None
+    fallback_used = False
+
+    if session_id:
+        first = _execute_once(
+            cfg, workspace,
+            build_score_reprompt_task(report, round_no=round_no),
+            limit=call_limit,
+            label="reviewer score reprompt round %d" % int(round_no or 1),
+            exclude_logs=logs, policy=policy, session_id=session_id,
+            transport_name=transport_name, cancel_check=cancel_check)
+        executions.append(first)
+        logs.update(first.get("session_logs") or [])
+        stop_reason = str(first.get("stop_reason") or "").lower()
+        dead = (str(first.get("status") or "").lower() != "ok"
+                and stop_reason not in ("budget", "cancelled", "canceled",
+                                        "interrupted"))
+        if dead:
+            session_error = first.get("error") or "reviewer session unavailable"
+            remaining_after = None
+            if budget is not None:
+                try:
+                    remaining_after = budget.remaining_seconds()
+                except Exception:
+                    remaining_after = None
+            fresh_limit, fresh_has_time = _reprompt_bounded_limit(
+                limit, remaining_after)
+            if fresh_has_time:
+                fallback_used = True
+                second = _execute_once(
+                    cfg, workspace,
+                    build_score_reprompt_task(report, round_no=round_no,
+                                              fresh=True),
+                    limit=fresh_limit,
+                    label=("reviewer score reprompt fresh round %d"
+                           % int(round_no or 1)),
+                    exclude_logs=logs, policy=policy, session_id=None,
+                    transport_name=transport_name,
+                    cancel_check=cancel_check)
+                executions.append(second)
+                logs.update(second.get("session_logs") or [])
+        method = ("fresh_after_dead_session" if fallback_used
+                  else "same_session")
+        last = executions[-1]
+        return _reprompt_record(
+            executions, method, session_id,
+            error=(last.get("error") if str(last.get("status")) != "ok"
+                   else None),
+            fallback_used=fallback_used, session_error=session_error)
+
+    fresh = _execute_once(
+        cfg, workspace,
+        build_score_reprompt_task(report, round_no=round_no, fresh=True),
+        limit=call_limit,
+        label="reviewer score reprompt fresh round %d" % int(round_no or 1),
+        exclude_logs=logs, policy=policy, session_id=None,
+        transport_name=transport_name, cancel_check=cancel_check)
+    executions.append(fresh)
+    logs.update(fresh.get("session_logs") or [])
+    return _reprompt_record(executions, "fresh", None,
+                            error=fresh.get("error"))
+
+
+def _merge_reprompt_usage(entry, record):
+    """Fold a re-prompt's usage into the review entry (additive)."""
+    if not isinstance(entry, dict) or not isinstance(record, dict):
+        return entry
+    # Review entries store the priced cost under ``cost``; normalise that view
+    # for ``_sum_executions`` so a known review cost is not lost when the
+    # re-prompt itself is unpriced, and vice versa.
+    entry_view = dict(entry)
+    if (entry_view.get("estimated_cost_usd") is None
+            and entry_view.get("cost") is not None):
+        entry_view["estimated_cost_usd"] = entry_view.get("cost")
+    totals = _sum_executions([entry_view, record])
+    for key in ("estimated_cost_usd", "cost_known", "tokens_in",
+                "cache_read_tokens", "tokens_out", "total_tokens", "models"):
+        if key in totals:
+            entry[key] = totals[key]
+    # Review entries keep the priced cost under ``cost`` (not
+    # ``estimated_cost_usd``); keep both views consistent.
+    entry["cost"] = totals.get("estimated_cost_usd")
+    entry["cost_known"] = totals.get("cost_known", False)
+    try:
+        entry["seconds"] = round(
+            float(entry.get("seconds") or 0)
+            + float(record.get("seconds") or 0), 3)
+    except (TypeError, ValueError):
+        pass
+    entry["score_reprompt"] = record
+    entry["score_reprompt_method"] = record.get("method")
+    entry["score_reprompt_status"] = record.get("status")
+    return entry
+
+
+def _append_score_to_review(workspace, score, blocking, report_text):
+    """Append the re-prompted two lines so REVIEW.md stays self-consistent."""
+    path = Path(workspace) / "REVIEW.md"
+    suffix = ("\n\nFinal quality score: %s/10\nBlocking defects: %d\n"
+              % (round(float(score), 2), int(blocking or 0)))
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(suffix)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return str(report_text or "").rstrip() + suffix
+    except Exception:
+        return report_text
 
 
 def _apply_execution(run, execution, include_outputs=True):
@@ -3319,6 +3564,35 @@ def _health_block_attention(run, cfg, board, component, message=None):
                                     message=message))
 
 
+
+def _review_resume_start(rounds, prior_reviews, prior_revisions):
+    """Return ``(start_round, skip_review_round, review_status)`` on resume.
+
+    Rounds are a prefix.  A score-missing review that already had real
+    blocking defects consumes a revision phase, so a missing revision must
+    resume at that revision (``skip_review_round``).  A score-missing review
+    with no real blocking defect bought no revision, so it is a consumed
+    round: resume moves to the next review instead of resurrecting a revision.
+    """
+    for number in range(1, int(rounds) + 1):
+        review = prior_reviews.get(number)
+        if review is None:
+            return number, None, "disabled"
+        if number in prior_revisions:
+            continue
+        unscored = (bool(review.get("score_missing"))
+                    or (review.get("score") is None
+                        and review.get("status") == "ok"))
+        try:
+            blocking = int(review.get("blocking_defects") or 0)
+        except (TypeError, ValueError):
+            blocking = 0
+        if unscored and blocking == 0:
+            continue
+        return number, number, "disabled"
+    return int(rounds) + 1, None, "stopped"
+
+
 def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     """Run one Harness task with optional independent review/revision rounds.
 
@@ -4814,17 +5088,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             review_status = "accepted"
             _restore_review_report(workspace, accepted_review)
         else:
-            for number in range(1, rounds + 1):
-                if number not in prior_reviews:
-                    start_round = number
-                    break
-                if number not in prior_revisions:
-                    start_round = number
-                    skip_review_round = number
-                    break
-            else:
-                start_round = rounds + 1
-                review_status = "stopped"
+            start_round, skip_review_round, review_status = _review_resume_start(
+                rounds, prior_reviews, prior_revisions)
         if prior_rounds and start_round > 1:
             run["resumed_rounds"] = start_round - 1
         # Whole-job cost gate before the first paid reviewer call. The builder
@@ -4842,9 +5107,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 run["status_detail"] = status_mod.STATUS_MEANING["budget_exceeded"]
                 start_round = rounds + 1
         for round_no in range(start_round, rounds + 1):
+            score_missing = False
             reused = prior_reviews.get(round_no) if round_no == skip_review_round else None
             if reused is not None:
                 score = reused.get("score")
+                score_missing = bool(reused.get("score_missing")) or (
+                    score is None and reused.get("status") == "ok")
                 blocking = int(reused.get("blocking_defects") or 0)
                 defects = list(reused.get("defects") or [])
                 fixes = list(reused.get("fixes") or [])
@@ -5464,17 +5732,74 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         if carried_group == "blocking":
                             blocking += 1
                 fixes = list(parsed.get("fixes") or [])
+                score_missing = False
+                reprompt_record = None
+                if (score is None and review.get("status") == "ok"
+                        and reused is None):
+                    # 3.9.4: one score re-prompt before declaring the review
+                    # unscored.  The same reviewer session is resumed when it
+                    # has an id; only a dead session gets a fresh short call.
+                    reprompt_record = _reprompt_review_score(
+                        cfg, workspace, review, report_text,
+                        round_no=round_no, policy=reviewer_policy,
+                        transport_name=run["transport"],
+                        limit=job_budget.phase_limit(limit),
+                        cancel_check=cancel_check, budget=job_budget,
+                        used_logs=used_logs)
+                    if reprompt_record.get("attempted"):
+                        reviewer_executions.append(reprompt_record)
+                        for _log in reprompt_record.get("session_logs") or []:
+                            used_logs.add(_log)
+                    if reprompt_record.get("score") is not None:
+                        recovered_score = float(reprompt_record["score"])
+                        # The reviewer's own report sections decide the
+                        # blocking count.  The follow-up score is recorded for
+                        # audit, but it can never add a blocking defect the
+                        # reviewer never listed (no invented fix demand).  A
+                        # score-only reply (missing "Blocking defects:")
+                        # likewise keeps the report count instead of a
+                        # fabricated zero.
+                        reply_blocking = reprompt_record.get("blocking")
+                        if reply_blocking is not None:
+                            reply_blocking = int(reply_blocking)
+                            if reply_blocking > blocking:
+                                reprompt_record["blocking_disagreement"] = {
+                                    "report": blocking,
+                                    "reprompt": reply_blocking}
+                        report_text = _append_score_to_review(
+                            workspace, recovered_score, blocking, report_text)
+                        report_path = str(Path(workspace) / "REVIEW.md")
+                        # Reparse the augmented report with the original task
+                        # type and carried-section preference: the creative
+                        # visual-impact cap and the section-derived review
+                        # fields must apply exactly as on the normal scored
+                        # path, never the raw re-prompt number.
+                        rescored = parse_review(
+                            report_text, review.get("answer") or "",
+                            task_type=run.get("task_type"),
+                            prefer_sections=bool(carried_defects))
+                        if rescored.get("score") is not None:
+                            score = float(rescored["score"])
+                            blocking = int(
+                                rescored.get("blocking_defects") or 0)
+                            defects = list(rescored.get("defects") or [])
+                            fixes = list(rescored.get("fixes") or [])
+                            parsed = rescored
+                        else:
+                            score = recovered_score
                 if score is None and review.get("status") == "ok":
-                    score = 0.0
-                    blocking = max(1, blocking)
-                    defects.append("Independent reviewer did not report a 0-10 score.")
-                    if not fixes:
-                        fixes = ["Have the reviewer write REVIEW.md with "
-                                 "'Final quality score: X/10'."]
+                    # Unscored review: score stays None and the reviewer's
+                    # real blocking count/defects are untouched.  Never
+                    # fabricate 0.0 or a synthetic blocking defect.
+                    score_missing = True
                 entry = {
                     "round": round_no,
                     "kind": "review",
                     "score": score,
+                    "score_missing": bool(score_missing),
+                    "score_status": ("score_missing" if score_missing else
+                                     ("scored" if score is not None
+                                      else "review_failed")),
                     "blocking_defects": blocking,
                     "defects": defects,
                     "fixes": fixes,
@@ -5500,10 +5825,43 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "write_violations": violations,
                     "sandbox": reviewer_policy,
                     "transport": review.get("transport"),
-                    "accepted": bool(score is not None
+                    "accepted": bool(not score_missing
+                                     and score is not None
                                      and score >= DEFAULT_QUALITY_TARGET
                                      and blocking == 0),
                 }
+                if reprompt_record is not None:
+                    # Record skipped/budget-refused attempts too: the run and
+                    # journal should say the connector tried, and why it did
+                    # not launch a paid call.
+                    if reprompt_record.get("attempted"):
+                        entry = _merge_reprompt_usage(entry, reprompt_record)
+                    run.setdefault("review_score_reprompts", []).append(
+                        reprompt_record)
+                    _emit_run_event(run, cfg, "score_reprompt", {
+                        "round": round_no,
+                        "method": reprompt_record.get("method"),
+                        "status": reprompt_record.get("status"),
+                        "fallback_used": reprompt_record.get("fallback_used"),
+                        "score": reprompt_record.get("score"),
+                        "blocking": reprompt_record.get("blocking"),
+                        "contract_complete": reprompt_record.get(
+                            "contract_complete"),
+                        "seconds": reprompt_record.get("seconds"),
+                        "tokens_in": reprompt_record.get("tokens_in"),
+                        "cache_read_tokens": reprompt_record.get(
+                            "cache_read_tokens"),
+                        "tokens_out": reprompt_record.get("tokens_out"),
+                        "total_tokens": reprompt_record.get("total_tokens"),
+                        "cost": reprompt_record.get("estimated_cost_usd"),
+                        "cost_known": reprompt_record.get("cost_known"),
+                        "session_id": reprompt_record.get("session_id"),
+                    })
+                if score_missing:
+                    run["review_score_missing"] = True
+                    _unscored = run.setdefault("review_unscored_rounds", [])
+                    if int(round_no) not in _unscored:
+                        _unscored.append(int(round_no))
                 if review_preflight_record is not None:
                     entry = _merge_preflight_usage(
                         entry, review_preflight_record, cfg)
@@ -5625,6 +5983,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 if entry is not None:
                     entry["accepted"] = True
                 break
+            if score_missing and blocking == 0:
+                # The reviewer produced no parsable score but also reported no
+                # real blocking defect.  Do not buy a revision for a defect
+                # that does not exist: mark the round stopped and let the next
+                # review round re-review (or stop cleanly at the round cap).
+                review_status = "stopped"
+                if round_no >= rounds:
+                    break
+                continue
             # P3-2: stop buying the same fix. The decision is computed from
             # blocking signatures; observe records it without enforcing.
             convergence_mode = str(cfg.get("quality_convergence", "observe")
@@ -5643,7 +6010,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "first_seen_round": decision.get("first_seen_round"),
                     "cosmetic_only": bool(decision.get("cosmetic_only")),
                 }
-            if decision.get("action") == "stop":
+            if decision.get("action") == "stop" and not score_missing:
                 if scope_resume is not None and int(round_no) == scope_round:
                     # One manual scoped cycle is allowed. Record that the
                     # historical signature was intentionally overridden once.
@@ -5691,7 +6058,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 prompt, deliverable_files, fixes, defects, skill=skill,
                 quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
                 escalation=escalation, task_type=run.get("task_type"),
-                scope_note=round_scope)
+                scope_note=round_scope, score_missing=score_missing)
             if checkpoint:
                 try:
                     checkpoint.begin("revision-%d" % round_no)
@@ -6015,10 +6382,20 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                           "independently verified." % (review_error or "unknown"))
         run["review_warning"] = review_warning
     elif run.get("status") == "ok_below_gate":
-        review_warning = (
-            "Independent review did not pass: score %s/10, %d blocking defect(s). "
-            "Read REVIEW.md and the fix list; this result is not release-ready."
-            % ((last_review or {}).get("score"), final_blocking))
+        if (last_review or {}).get("score") is None:
+            review_warning = (
+                "Independent review finished without a parseable 0-10 score "
+                "(review unscored, round %s); the run did not pass the quality "
+                "gate and is not release-ready. The reviewer reported %d real "
+                "blocking defect(s). Read REVIEW.md and the fix list; the score "
+                "is missing, not 0/10."
+                % ((last_review or {}).get("round"),
+                   int(final_blocking or 0)))
+        else:
+            review_warning = (
+                "Independent review did not pass: score %s/10, %d blocking defect(s). "
+                "Read REVIEW.md and the fix list; this result is not release-ready."
+                % ((last_review or {}).get("score"), final_blocking))
         run["review_warning"] = review_warning
     run["status_vocabulary"] = "3.6"
     if _note_agent_limit(run, all_executions):

@@ -358,6 +358,16 @@ def _remove_defect_bullets(text, key):
     return "\n".join(kept).rstrip() + "\n"
 
 
+_LEGACY_SYNTHETIC_SCORE_RE = re.compile(
+    r"independent\s+reviewer\s+did\s+not\s+report\s+a\s+0\s*[-\u2013\u2014]\s*10\s+score",
+    re.IGNORECASE)
+
+
+def _is_legacy_synthetic_defect(text):
+    """3.9.3's connector-invented blocking defect is never carried forward."""
+    return bool(_LEGACY_SYNTHETIC_SCORE_RE.search(str(text or "")))
+
+
 def merge_review(report_text, partial):
     """Merge carried findings into the matching blocking/non-blocking section.
 
@@ -370,7 +380,7 @@ def merge_review(report_text, partial):
     carried = []
     for item in (partial or {}).get("defects") or []:
         defect = _as_defect(item)
-        if defect["text"]:
+        if defect["text"] and not _is_legacy_synthetic_defect(defect["text"]):
             defect["carried_over"] = True
             carried.append(defect)
     merged = str(report_text or "")
@@ -406,10 +416,13 @@ merge_review_text = merge_review
 
 def merge_defects(defects, partial):
     """Return ``defects`` plus carried partial defects, deduped."""
-    result = [str(item) for item in (defects or [])]
+    result = [str(item) for item in (defects or [])
+              if not _is_legacy_synthetic_defect(item)]
     known = {normalise_text(item) for item in result}
     for item in (partial or {}).get("defects") or []:
         defect = _as_defect(item)
+        if _is_legacy_synthetic_defect(defect["text"]):
+            continue
         key = normalise_text(defect["text"])
         if defect["text"] and key not in known:
             result.append(defect["text"])
@@ -836,7 +849,8 @@ class ReviewProgress:
                 area["status"] = "checked"
             for item in defects or []:
                 defect = _as_defect(item)
-                if not defect["text"]:
+                if not defect["text"] or _is_legacy_synthetic_defect(
+                        defect["text"]):
                     continue
                 key = normalise_text(defect["text"])
                 match = next((existing for existing in self.defects

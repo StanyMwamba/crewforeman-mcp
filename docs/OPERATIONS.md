@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.3)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.4)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -345,6 +345,35 @@ text shows the same, and `deepseek_job_status run_id=<id> events_since=0`
 returns `reviewer_usage` plus a compact `review_rounds` view. Cost is included
 when `reviewer_prices` resolves every observed model; otherwise the record says
 `cost unknown (reviewer_prices not configured)`.
+
+### Review score re-prompt and `score_missing`
+
+A completed review with no parseable 0-10 score now gets exactly one re-prompt
+in the same reviewer session, carrying the report text. If no session id exists,
+or the same-session call fails because the session is gone or errored, the
+connector falls back once to a short fresh call that derives the score the
+report's findings support (it is not told to answer `unknown`). The attempt is
+a paid reviewer-phase call: the round records `score_reprompt` (method, status,
+seconds, tokens in/cache/out/total, cost and the parsed score/blocking), emits
+a `score_reprompt` journal event, and adds its usage to `reviewer_executions`
+and `reviewer_usage`, so token and cost totals stay honest. The parsed two
+lines are appended to the connector-owned `REVIEW.md` and the augmented report
+is reparsed, so the creative visual-impact cap and the report's blocking count
+still apply. A reply that omits `Blocking defects: N` keeps the report-derived
+count instead of a fabricated zero.
+
+Score labels only discard a parenthetical qualifier when it explicitly names
+the overall score (`(overall)`, `(out of 10)`). Category qualifiers such as
+`## Score (test coverage)` or `| Quality (code quality) | 9/10 |` are unrelated
+metrics and leave the review unscored, so they trigger the same re-prompt
+instead of satisfying the acceptance gate.
+
+`score_missing` marks a round/run whose review still has no score. It is not a
+blocking defect: the reviewer's real defects and real blocking count are kept
+unchanged. The gate never accepts a null score, and a score-missing round with
+no real blocking defects skips the revision and moves to the next review round.
+If no round remains, the run ends as `ok_below_gate` with `quality_score` null
+and `review_passed` false.
 
 ### Detached client restart status (P3.2)
 

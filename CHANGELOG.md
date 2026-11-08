@@ -5,6 +5,66 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.4
+
+### Added
+
+- One score re-prompt per completed review that has no parseable 0-10 score.
+  The connector retries in the same reviewer session when a session id exists;
+  when the session is gone or errored, it makes one short fresh reviewer call
+  carrying the report text. The attempt is recorded as `score_reprompt`
+  (method, status, seconds, tokens in/cache/out/total, cost, parsed
+  score/blocking) and as a `score_reprompt` journal event. Its usage is added
+  to `reviewer_executions`, the review round and `reviewer_usage`.
+- `score_missing` on the review round and run record: an unscored review is
+  represented as missing rather than as `0.0`.
+- Regression coverage in `tests/test_v394_review_score.py` for parser
+  tolerance, the same-session re-prompt and one-shot fresh fallback, token
+  roll-up, `score_missing` gating/resume, legacy synthetic-defect cleanup and
+  the unscored revision brief. The tests use the fake reviewer and need no
+  network access.
+
+### Changed
+
+- Score parsing is context-aware: a number is accepted only from a whole score
+  label, so unrelated text such as `checked 3/10 files`,
+  `9.0/10 pt`, `Test coverage score: 10/10` or `Code quality score: 9/10`
+  is no longer read as a score. A parenthetical qualifier is dropped only when
+  it explicitly names the overall score (`## Score (overall)`,
+  `(out of 10)`); category forms such as `## Score (test coverage)` and
+  `| Quality (code quality) | 9/10 |` are rejected instead of being collapsed
+  to `Score`. `Final quality score: X/10`,
+  bold/table forms and a final standalone `N/10` still parse; target and
+  visual-impact lines do not win, and a bare closing value counts only under an
+  overall-score or summary heading (not `## Tests`/`## Fix list`). Quoted or
+  blockquoted scores are ignored. A review with no score statement yields
+  `score=None`; no number is fabricated. The fresh score-re-prompt fallback
+  derives the score the report's findings support instead of answering
+  `unknown`.
+- A re-prompted score is reparsed through the normal review parser, so the
+  creative visual-impact cap and the report's section-derived blocking count
+  still apply. A reply that omits `Blocking defects: N` keeps the
+  report-derived count rather than recording a fabricated zero.
+- A score-missing round with no real blocking defects skips the revision cycle
+  and moves to the next review round. If no round remains, the run ends as
+  `ok_below_gate` with `quality_score` null and `review_passed` false, and the
+  warning names the unscored review instead of printing a `None/10` score.
+
+### Fixed
+
+- Removed the `score = 0.0` coercion and the synthetic blocking defect
+  ("Independent reviewer did not report a 0-10 score.") added when a review
+  completed without a score. The reviewer's real defects and real
+  `blocking_defects` count are preserved. A 3.9.3 partial/report that still
+  contains that connector-invented bullet is filtered on merge/parse, so it
+  cannot keep a workspace permanently blocked.
+- The quality gate no longer accepts a null score, and an unscored review with
+  no real defects no longer buys a revision for a defect that does not exist.
+- Resume treats a score-missing round that recorded no revision as a consumed
+  review round, not as a pending revision, so the next round re-reviews. A
+  score-missing round that does have real blocking defects still resumes its
+  missing revision.
+
 ## 3.9.3
 
 ### Added
