@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.9.2"
+SERVER_VERSION = "3.9.3"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -63,6 +63,14 @@ _DSH_DEFAULT = ("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/c
 
 # Generic, portable defaults. Every path is overridable.
 DEFAULTS = {
+    # P3.4a: optional root for connector-owned mutable state. Empty keeps
+    # the historical per-key defaults; when set it derives state_dir,
+    # log_dir, jobs_dir and pid_file (four roots, see
+    # DERIVED_STATE_ROOT_KEYS). The Harness session directory is not derived:
+    # dsh keys its home off DSH_HOME, which workers do not receive, so
+    # dsh_sessions_dir stays ~/.dsh/sessions unless explicitly configured
+    # (DSH_SESSIONS_DIR / DEEPSEEK_DSH_SESSIONS_DIR or the config file).
+    "state_root": "",
     "log_dir": os.path.join(BASE_DIR, "runs"),
     "jobs_dir": os.path.join(BASE_DIR, "jobs"),
     "pid_file": os.path.join(BASE_DIR, "keep_awake.pid"),
@@ -283,6 +291,7 @@ ENV_MAP = {
     "DEEPSEEK_WORKSPACE": "harness_workspace",
     "DSH_SESSIONS_DIR": "dsh_sessions_dir",
     "DEEPSEEK_DSH_SESSIONS_DIR": "dsh_sessions_dir",
+    "CREWFOREMAN_STATE_DIR": "state_root",
     "DSH_STATE_DIR": "state_dir",
     "DEEPSEEK_MCP_STATE_DIR": "state_dir",
     "DSH_ZSTD_BIN": "zstd_bin",
@@ -482,8 +491,24 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds"}
-PATH_KEYS = {"log_dir", "jobs_dir", "pid_file", "skills_dir", "harness_workspace",
+PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
+             "harness_workspace",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path"}
+
+# P3.4a: the four connector-owned keys derived from a non-empty state_root
+# (env CREWFOREMAN_STATE_DIR or config file state_root). This sits below
+# explicit config-file values and explicit environment aliases in the
+# precedence order. dsh_sessions_dir is deliberately absent: Harness session
+# logs live under dsh's own home (~/.dsh/sessions, keyed off DSH_HOME), which
+# worker children do not inherit, so deriving a read path here would silently
+# blind token/cost accounting and child activity. Set DSH_SESSIONS_DIR
+# explicitly to co-locate.
+DERIVED_STATE_ROOT_KEYS = {
+    "state_dir": "state",
+    "log_dir": "runs",
+    "jobs_dir": "jobs",
+    "pid_file": "keep_awake.pid",
+}
 
 
 class Config:
@@ -626,17 +651,45 @@ def read_config_file(path=None, env=None):
     return data
 
 
+def _state_root_value(env, file_values):
+    """Return the effective state root ("" when neither source sets one).
+
+    ``CREWFOREMAN_STATE_DIR`` (environment) beats the config-file key
+    ``state_root``. Blank values count as unset so the next source can apply.
+    """
+    for raw in (env.get("CREWFOREMAN_STATE_DIR"), file_values.get("state_root")):
+        if raw is None:
+            continue
+        if isinstance(raw, str) and not raw.strip():
+            continue
+        return _coerce("state_root", raw)
+    return ""
+
+
 def load_config(config_path=None, env=None, include_file=True):
-    """Build a Config using defaults < config file < environment."""
+    """Build a Config: defaults < derived state root < file < environment."""
     env = dict(os.environ) if env is None else env
     values = {key: _coerce(key, value) for key, value in DEFAULTS.items()}
 
+    file_values = {}
     if include_file:
         path = (_expand_config_path(config_path) if config_path is not None
                 else default_config_path(env))
         for key, raw in read_config_file(path, env).items():
             if key in DEFAULTS:
-                values[key] = _coerce(key, raw)
+                file_values[key] = _coerce(key, raw)
+
+    # P3.4a: a non-empty state root relocates the four connector-owned roots
+    # (state/log/jobs/pid only; Harness sessions are never derived). It sits
+    # below config-file values and explicit environment aliases, which are
+    # applied afterwards and therefore win key by key.
+    root = _state_root_value(env, file_values)
+    if root:
+        for key, leaf in DERIVED_STATE_ROOT_KEYS.items():
+            values[key] = os.path.join(root, leaf)
+
+    for key, value in file_values.items():
+        values[key] = value
 
     # Iterate oldest alias first so the newer DSH_* name wins if both are set.
     for env_name, key in reversed(list(ENV_MAP.items())):

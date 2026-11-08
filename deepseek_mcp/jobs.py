@@ -299,9 +299,19 @@ def keep_awake():
     if sys.platform != "darwin" or os.environ.get("DEEPSEEK_NO_CAFFEINATE"):
         return
     try:
-        subprocess.Popen(["/usr/bin/caffeinate", "-i", "-s", "-w", str(os.getpid())],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            ["/usr/bin/caffeinate", "-i", "-s", "-w", str(os.getpid())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        # caffeinate is intentionally detached and exits when this worker
+        # exits; do not wait for it.  Mark the Popen handle as reaped so
+        # CPython's __del__ does not emit "subprocess N is still running"
+        # ResourceWarnings when the handle is collected (same pattern as
+        # restart_helper.spawn_restart_helper).
+        try:
+            proc.returncode = 0
+        except Exception:
+            pass
     except Exception:
         pass
 

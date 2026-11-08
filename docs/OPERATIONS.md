@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.2)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.3)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -21,6 +21,66 @@ On Linux, runs, jobs and state intentionally use the historical
 `~/DeepSeek-MCP` location rather than `$XDG_DATA_HOME` / `$XDG_STATE_HOME`, so
 existing run histories keep working; every path stays overridable through the
 environment variables in `config.example.json`.
+
+### One root for all mutable state: `state_root` (P3.4a)
+
+`CREWFOREMAN_STATE_DIR` (environment) and `state_root` (JSON config key)
+relocate the four connector-owned mutable roots under one directory. They are
+useful for per-test isolation, read-only sandboxes, and side-by-side instances.
+
+When a root is set, these defaults are derived from it:
+
+| Config key | Derived value | Built-in default when unset |
+| --- | --- | --- |
+| `state_dir` | `<root>/state` | `~/DeepSeek-MCP/state` |
+| `log_dir` | `<root>/runs` | `~/DeepSeek-MCP/runs` |
+| `jobs_dir` | `<root>/jobs` | `~/DeepSeek-MCP/jobs` |
+| `pid_file` | `<root>/keep_awake.pid` | `~/DeepSeek-MCP/keep_awake.pid` |
+
+`dsh_sessions_dir` is deliberately **not** derived. Harness session logs live
+under dsh's own home (`~/.dsh/sessions` by default), which dsh keys off
+`DSH_HOME`; the connector does not pass `DSH_HOME` to builder/worker children.
+Deriving the read path from CrewForeman's root would therefore make token and
+cost accounting and child-activity progress silently scan an empty directory.
+It stays `~/.dsh/sessions` unless the config file sets it or
+`DSH_SESSIONS_DIR` / `DEEPSEEK_DSH_SESSIONS_DIR` is exported. Set one of those
+explicitly only if your dsh also runs with a matching `DSH_HOME`; otherwise
+leave it alone.
+
+`skills_dir` and `harness_workspace` are also **not** derived; set them
+explicitly if they must move too. A leading `~` in the root is expanded. An
+empty or unset value means "use the historical defaults", which are
+byte-identical to v3.9.2.
+
+Precedence, lowest to highest:
+
+1. built-in defaults (the table's right column);
+2. paths derived from a non-empty state root;
+3. explicit values in the config file — `state_root` relocates only keys the
+   file did not set itself, so `{"state_root": "/srv/cf", "log_dir":
+   "/var/log/cf"}` keeps that one custom `log_dir`;
+4. explicit environment aliases — `DSH_STATE_DIR` /
+   `DEEPSEEK_MCP_STATE_DIR` (state only), `DEEPSEEK_MCP_LOG_DIR`,
+   `DEEPSEEK_MCP_JOBS_DIR`, `DEEPSEEK_MCP_PID_FILE`, `DSH_SESSIONS_DIR` /
+   `DEEPSEEK_DSH_SESSIONS_DIR`. These always win over derived paths and file
+   values.
+
+`CREWFOREMAN_STATE_DIR` is an environment variable, so it beats the config
+file's `state_root` for the derived paths. If both `DSH_STATE_DIR` and
+`CREWFOREMAN_STATE_DIR` are set, `DSH_STATE_DIR` wins for `state_dir` only;
+the other three roots still come from `CREWFOREMAN_STATE_DIR`.
+
+```bash
+# Environment for one process tree (no file edit):
+CREWFOREMAN_STATE_DIR=/srv/crewforeman python deepseek_mcp.py
+
+# Equivalent config file entry:
+# {"state_root": "/srv/crewforeman"}
+```
+
+Paths are expanded and stripped exactly like the existing path keys
+(`log_dir`, `jobs_dir`, ...), and Python 3.9+ with the standard library only
+is still required.
 
 `DSH_BIN` overrides Harness discovery. When it is unset the server checks the
 per-OS application/runtime locations, then `PATH`. `DSH_SKILLS_DIR` points at
@@ -299,6 +359,21 @@ the app comes back: `state` is `scheduled`, `waiting`, `reopened` or `failed`,
 with `attempts`, `attempts_detail`, timestamps, `helper_pid`, and `error`.
 `restart_client_app` returns the status path; no secret is written there.
 
+On macOS the helper runs `osascript -e 'application "Claude" is running'`
+(authoritative for the app bundle) and the corroborating process check
+`["pgrep", "-a", "-x", "Claude"]` in the same attempt, and records both in the
+same JSON (`process_check_returncode`, `process_check_output`,
+`process_check_ok`, `process_check_ancestry_known`, `verified_by`).
+`verified_by` is `osascript`, or `both` when pgrep also corroborates; a failed
+or false `osascript` keeps the attempt `failed` even if pgrep sees a process.
+`-a` aids diagnosis only: `pgrep` excludes its own process and all of its **ancestors**, so
+plain `pgrep -x Claude` can report nothing while Claude is running when the
+connector itself was started from inside Claude's process tree. Ancestor PIDs
+are excluded from the corroboration so an old Claude process cannot by itself
+prove that a reopened app is running. If the ancestor walk fails (for example
+`/bin/ps` is denied in the Harness sandbox), `process_check_ok` is false and
+`process_check_ancestry_known` is false; pgrep alone never confirms a reopen.
+
 The baseline copy is bounded (256 KiB per file, 400 files); larger or binary
 files are recorded in the manifest with an `excluded` reason and listed as
 changed/added/deleted with a metadata-only body.
@@ -567,7 +642,7 @@ the trace summary and the local files remain.
 | Permissions | `0600`/`0700` | `0600`/`0700` | inherited ACLs (no POSIX mode) |
 | Keep awake | `caffeinate` | `systemd-inhibit` | `SetThreadExecutionState` |
 | OS sandbox | Seatbelt | Harness preset only | Harness preset only |
-| Restart helper | `osascript` + `open -a` | exact `pkill -x`/`pgrep -x` + command/`xdg-open` | `taskkill` + `start` |
+| Restart helper | `osascript` verify (authoritative) + executed `pgrep -a -x <App>` process check + `open -a` | exact `pkill -x`/`pgrep -x` + command/`xdg-open` | `taskkill` + `start` |
 
 Every helper returns a clear `unsupported: ...` sentence instead of raising
 when the platform or the application cannot be handled.
@@ -601,9 +676,11 @@ directory.
 | `jobs_dir` | `~/DeepSeek-MCP/jobs` | Directory scanned for flat job files (`*.job.json`, `*.status.json`, `*.log`). |
 | `state_dir` | `~/DeepSeek-MCP/state` | Traces live in `<state_dir>/traces` (`*.jsonl`/`*.json`) and checkpoints in `<state_dir>/checkpoints` (`*.json`); both are cleaned as part of the same run. |
 
-There are no separate run/trace directory overrides and no base-directory key:
-the run and job roots come from `log_dir`/`jobs_dir`, and the trace/checkpoint
-roots are derived from `state_dir`. `~` is expanded, and a relative path is
+There are no separate per-artifact overrides: the run and job roots come from
+`log_dir`/`jobs_dir`, and the trace/checkpoint roots are derived from
+`state_dir`. `state_root` (or `CREWFOREMAN_STATE_DIR`) relocates all of those
+defaults at once; explicit values still win per key (see "One root for all
+mutable state" above). `~` is expanded, and a relative path is
 resolved against the process working directory. `now` is a timestamp override
 for tests; it defaults to the current time.
 
@@ -702,15 +779,81 @@ The test package probes `DSH_TEST_TMPDIR`, `DSH_TMPDIR`, `TMPDIR`, `TMP` and
 `TEMP` only when the path already exists; it never creates an explicit
 `TMPDIR`.  This matters under uid 0, where a path such as `/no/such` would
 otherwise be created and mask the sandbox misconfiguration.  If no explicit
-candidate is usable, it creates and verifies a fallback under `<repo>/.tmp`,
-`<repo-parent>/.tmp`, `$PWD/.tmp`, or the user cache before trying tmpfs and
-the system temp root.  Set `TMPDIR` (or `DSH_TEST_TMPDIR`) to an existing
-writable directory to choose the location.  `tests.tempdir()` returns a
-verified directory and raises `unittest.SkipTest` with an environment-only
+candidate is usable, it creates and verifies a fallback under
+`<repo>/.dsh-tmp-tests`, `<repo>/.tmp` (and `$PWD/.tmp` when `$PWD` is inside
+the repo) before trying the user cache, tmpfs and the system temp root.
+`repo.parent` is never a fallback.  Set `TMPDIR` (or `DSH_TEST_TMPDIR`) to an
+existing writable directory to choose the location.  `tests.tempdir()` returns
+a verified directory and raises `unittest.SkipTest` with an environment-only
 reason when nothing is writable; `tests.make_tempdir()` creates a fresh child
 directory.  In tests, prefer a regular-file blocker (`regular-file/tmp`) over
 `/no/such/...`, because root can create arbitrary absolute paths while
 `ENOTDIR` under a file fails for every uid.
+
+### Running the full suite inside a Harness sandbox (P3.4a)
+
+From the repository root inside the Harness job workspace, run the standard
+library runner (pytest is neither required nor installed by this project):
+
+```bash
+python3 -m unittest discover -s tests -q
+```
+
+That command is enough under `sandbox workspace-write`; it needs no
+`danger-full-access`, no `sandbox-exec` wrapper and no
+`run_suite_noseatbelt.py`. `tests/isolation.py` is standard-library-only and
+gives every test a fresh `case-*` directory under a workspace-local scratch
+base: an existing `TMPDIR`/`TMP`/`TEMP` whose basename is `.dsh-tmp-*`
+(the Harness grant) first, then `<repo>/.dsh-tmp-tests`, then `<repo>/.tmp`.
+The base is never the checkout's parent (`repo.parent`). `DSH_TEST_TMPDIR` /
+`DSH_TMPDIR` are explicit test-run overrides and may point anywhere writable.
+`tests/__init__.py` installs that per-test hook when the test package is
+imported (the `unittest discover -s tests` layout) and also exposes it through
+`load_tests` for package discovery; `tests/conftest.py` is only an optional
+pytest adapter, not a dependency.
+
+Inside a case the helper points `CREWFOREMAN_STATE_DIR`,
+`DSH_STATE_DIR`/`DEEPSEEK_MCP_STATE_DIR`, `DSH_SESSIONS_DIR`,
+`DSH_SKILLS_DIR`/`DEEPSEEK_SKILLS_DIR`,
+`DSH_WORKSPACE`/`DEEPSEEK_WORKSPACE`, `DEEPSEEK_MCP_CONFIG`,
+`TMPDIR`/`TMP`/`TEMP` and `PYTHONPYCACHEPREFIX` at the case. It also removes
+inherited per-key aliases (`DEEPSEEK_MCP_LOG_DIR`, `DEEPSEEK_MCP_JOBS_DIR`,
+`DEEPSEEK_MCP_PID_FILE`, `DEEPSEEK_DSH_SESSIONS_DIR`) for the duration,
+because those outrank the derived roots; the previous values are restored
+after the test. `DSH_SESSIONS_DIR` is redirected rather than removed because
+session accounting is no longer derived from the state root (B1). Runs, jobs,
+sessions, traces, checkpoints, queue/locks, journals, skills, restart/render
+status and `tempfile` output therefore land inside the workspace, and the case
+directory is deleted after the test.
+
+`HOME`/`USERPROFILE`/`XDG_*` are deliberately left alone:
+`api.redact_secrets()` rewrites `/Users/<name>` and `/home/<name>` to `~`, so
+redirecting `HOME` would make machine-readable trace/resume paths re-expand
+under the wrong home (nine resume tests depend on that round-trip).
+
+Explicit `TMPDIR` (or `DSH_TEST_TMPDIR`) still chooses the base for
+`tests.tempdir()`; the per-test case root is the workspace-local
+`tests.workspace_temp_root()` so an unwritable or outside-workspace `TMPDIR`
+cannot push state out of the sandbox. If no workspace scratch root is
+writable (for example a read-only review sandbox), `tests/isolation.py` records
+one **counted** skip per test (`result.startTest` + `result.addSkip` with an
+`environment-only:` reason + `result.stopTest`) instead of letting `SkipTest`
+escape before `startTest`. The run therefore completes as
+`OK (skipped=N)`; it never aborts with a traceback.
+`tests/sandbox_guard.py` detects an outer Seatbelt/Harness sandbox through
+`safety.seatbelt_usable()` and lets a future test that genuinely needs a real
+nested sandbox skip with an `environment-only` reason instead of failing with
+EPERM. At 3.9.3 no test needs that skip: every sandbox-policy test mocks
+`seatbelt_usable` and `DSH_OS_SANDBOX=0`, so an ordinary writable run reports
+zero skips.
+
+Baseline: 1008 tests at 3.9.2 (historical pytest run, kept only for the
+comparison). The 3.9.3 P3.4a work adds 34 tests over that baseline: 18 from
+the original build plus 16 from the fix round (3 state-root/session
+precedence, 2 B1 session regression, 3 isolation/read-only skip, 6 macOS
+restart verification including the fail-closed ancestor-unknown regression,
+and 2 detached-caffeinate handle tests). Final stdlib-discovered total:
+**1042 tests**.
 
 ## Durable work
 

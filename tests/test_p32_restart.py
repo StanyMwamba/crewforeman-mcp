@@ -138,6 +138,199 @@ class RestartHelperTests(unittest.TestCase):
         self.assertEqual(cfg.restart_status_path, "")
 
 
+class MacOSDefaultCommandTests(unittest.TestCase):
+    """macOS keeps osascript verify and adds an ancestor-aware process check."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
+        self.addCleanup(self.tmp.cleanup)
+        self.status = Path(self.tmp.name) / "restart-status.json"
+        # Deterministic process-check decisions: the real helper asks ps for
+        # its ancestor PIDs; these tests use fake PIDs.
+        patcher = mock.patch.object(restart_helper, "_ancestor_pids",
+                                    return_value=set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_macos_verify_osascript_and_process_check_includes_ancestors(self):
+        commands = restart_helper.resolve_commands("macos", "Claude")
+        self.assertEqual(commands["verify"],
+                         ["osascript", "-e",
+                          'application "Claude" is running'])
+        self.assertEqual(commands["process_check"],
+                         ["pgrep", "-a", "-x", "Claude"])
+        # Plain -x excludes ancestors and can miss a running Claude.
+        self.assertEqual(commands["process_check"][:2], ["pgrep", "-a"])
+        self.assertNotEqual(commands["process_check"],
+                            ["pgrep", "-x", "Claude"])
+        self.assertEqual(restart_helper.macos_process_check("Claude"),
+                         ["pgrep", "-a", "-x", "Claude"])
+
+    def test_run_once_executes_verify_and_process_check(self):
+        seen = []
+
+        def runner(argv, timeout=None):
+            seen.append(list(argv))
+            if list(argv) == ["pgrep", "-a", "-x", "Claude"]:
+                return subprocess.CompletedProcess(argv, 0, "4242 Claude\n", "")
+            # macOS osascript verify requires stdout "true".
+            return subprocess.CompletedProcess(argv, 0, "true", "")
+
+        record = restart_helper.run_once({
+            "app_name": "Claude", "system": "macos", "attempts": 1,
+            "retry_seconds": 0, "status_path": str(self.status),
+            "close": _py("pass"), "open": _py("pass"), "runner": runner,
+        })
+        self.assertEqual(record["state"], "reopened")
+        self.assertEqual(record["process_check"],
+                         ["pgrep", "-a", "-x", "Claude"])
+        # Both the authoritative osascript verify and the process check are
+        # executed in the same attempt.
+        self.assertIn(["osascript", "-e",
+                       'application "Claude" is running'], seen)
+        self.assertIn(["pgrep", "-a", "-x", "Claude"], seen)
+        detail = record["attempts_detail"][0]
+        self.assertEqual(detail["verified_by"], "both")
+        self.assertEqual(detail["verify_returncode"], 0)
+        self.assertEqual(detail["process_check_returncode"], 0)
+        self.assertEqual(detail["process_check_output"], "4242 Claude")
+        self.assertTrue(detail["process_check_ok"])
+        self.assertTrue(record["process_check_ok"])
+        self.assertEqual(record["verified_by"], "both")
+        data = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual(data["process_check"],
+                         ["pgrep", "-a", "-x", "Claude"])
+        self.assertTrue(data["process_check_ok"])
+        self.assertEqual(data["attempts_detail"][0]["verified_by"], "both")
+
+    def test_pgrep_alone_does_not_override_failed_osascript(self):
+        # Regression for the reviewed false positive: osascript said the app
+        # was not running while pgrep found a (non-ancestor) process.  pgrep
+        # is corroboration only and must not turn the attempt into a reopen.
+        def runner(argv, timeout=None):
+            if list(argv) == ["pgrep", "-a", "-x", "Claude"]:
+                return subprocess.CompletedProcess(argv, 0, "4242 Claude\n", "")
+            if list(argv)[:1] == ["osascript"]:
+                return subprocess.CompletedProcess(argv, 1, "false", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        record = restart_helper.run_once({
+            "app_name": "Claude", "system": "macos", "attempts": 1,
+            "retry_seconds": 0, "status_path": str(self.status),
+            "close": _py("pass"), "open": _py("pass"), "runner": runner,
+        })
+        self.assertEqual(record["state"], "failed")
+        self.assertNotEqual(record.get("verified_by"), "process_check")
+        detail = record["attempts_detail"][0]
+        self.assertFalse(detail["verified"])
+        self.assertEqual(detail["verified_by"], "")
+        self.assertEqual(detail["verify_returncode"], 1)
+        self.assertEqual(detail["process_check_returncode"], 0)
+        self.assertEqual(detail["process_check_output"], "4242 Claude")
+        self.assertTrue(detail["process_check_ok"])
+        self.assertTrue(detail["process_check_ancestry_known"])
+        self.assertIn("osascript did not confirm", record["error"])
+        data = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual(data["state"], "failed")
+
+    def test_ancestor_lookup_failure_is_fail_closed(self):
+        # In the Harness sandbox /bin/ps can be denied, so the ancestor walk
+        # is unknown.  The only pgrep match is then an old Claude ancestor;
+        # it must not be accepted as proof that the app reopened.
+        with mock.patch.object(restart_helper, "_ancestor_pids",
+                               return_value=None):
+            def runner(argv, timeout=None):
+                if list(argv) == ["pgrep", "-a", "-x", "Claude"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, "123 Claude\n", "")
+                if list(argv)[:1] == ["osascript"]:
+                    return subprocess.CompletedProcess(argv, 1, "false", "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            record = restart_helper.run_once({
+                "app_name": "Claude", "system": "macos", "attempts": 1,
+                "retry_seconds": 0, "status_path": str(self.status),
+                "close": _py("pass"), "open": _py("pass"), "runner": runner,
+            })
+        self.assertEqual(record["state"], "failed")
+        self.assertNotEqual(record.get("verified_by"), "process_check")
+        detail = record["attempts_detail"][0]
+        self.assertFalse(detail["verified"])
+        self.assertEqual(detail["verified_by"], "")
+        self.assertFalse(detail["process_check_ok"])
+        self.assertFalse(detail["process_check_ancestry_known"])
+        self.assertEqual(detail["process_check_pids"], [123])
+        self.assertEqual(detail["process_check_matches"], [])
+        self.assertIn("ancestor lookup failed", record["error"])
+
+    def test_osascript_alone_verifies_when_process_check_is_empty(self):
+        def runner(argv, timeout=None):
+            if list(argv) == ["pgrep", "-a", "-x", "Claude"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if list(argv)[:1] == ["osascript"]:
+                return subprocess.CompletedProcess(argv, 0, "true", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        record = restart_helper.run_once({
+            "app_name": "Claude", "system": "macos", "attempts": 1,
+            "retry_seconds": 0, "status_path": str(self.status),
+            "close": _py("pass"), "open": _py("pass"), "runner": runner,
+        })
+        self.assertEqual(record["state"], "reopened")
+        detail = record["attempts_detail"][0]
+        self.assertEqual(detail["verified_by"], "osascript")
+        self.assertEqual(detail["verify_returncode"], 0)
+        self.assertEqual(detail["process_check_returncode"], 1)
+
+    def test_both_checks_failing_fails_the_attempt(self):
+        def runner(argv, timeout=None):
+            if list(argv) == ["pgrep", "-a", "-x", "Claude"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if list(argv)[:1] == ["osascript"]:
+                return subprocess.CompletedProcess(argv, 1, "false", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        record = restart_helper.run_once({
+            "app_name": "Claude", "system": "macos", "attempts": 1,
+            "retry_seconds": 0, "status_path": str(self.status),
+            "close": _py("pass"), "open": _py("pass"), "runner": runner,
+        })
+        self.assertEqual(record["state"], "failed")
+        detail = record["attempts_detail"][0]
+        self.assertFalse(detail["verified"])
+        self.assertEqual(detail["verified_by"], "")
+        self.assertEqual(detail["verify_returncode"], 1)
+        self.assertEqual(detail["process_check_returncode"], 1)
+        self.assertIn("verification failed", record["error"])
+        data = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual(data["state"], "failed")
+
+    def test_process_check_ok_requires_zero_exit_and_numeric_pid(self):
+        self.assertTrue(restart_helper._process_check_ok(
+            0, "123 Claude\n", ancestors=set()))
+        self.assertTrue(restart_helper._process_check_ok(
+            0, "  456  Claude\n", ancestors=set()))
+        self.assertFalse(restart_helper._process_check_ok(
+            0, "", ancestors=set()))
+        self.assertFalse(restart_helper._process_check_ok(
+            0, "no pid here", ancestors=set()))
+        self.assertFalse(restart_helper._process_check_ok(
+            1, "123 Claude\n", ancestors=set()))
+        # Unknown ancestry (ps denied) is fail closed, not "no ancestors".
+        with mock.patch.object(restart_helper, "_ancestor_pids",
+                               return_value=None):
+            self.assertFalse(restart_helper._process_check_ok(
+                0, "123 Claude\n"))
+
+    def test_process_check_ignores_ancestor_claude(self):
+        # pgrep -a includes ancestors; an old Claude that is still our
+        # ancestor must not by itself prove the reopened app is running.
+        self.assertFalse(restart_helper._process_check_ok(
+            0, "123 Claude\n", ancestors={123}))
+        self.assertTrue(restart_helper._process_check_ok(
+            0, "123 Claude\n9999 Claude\n", ancestors={123}))
+
+
 class LinuxDefaultCommandTests(unittest.TestCase):
     """The real Linux defaults must use exact names, never full cmdlines."""
 
@@ -173,10 +366,14 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         return str(self.fake_app) if name == "cfp32fakeapp" else None
 
     def _launch_open(self):
+        # Detached on purpose (the reopen must survive the opener); mark the
+        # handle as reaped so this short-lived opener script does not emit a
+        # ResourceWarning at exit (NB6).
         return _py(
             "import subprocess, sys; "
-            "subprocess.Popen([sys.argv[1], '60'], start_new_session=True, "
-            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+            "p = subprocess.Popen([sys.argv[1], '60'], start_new_session=True, "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+            "p.returncode = 0",
             self.fake_app)
 
     def test_defaults_use_exact_process_name_not_full_cmdline(self):

@@ -297,7 +297,8 @@ class HarnessStallIntegrationTests(unittest.TestCase):
 
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             print(json.dumps({"type": "tool_call", "name": "workflow"}), flush=True)
-            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(8)"])
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(8)"])
+            child.returncode = 0
             time.sleep(30)
         """, name="fake-dsh-grandchild")
         run, _error, elapsed, _cfg = self._run_expecting_error(
@@ -319,7 +320,8 @@ class HarnessStallIntegrationTests(unittest.TestCase):
             from pathlib import Path
 
             Path("deliverable.md").write_text("# done\\n", encoding="utf-8")
-            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+            child.returncode = 0
             print(json.dumps({"type": "final", "text": "done"}), flush=True)
             sys.exit(0)
         """, name="fake-dsh-normal-grandchild")

@@ -7,6 +7,7 @@ server.dispatch. No network, no real DSH, no paid API.
 
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -14,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from deepseek_mcp import harness, server
+from deepseek_mcp import harness, jobs, server
 from deepseek_mcp.config import load_config
 from tests import fakes
 
@@ -129,8 +130,18 @@ class CancelTests(unittest.TestCase):
         env = dict(self.env)
         env.update({"FAKE_DSH_MODE": "sleep", "FAKE_DSH_SLEEP": "10",
                     "FAKE_DSH_LOG": str(started_marker)})
+        spawned = []
+        real_spawn = jobs._spawn_worker
+
+        def capture_spawn(*args, **kwargs):
+            child = real_spawn(*args, **kwargs)
+            spawned.append(child)
+            return child
+
         thread = threading.Thread(target=worker, daemon=True)
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(jobs, "_spawn_worker",
+                                  side_effect=capture_spawn):
             thread.start()
             deadline = time.monotonic() + 5
             while not started_marker.exists() and time.monotonic() < deadline:
@@ -141,6 +152,19 @@ class CancelTests(unittest.TestCase):
             thread.join(timeout=8)
 
         self.assertFalse(thread.is_alive(), "dispatch ignored cancellation")
+        # cancel_job SIGTERMs the detached worker but the test owns the
+        # Popen handle, so reap it here; otherwise interpreter exit emits
+        # "subprocess N is still running" (NB6).
+        for child in spawned:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
         self.assertNotIn("error", failure, "dispatch raised: %r" % (failure,))
         result = reply.get("value") or {}
         payload = result.get("result") or {}

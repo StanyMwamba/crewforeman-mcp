@@ -19,7 +19,7 @@ add it to the `env` object shown below.
 
 ## Native command
 
-Version 3.9.2 installs the `crewforeman-mcp` command and registers the MCP
+Version 3.9.3 installs the `crewforeman-mcp` command and registers the MCP
 server name `crewforeman-mcp`. Use this form for a new configuration:
 
 ```json
@@ -213,10 +213,25 @@ test a different interpreter or entry point.
 `osascript` + `open -a` on macOS, `taskkill` + `start` on Windows, and
 exact-name `pkill -x`/`pgrep -x` + command lookup/`xdg-open` on Linux. The
 detached helper owns the close, reopen and verification so the reopen
-survives the client exiting. On Linux, verification also checks the
-reopened process's executable path, so a same-named helper or unrelated
+survives the client exiting. On macOS the helper runs the authoritative
+`osascript -e 'application "Claude" is running'` and a corroborating
+`process_check` of `pgrep -a -x <App>` in the same attempt, and records both
+results in the status JSON. `osascript` alone decides whether the attempt is
+`reopened`; `pgrep` never overrides a failed or false `osascript` result.
+`-a` includes ancestors, so a connector started from inside Claude's process
+tree can see Claude where plain `pgrep -x Claude` cannot. Ancestor PIDs are
+excluded from the pgrep corroboration, and if the ancestor walk itself fails
+(for example `/bin/ps` is denied by the sandbox) the check is recorded as
+inconclusive (`process_check_ancestry_known: false`) rather than treating an
+empty ancestor set as fresh evidence. On Linux, verification also
+checks the reopened process's executable path, so a same-named helper or unrelated
 process cannot make the restart look successful. The call validates the
 application name (max 60 characters) and wait time (0–60 seconds) and
 returns an `unsupported: ...` sentence instead of raising when the
 platform or application cannot be handled. Browser-based clients may need a page reload
 even after the process restarts.
+
+If the standalone `restart_claude.sh` reports "not running" while Claude is
+open, its `is_running()` test uses plain `pgrep -x`; change that one line to
+`pgrep -a -x "$PROC_NAME"` (the script is outside this package and is not
+edited by the connector).

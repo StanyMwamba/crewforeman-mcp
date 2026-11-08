@@ -181,6 +181,10 @@ class NormalExitPipeTests(unittest.TestCase):
             # open for 30 s after the direct child has exited.
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", __GRANDCHILD__])
+            # The grandchild is deliberately left running; mark the handle as
+            # reaped so this fake-dsh process does not emit a ResourceWarning
+            # at exit (NB6).
+            grandchild.returncode = 0
             Path(os.environ["PIPE_TEST_PIDFILE"]).write_text(
                 str(grandchild.pid), encoding="utf-8")
 
@@ -222,6 +226,10 @@ class NormalExitPipeTests(unittest.TestCase):
                 encoding="utf-8")
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", __GRANDCHILD__])
+            # The grandchild is deliberately left running; mark the handle as
+            # reaped so this fake-dsh process does not emit a ResourceWarning
+            # at exit (NB6).
+            grandchild.returncode = 0
             Path(os.environ["PIPE_TEST_PIDFILE"]).write_text(
                 str(grandchild.pid), encoding="utf-8")
             print(json.dumps({"type": "final", "text": "done-never"}),
@@ -267,6 +275,10 @@ class NormalExitPipeTests(unittest.TestCase):
             # by the grandchild 0.45 s later.
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", __GRANDCHILD__])
+            # The grandchild is deliberately left running; mark the handle as
+            # reaped so this fake-dsh process does not emit a ResourceWarning
+            # at exit (NB6).
+            grandchild.returncode = 0
             Path(os.environ["PIPE_TEST_PIDFILE"]).write_text(
                 str(grandchild.pid), encoding="utf-8")
             sys.exit(0)
@@ -301,6 +313,10 @@ class NormalExitPipeTests(unittest.TestCase):
             # post-exit drain beyond its 1 s bound.
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", __GRANDCHILD__])
+            # The grandchild is deliberately left running; mark the handle as
+            # reaped so this fake-dsh process does not emit a ResourceWarning
+            # at exit (NB6).
+            grandchild.returncode = 0
             Path(os.environ["PIPE_TEST_PIDFILE"]).write_text(
                 str(grandchild.pid), encoding="utf-8")
             print(json.dumps({"type": "final", "text": "done-flood"}),

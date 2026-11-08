@@ -201,6 +201,10 @@ if mode == "tree":
                               "import signal, time; "
                               "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                               "time.sleep(30)"])
+    # The grandchild is intentionally left alive for the process-tree kill
+    # test.  Mark the handle as reaped so this fake-dsh process does not emit
+    # "subprocess N is still running" ResourceWarnings on exit (NB6).
+    child.returncode = 0
     Path(os.environ["FAKE_DSH_CHILD_PID"]).write_text(str(child.pid), encoding="utf-8")
     emit({"type": "tool_call", "name": "bash"})
     time.sleep(30)

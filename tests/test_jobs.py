@@ -259,5 +259,32 @@ class JobTests(unittest.TestCase):
             jobs.tool_status({"run_id": "does-not-exist"}, cfg)
 
 
+class KeepAwakeDetachTests(unittest.TestCase):
+    """NB6: the intentionally detached caffeinate handle must not warn."""
+
+    def test_keep_awake_marks_detached_caffeinate_handle_reaped(self):
+        class FakeProc(object):
+            pid = 4321
+            returncode = None
+
+        proc = FakeProc()
+        with mock.patch.object(jobs, "sys", mock.Mock(platform="darwin")), \
+                mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(jobs.subprocess, "Popen",
+                                  return_value=proc) as popen:
+            os.environ.pop("DEEPSEEK_NO_CAFFEINATE", None)
+            jobs.keep_awake()
+        self.assertEqual(popen.call_args[0][0][0], "/usr/bin/caffeinate")
+        self.assertEqual(proc.returncode, 0)
+
+    def test_keep_awake_respects_the_opt_out(self):
+        with mock.patch.object(jobs, "sys", mock.Mock(platform="darwin")), \
+                mock.patch.dict(os.environ,
+                                {"DEEPSEEK_NO_CAFFEINATE": "1"}, clear=False), \
+                mock.patch.object(jobs.subprocess, "Popen") as popen:
+            jobs.keep_awake()
+        popen.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

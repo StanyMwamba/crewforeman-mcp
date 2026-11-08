@@ -99,6 +99,124 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(Path(cfg._config_path).is_absolute())
         self.assertNotIn("~", cfg._config_path)
 
+    def test_state_root_defaults_unchanged_without_root(self):
+        cfg = load_config(config_path=self.config_path, env={})
+        self.assertEqual(cfg.state_root, "")
+        for key in ("state_dir", "log_dir", "jobs_dir", "pid_file"):
+            self.assertEqual(str(getattr(cfg, key)),
+                             os.path.expanduser(DEFAULTS[key]))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_state_root_env_relocates_four_connector_roots(self):
+        root = self.root / "state-root"
+        cfg = load_config(config_path=self.config_path,
+                          env={"CREWFOREMAN_STATE_DIR": str(root)})
+        self.assertEqual(str(cfg.state_root), str(root))
+        self.assertEqual(str(cfg.state_dir), str(root / "state"))
+        self.assertEqual(str(cfg.log_dir), str(root / "runs"))
+        self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
+        self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
+        # B1: the Harness session home is not derived from CrewForeman's root.
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_explicit_state_env_wins_for_state_only(self):
+        root = self.root / "root"
+        state = self.root / "explicit-state"
+        cfg = load_config(config_path=self.config_path, env={
+            "CREWFOREMAN_STATE_DIR": str(root),
+            "DSH_STATE_DIR": str(state),
+        })
+        self.assertEqual(str(cfg.state_dir), str(state))
+        self.assertEqual(str(cfg.log_dir), str(root / "runs"))
+        self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
+        self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_config_state_root_relocates_defaults(self):
+        root = self.root / "file-root"
+        self.config_path.write_text(json.dumps({"state_root": str(root)}),
+                                    encoding="utf-8")
+        cfg = load_config(config_path=self.config_path, env={})
+        self.assertEqual(str(cfg.state_root), str(root))
+        self.assertEqual(str(cfg.state_dir), str(root / "state"))
+        self.assertEqual(str(cfg.log_dir), str(root / "runs"))
+        self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
+        self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_env_state_root_beats_config_state_root(self):
+        file_root = self.root / "file-root"
+        env_root = self.root / "env-root"
+        self.config_path.write_text(json.dumps({"state_root": str(file_root)}),
+                                    encoding="utf-8")
+        cfg = load_config(config_path=self.config_path,
+                          env={"CREWFOREMAN_STATE_DIR": str(env_root)})
+        self.assertEqual(str(cfg.state_root), str(env_root))
+        self.assertEqual(str(cfg.state_dir), str(env_root / "state"))
+        self.assertEqual(str(cfg.log_dir), str(env_root / "runs"))
+        self.assertEqual(str(cfg.jobs_dir), str(env_root / "jobs"))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_config_file_explicit_path_beats_derived_root(self):
+        root = self.root / "file-root"
+        explicit = self.root / "explicit-runs"
+        self.config_path.write_text(json.dumps({
+            "state_root": str(root),
+            "log_dir": str(explicit),
+        }), encoding="utf-8")
+        cfg = load_config(config_path=self.config_path, env={})
+        self.assertEqual(str(cfg.log_dir), str(explicit))
+        self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
+        self.assertEqual(str(cfg.state_dir), str(root / "state"))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
+
+    def test_state_root_tilde_is_expanded(self):
+        home = self.root / "home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home),
+                                          "USERPROFILE": str(home)}):
+            cfg = load_config(config_path=self.config_path,
+                              env={"CREWFOREMAN_STATE_DIR": "~/mcp-root"})
+        self.assertEqual(str(cfg.state_dir), str(home / "mcp-root" / "state"))
+        self.assertEqual(str(cfg.dsh_sessions_dir),
+                         str(home / ".dsh" / "sessions"))
+
+    def test_explicit_sessions_env_wins_with_state_root(self):
+        root = self.root / "root"
+        sessions = self.root / "explicit-sessions"
+        cfg = load_config(config_path=self.config_path, env={
+            "CREWFOREMAN_STATE_DIR": str(root),
+            "DSH_SESSIONS_DIR": str(sessions),
+        })
+        self.assertEqual(str(cfg.dsh_sessions_dir), str(sessions))
+        self.assertEqual(str(cfg.state_dir), str(root / "state"))
+
+    def test_older_sessions_alias_wins_with_state_root(self):
+        root = self.root / "root"
+        sessions = self.root / "older-sessions"
+        cfg = load_config(config_path=self.config_path, env={
+            "CREWFOREMAN_STATE_DIR": str(root),
+            "DEEPSEEK_DSH_SESSIONS_DIR": str(sessions),
+        })
+        self.assertEqual(str(cfg.dsh_sessions_dir), str(sessions))
+
+    def test_config_file_sessions_wins_over_derived_root(self):
+        root = self.root / "root"
+        sessions = self.root / "file-sessions"
+        self.config_path.write_text(json.dumps({
+            "state_root": str(root),
+            "dsh_sessions_dir": str(sessions),
+        }), encoding="utf-8")
+        cfg = load_config(config_path=self.config_path, env={})
+        self.assertEqual(str(cfg.dsh_sessions_dir), str(sessions))
+        self.assertEqual(str(cfg.state_dir), str(root / "state"))
+
     def test_unknown_config_keys_ignored(self):
         self.config_path.write_text(json.dumps({"not_a_setting": 1, "model": "deepseek-flash"}),
                                     encoding="utf-8")

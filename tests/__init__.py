@@ -45,7 +45,31 @@ os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
 os.environ.setdefault("DSH_OS_SANDBOX", "0")
 
 _PROBE_PREFIX = ".dsh-tmp-probe-"
-_EXPLICIT_VARS = ("DSH_TEST_TMPDIR", "DSH_TMPDIR", "TMPDIR", "TMP", "TEMP")
+_TEST_OVERRIDE_VARS = ("DSH_TEST_TMPDIR", "DSH_TMPDIR")
+_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
+_EXPLICIT_VARS = _TEST_OVERRIDE_VARS + _ENV_VARS
+
+
+def _env_temp_candidates(names=None):
+    """Return environment temp candidates in override order."""
+    candidates = []
+    for name in (names or _EXPLICIT_VARS):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            candidates.append(Path(os.path.expanduser(raw)))
+        except (TypeError, ValueError):
+            continue
+    return candidates
+
+
+# Capture the environment handed to the import before _select_tempdir()
+# rewrites os.environ["TMPDIR"].  The Harness may grant a workspace-local
+# ``.dsh-tmp-*`` directory through TMPDIR; that grant must stay visible to
+# workspace_temp_root() even after this module installs its own fallback.
+_IMPORT_TEMP_CANDIDATES = tuple(_env_temp_candidates())
+_IMPORT_TEST_OVERRIDES = tuple(_env_temp_candidates(_TEST_OVERRIDE_VARS))
 
 
 def _usable(directory):
@@ -140,8 +164,7 @@ def _select_tempdir():
     # grant over ``repo/.tmp`` so a focused run with an unusable TMPDIR (for
     # example the reviewer's TMPDIR=/tmp) still executes every test instead of
     # skipping the ones that need a scratch directory.
-    fallbacks = [repo.parent / ".dsh-tmp-tests", repo / ".dsh-tmp-tests",
-                 repo / ".tmp", repo.parent / ".tmp"]
+    fallbacks = [repo / ".dsh-tmp-tests", repo / ".tmp"]
     try:
         fallbacks.append(Path.cwd() / ".tmp")
     except OSError:
@@ -165,6 +188,105 @@ def _select_tempdir():
     except Exception:
         return None
     return _first_usable([default], create=False)
+
+
+def _inside(path, root):
+    """True when *path* resolves to *root* or below it."""
+    try:
+        path = Path(path).resolve()
+        root = Path(root).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return path == root or root in path.parents
+
+
+def _workspace_grant(candidate, repo):
+    """True when *candidate* is an allowed workspace scratch location.
+
+    ``DSH_TEST_TMPDIR``/``DSH_TMPDIR`` are explicit test-run overrides and are
+    accepted anywhere (the caller opted in).  ``TMPDIR``/``TMP``/``TEMP`` are
+    ambient, so they are accepted only inside the repository or for the
+    Harness-granted ``<workspace>/.dsh-tmp-*`` directory whose parent is the
+    repository's parent (or ``DSH_WORKSPACE``).  A ``.dsh-tmp-*`` directory
+    under ``/tmp`` is not a workspace grant (NB1/S6 risk).
+    """
+    try:
+        candidate = Path(candidate)
+    except (TypeError, ValueError):
+        return False
+    if _inside(candidate, repo):
+        return True
+    if not candidate.name.startswith(".dsh-tmp-"):
+        return False
+    roots = [repo.parent]
+    workspace = os.environ.get("DSH_WORKSPACE")
+    if workspace:
+        try:
+            roots.append(Path(os.path.expanduser(workspace)))
+        except (TypeError, ValueError):
+            pass
+    return any(_inside(candidate, root) for root in roots)
+
+
+def workspace_temp_root():
+    """Return a verified workspace-local scratch root or raise SkipTest.
+
+    ``DSH_TEST_TMPDIR``/``DSH_TMPDIR`` (explicit test overrides) come first and
+    may point anywhere writable.  Then an existing, writable
+    TMPDIR/TMP/TEMP candidate is preferred when it is inside the repository or
+    is the Harness-granted ``<workspace>/.dsh-tmp-*`` directory.  The
+    import-time snapshot keeps that grant visible after ``_select_tempdir``
+    rewrites ``TMPDIR``.  Deliberate fallbacks are ``<repo>/.dsh-tmp-tests`` and
+    ``<repo>/.tmp``; ``cwd/.tmp`` is accepted only when the cwd is inside the
+    repository.  ``repo.parent`` is never a derived candidate (NB1).  If none
+    is writable the environment-only skip is raised; the unittest hook turns
+    it into a counted per-test skip (B2).
+    """
+    repo = Path(__file__).resolve().parent.parent
+    # Inside an active case, TMPDIR points at <case>/tmp.  That is a child of
+    # the scratch base, not the base itself: accepting it would make every
+    # call return a nested case-local path (and made the TEST-MAC run fail its
+    # "tempdir is under the workspace root" assertion).  Skip any candidate
+    # inside the active case.
+    active_case = os.environ.get("DSH_TEST_CASE_DIR")
+    active_case_path = Path(active_case) if active_case else None
+
+    def _case_local(candidate):
+        return (active_case_path is not None
+                and _inside(candidate, active_case_path))
+
+    test_overrides = []
+    for candidate in (_env_temp_candidates(_TEST_OVERRIDE_VARS)
+                      + list(_IMPORT_TEST_OVERRIDES)):
+        if candidate not in test_overrides and not _case_local(candidate):
+            test_overrides.append(candidate)
+    selected = _first_usable(test_overrides, create=False)
+    if selected is not None:
+        return selected
+    env_candidates = []
+    for candidate in (_env_temp_candidates(_ENV_VARS)
+                      + list(_IMPORT_TEMP_CANDIDATES)):
+        if (_workspace_grant(candidate, repo) and not _case_local(candidate)
+                and candidate not in env_candidates):
+            env_candidates.append(candidate)
+    selected = _first_usable(env_candidates, create=False)
+    if selected is not None:
+        return selected
+    fallbacks = [repo / ".dsh-tmp-tests", repo / ".tmp"]
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    if cwd is not None and _inside(cwd, repo):
+        fallbacks.append(cwd / ".tmp")
+    selected = _first_usable(fallbacks, create=True)
+    if selected is not None:
+        return selected
+    raise unittest.SkipTest(
+        "environment-only: no writable workspace scratch root inside the "
+        "workspace (tried %s); the suite must not write outside the "
+        "sandboxed workspace"
+        % ", ".join(str(item) for item in test_overrides + env_candidates + fallbacks))
 
 
 def tempdir():
@@ -198,3 +320,26 @@ if _SELECTED_TMPDIR is not None:
     # and the environment at the verified path so child processes agree.
     tempfile.tempdir = str(_SELECTED_TMPDIR)
     os.environ["TMPDIR"] = str(_SELECTED_TMPDIR)
+
+# Install the per-test isolation hook as soon as the test package is imported.
+# ``unittest discover -s tests`` imports modules as top-level names but every
+# test module imports ``tests`` during discovery, before any test runs.
+from tests import isolation as _isolation  # noqa: E402
+
+_isolation.install_unittest_hook()
+
+
+def load_tests(loader, standard_tests, pattern):
+    """Keep the discovery suite unchanged; the per-test hook does the work.
+
+    ``python -m unittest discover -s tests`` imports test modules as top-level
+    modules and does not call this hook; importing ``tests`` installs the
+    ``unittest.TestCase.run`` hook below.  Package discovery does call this
+    hook, and returning the suite unchanged preserves unittest's normal class
+    and module fixture handling.  The helper is stdlib-only, so no third-party
+    test dependency is needed.
+    """
+    from tests import isolation
+
+    isolation.install_unittest_hook()
+    return standard_tests

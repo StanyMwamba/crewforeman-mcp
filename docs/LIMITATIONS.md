@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.9.2)
+# Known limitations and failure modes (3.9.3)
 
 Only limitations that remain in this version are listed here.
 

@@ -88,6 +88,18 @@ def _linux_candidates(name):
     return candidates
 
 
+def macos_process_check(name):
+    """Return the argv for the macOS application process check.
+
+    ``pgrep -a`` is required to *see* a running app when this helper is
+    started from inside Claude's process tree: plain ``pgrep -x`` excludes its
+    own ancestors, so it returns no match even though a process named exactly
+    ``Claude`` is running.  ``-a`` includes ancestors; the caller filters the
+    ancestor PIDs again before treating the output as corroboration.
+    """
+    return ["pgrep", "-a", "-x", _app_name(name)]
+
+
 def resolve_commands(family, app_name, overrides=None, which=None):
     """Return ``close``/``open``/``verify`` argv lists for one platform."""
     family = _family(family)
@@ -99,6 +111,14 @@ def resolve_commands(family, app_name, overrides=None, which=None):
             "close": ["osascript", "-e", 'tell application "%s" to quit' % name],
             "open": ["open", "-a", name],
             "verify": ["osascript", "-e", 'application "%s" is running' % name],
+            # Executed alongside osascript on every attempt and recorded as
+            # corroboration.  osascript remains authoritative for ``reopened``:
+            # pgrep alone never overrides a failed/false osascript.  ``-a``
+            # includes ancestors, which plain ``pgrep -x`` excludes, so a
+            # helper inside Claude's process tree can still see Claude; the
+            # ancestor PIDs are filtered before the check counts as
+            # corroboration.
+            "process_check": macos_process_check(name),
         }
     elif family == "windows":
         commands = {
@@ -308,6 +328,111 @@ def _opts(args):
     return dict(vars(args))
 
 
+def _parent_pid(pid):
+    """Best-effort parent PID for *pid* on macOS/Linux; None when unknown."""
+    if sys.platform.startswith("linux"):
+        try:
+            data = Path("/proc/%d/stat" % int(pid)).read_text(encoding="utf-8")
+            # The comm field may contain spaces and parentheses; the fields
+            # after the last ')' are state, ppid, ...
+            fields = data.rsplit(")", 1)[1].split()
+            return int(fields[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "ppid="],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=2, check=False)
+        text = _text(proc.stdout).strip().splitlines()
+        return int(text[0].strip()) if text else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _ancestor_pids(pid=None):
+    """Return this process's ancestor PIDs, or ``None`` when unknown.
+
+    ``pgrep -a`` deliberately includes ancestors so a helper running inside
+    the app's process tree can see the app.  That is useful for diagnostics,
+    but an ancestor must not *by itself* prove that a reopened app is running:
+    the old app would still be an ancestor while osascript reports it gone.
+    Excluding ancestors keeps the process check a real second signal.
+
+    A failed parent lookup (for example ``ps`` denied by a sandbox) makes the
+    result explicitly unknown instead of silently returning an empty set.  A
+    caller must treat ``None`` as "cannot corroborate", never as "no
+    ancestors", or a stale ancestor PID would look like a fresh process.
+    """
+    seen = set()
+    current = int(pid if pid is not None else os.getpid())
+    for _ in range(64):
+        parent = _parent_pid(current)
+        if parent is None:
+            return None
+        if parent <= 0:
+            return seen
+        if parent in seen:
+            # A cycle means the walk is incomplete and the evidence is unsafe.
+            return None
+        seen.add(parent)
+        if parent == 1:
+            return seen
+        current = parent
+    return None
+
+
+def _process_check_result(code, stdout, ancestors=None):
+    """Return the process check result as an explicit, fail-closed mapping.
+
+    ``pgrep`` exits 0 on a match and prints one ``<pid> <command>`` line per
+    match.  Require both the zero exit status and a numeric PID so a broken or
+    stubbed ``pgrep`` that exits 0 with empty output cannot verify a restart.
+    *ancestors* may be supplied for tests.  When it is omitted the ancestor
+    walk runs; if that walk is incomplete the check is inconclusive
+    (``ancestry_known=False``) and never confirms a restart.
+    """
+    result = {
+        "ok": False,
+        "ancestry_known": False,
+        "pids": [],
+        "matches": [],
+    }
+    try:
+        if int(code) != 0:
+            return result
+    except (TypeError, ValueError):
+        return result
+    pids = []
+    for line in _text(stdout).splitlines():
+        tokens = line.split()
+        if tokens and tokens[0].isdigit():
+            pids.append(int(tokens[0]))
+    result["pids"] = pids
+    if not pids:
+        return result
+    if ancestors is None:
+        ancestors = _ancestor_pids()
+    if ancestors is None:
+        return result
+    ancestor_set = set(ancestors)
+    matches = [pid for pid in pids if pid not in ancestor_set]
+    result["ancestry_known"] = True
+    result["matches"] = matches
+    result["ok"] = bool(matches)
+    return result
+
+
+def _process_check_ok(code, stdout, ancestors=None):
+    """Return True when the process check found a non-ancestor process.
+
+    Thin boolean wrapper around :func:`_process_check_result`; an unknown
+    ancestor walk is falsey (fail closed).  Ancestors of this helper are
+    ignored unless *ancestors* is supplied.
+    """
+    return _process_check_result(code, stdout, ancestors)["ok"]
+
+
 def run_once(args):
     """Close, reopen and verify the app once, writing status as it goes.
 
@@ -355,6 +480,10 @@ def run_once(args):
         "message": "Restart helper started.",
         "attempts_detail": [],
     }
+    if commands.get("process_check"):
+        # Executed alongside osascript in the attempt loop; kept here so the
+        # status file shows the exact argv even before the first attempt.
+        record["process_check"] = list(commands["process_check"])
     write_status(status_path, record)
 
     close_code, _, close_err = _execute(commands["close"], runner, timeout)
@@ -392,10 +521,40 @@ def run_once(args):
             sleeper(retry)
         verify_code, verify_out, verify_err = _execute(
             commands["verify"], runner, timeout)
+        process_check = commands.get("process_check")
+        if process_check:
+            detail["verify_returncode"] = verify_code
+        verified_by = ""
         if _verify_ok(family, verify_code, verify_out, verify_err,
                       expected_executable=expected_exe,
                       helper_pid=os.getpid()):
+            verified_by = "osascript"
+        if process_check:
+            # macOS executes both signals on every attempt.  osascript is
+            # authoritative for ``reopened``; pgrep is corroboration only and
+            # can never override a failed or false osascript result.  An
+            # incomplete ancestor walk is recorded as inconclusive and cannot
+            # confirm either.
+            check_code, check_out, _ = _execute(process_check, runner, timeout)
+            check = _process_check_result(check_code, check_out)
+            detail["process_check_returncode"] = check_code
+            detail["process_check_output"] = check_out.strip()[:240]
+            detail["process_check_ok"] = check["ok"]
+            detail["process_check_ancestry_known"] = check["ancestry_known"]
+            detail["process_check_pids"] = check["pids"]
+            detail["process_check_matches"] = check["matches"]
+            # A stable top-level view for operators and tests, not only the
+            # per-attempt detail.
+            record["process_check_returncode"] = check_code
+            record["process_check_output"] = check_out.strip()[:240]
+            record["process_check_ok"] = check["ok"]
+            record["process_check_ancestry_known"] = check["ancestry_known"]
+            if check["ok"] and verified_by == "osascript":
+                verified_by = "both"
+        if verified_by:
             detail["verified"] = True
+            detail["verified_by"] = verified_by
+            record["verified_by"] = verified_by
             if expected_exe:
                 detail["executable"] = str(expected_exe)
             record["attempts_detail"].append(detail)
@@ -407,7 +566,19 @@ def run_once(args):
             write_status(status_path, record)
             return record
 
+        if process_check:
+            detail["verified_by"] = ""
         last_error = "verification failed with exit code %d" % verify_code
+        if process_check:
+            if not detail["process_check_ancestry_known"]:
+                last_error += (" (process check inconclusive: ancestor "
+                               "lookup failed)")
+            elif detail["process_check_ok"]:
+                last_error += (" (process check found a process but "
+                               "osascript did not confirm the app)")
+            else:
+                last_error += " (process check exit code %d)" % (
+                    detail["process_check_returncode"])
         if verify_err:
             last_error += ": " + verify_err
         detail["error"] = last_error[:240]

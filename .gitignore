@@ -78,4 +78,5 @@ test-results/
 *~
 
 # Test-run temp artifacts (TMPDIR may point inside the repo)
+.dsh-tmp-*
 .tmp-tests/

@@ -68,12 +68,13 @@ class TempDirPortabilityTests(unittest.TestCase):
         self.assertTrue(tests._usable(selected))
         self.assertNotEqual(str(selected), str(blocked))
         self.assertFalse(blocked.exists())
-        # The connector's read-only reviewer grants writes only below
-        # ``<workspace>/.dsh-tmp-*``.  Prefer that granted path over
-        # ``repo/.tmp``, which the same Seatbelt profile denies; this is what
-        # keeps the focused P3.2 run from skipping when its TMPDIR is /tmp.
+        # The deliberate fallback stays inside the checkout (NB1): never
+        # ``repo.parent``, which would write into the live ``~/DeepSeek-MCP``
+        # when the repo is ``~/DeepSeek-MCP/release``.  ``repo/.dsh-tmp-tests``
+        # is what keeps a focused P3.2 run from skipping when its TMPDIR is
+        # /tmp, and it is ignored by ``.gitignore``.
         repo = Path(tests.__file__).resolve().parent.parent
-        self.assertEqual(Path(selected), (repo.parent / ".dsh-tmp-tests").resolve())
+        self.assertEqual(Path(selected), (repo / ".dsh-tmp-tests").resolve())
         # The blocker-file premise must be uid-independent: creating the
         # candidate under a regular file raises ENOTDIR even for uid 0.  This
         # replaces an earlier ``euid == 0 or True`` assertion that could never

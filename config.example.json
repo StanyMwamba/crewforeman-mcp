@@ -1,4 +1,5 @@
 {
+  "state_root": "",
   "daily_alert_usd": 2.0,
   "daily_limit_usd": null,
   "default_subagents": 16,

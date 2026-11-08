@@ -5,6 +5,100 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.3
+
+### Added
+
+- State root: `CREWFOREMAN_STATE_DIR` (environment) and `state_root` (JSON
+  config key) relocate the four connector-owned roots `state_dir`, `log_dir`,
+  `jobs_dir` and `pid_file` under one directory (`<root>/state`,
+  `<root>/runs`, `<root>/jobs`, `<root>/keep_awake.pid`). Unset means the
+  historical 3.9.2 defaults, byte for byte; explicit config-file values and
+  per-key `DSH_*`/`DEEPSEEK_*` aliases still win. `dsh_sessions_dir` is **not**
+  derived (see Fixed). `skills_dir` and `harness_workspace` are not derived.
+  See `docs/OPERATIONS.md`.
+- Sandbox-safe test suite (P3.4a): `tests/isolation.py` (standard library
+  only) gives every test a fresh `case-*` directory under a workspace-local
+  scratch base: an existing `TMPDIR`/`TMP`/`TEMP` whose basename is
+  `.dsh-tmp-*` first, then `<repo>/.dsh-tmp-tests`, then `<repo>/.tmp`.
+  `repo.parent` is never a candidate. `tests/__init__.py` installs the
+  per-test hook for `python3 -m unittest discover -s tests`, and `load_tests`
+  covers package discovery; `tests/conftest.py` is only an optional pytest
+  adapter, not a dependency. The helper points the state root,
+  `DSH_SESSIONS_DIR`, `DEEPSEEK_MCP_CONFIG`, `TMPDIR`/`TMP`/`TEMP` and
+  `PYTHONPYCACHEPREFIX` inside the case and clears inherited
+  `DEEPSEEK_MCP_LOG_DIR`/`_JOBS_DIR`/`_PID_FILE` and
+  `DEEPSEEK_DSH_SESSIONS_DIR` for the duration (restoring them afterwards),
+  because those aliases outrank the derived roots. Runs, jobs, sessions,
+  traces, checkpoints, queue/locks, journals, skills, restart/render status
+  and tempfiles stay in the workspace; the directory is removed after the
+  test. `HOME`/`USERPROFILE`/`XDG_*` are deliberately untouched because
+  `api.redact_secrets()` rewrites a personal home prefix to `~` in
+  machine-readable trace paths, and redirecting `HOME` would break the resume
+  round-trip.
+- If no workspace scratch root is writable (read-only review sandbox), the
+  isolation hook records one **counted** skip per test
+  (`result.startTest` + `result.addSkip` with an `environment-only:` reason +
+  `result.stopTest`) instead of letting `SkipTest` escape before `startTest`.
+  The run completes as `OK (skipped=N)` and never aborts with a traceback.
+  `tests/sandbox_guard.py` detects an outer Seatbelt/Harness sandbox through
+  `safety.seatbelt_usable()` for a future test that genuinely needs a real
+  nested `sandbox-exec`; no current test needs it.
+- 34 new tests over the 3.9.2 baseline: 18 from the original 3.9.3 build
+  plus 16 from the fix round (3 for state-root/session precedence, 2 for the
+  B1 fake-HOME session regression, 3 for isolation/read-only counted skips,
+  6 for macOS restart verification including the fail-closed
+  ancestor-unknown regression, and 2 for the detached-caffeinate handle).
+  Full stdlib suite: **1042 tests** (1008 historical pytest baseline), zero
+  failures, zero errors, zero skips in a writable workspace-write Harness
+  job, with the system Python, no `danger-full-access`, no nested sandbox and
+  no installed test dependency.
+
+### Fixed
+
+- Harness session accounting: `state_root` no longer derives
+  `dsh_sessions_dir`. dsh decides its session home from `DSH_HOME`, which the
+  connector does not pass to builder/worker children, so deriving the read
+  path made token/cost accounting and child activity scan an empty directory.
+  It stays `~/.dsh/sessions` unless the config file or
+  `DSH_SESSIONS_DIR`/`DEEPSEEK_DSH_SESSIONS_DIR` explicitly sets it. Per-test
+  isolation redirects `DSH_SESSIONS_DIR` at the case so the suite still keeps
+  sessions inside the workspace.
+- Read-only/scratch roots: an unwritable workspace now yields counted
+  environment-only skips instead of a traceback that aborted the run; the
+  first temp candidate is no longer `repo.parent` (which would write into the
+  live `~/DeepSeek-MCP`), and `.dsh-tmp-*` is git-ignored.
+- macOS restart process check: plain `pgrep -x Claude` can miss the running
+  app because `pgrep` excludes its own ancestors, and a connector started from
+  inside Claude's process tree is a descendant of the app. The helper
+  **executes** `["pgrep", "-a", "-x", "Claude"]` in the same attempt as the
+  authoritative `osascript -e 'application "Claude" is running'` and records
+  both results in `restart-status.json`. `osascript` remains authoritative for
+  `reopened`; pgrep is corroboration only and never overrides a failed or
+  false `osascript` result. Ancestor PIDs are excluded from the corroboration,
+  and an incomplete ancestor walk (for example `/bin/ps` denied) is recorded
+  as inconclusive and cannot confirm a reopen. `pgrep -a -x` is corroboration
+  and diagnosis only; it is not a fix and never makes `reopened` true. The
+  out-of-scope `restart_claude.sh` still relies on `is_running()`.
+- ResourceWarning noise: the identified intentionally detached children — the
+  macOS `caffeinate` child in `jobs.keep_awake()`, the fake-dsh `tree`
+  grandchild, the fake-dsh grandchild/opener scripts in the v3.2 stall/final
+  pipe tests and `tests/test_p32_restart.py` — are marked as reaped on their
+  `Popen` handles. The last residual was attributed to the real detached job
+  worker started by `tests/test_v360_cancel.py`; that test now captures and
+  reaps the handle after cancellation. The final full-suite logs contain zero
+  `ResourceWarning: subprocess` lines.
+- Documentation: `docs/OPERATIONS.md` documents the four-root state root, the
+  explicit session override, the counted read-only skip behaviour and the
+  executed macOS process check; the retention sentence no longer claims there
+  is no base-directory key. `docs/CLIENTS.md` and `CHANGELOG.md` match the
+  executed check.
+
+### Changed
+
+- Version 3.9.3 (`deepseek_mcp/config.py`, `deepseek_mcp/observability.py`,
+  `pyproject.toml`, README and current-version docs).
+
 ## 3.9.2
 
 ### Added
