@@ -3935,12 +3935,20 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         run["render_probe"] = render_probe
     render_hint = render.hint(render_probe) if render_probe else None
 
+    from . import builder_practices
+    practices = builder_practices.record(
+        choice.get("task_type"),
+        enabled=bool(args.get("builder_practices",
+                              getattr(cfg, "builder_practices", True))))
+    run["builder_practices"] = practices
+
     task = build_harness_task(prompt, choice["subagents"], choice["reason"], skill,
                               quality=quality, quality_rounds=rounds,
                               concurrency=child_concurrency,
                               independent_review=independent,
                               render_hint=render_hint,
-                              task_type=choice.get("task_type"))
+                              task_type=choice.get("task_type"),
+                              builder_practices=practices["enabled"])
     run["harness_task"] = task
 
     try:
@@ -4802,7 +4810,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     skill=skill, quality=quality, quality_rounds=rounds,
                     concurrency=child_concurrency,
                     independent_review=independent, render_hint=render_hint,
-                    task_type=run.get("task_type"))
+                    task_type=run.get("task_type"),
+                    builder_practices=(run.get("builder_practices")
+                                       or {}).get("enabled", True))
                 extra_limit = job_budget.phase_limit(limit)
                 if extra_limit is not None and extra_limit <= 0:
                     entry["reason"] = ("live scaling stopped: whole-job deadline "
@@ -6058,7 +6068,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 prompt, deliverable_files, fixes, defects, skill=skill,
                 quality_target=DEFAULT_QUALITY_TARGET, round_no=round_no,
                 escalation=escalation, task_type=run.get("task_type"),
-                scope_note=round_scope, score_missing=score_missing)
+                scope_note=round_scope, score_missing=score_missing,
+                builder_practices=(run.get("builder_practices")
+                                   or {}).get("enabled", True))
             if checkpoint:
                 try:
                     checkpoint.begin("revision-%d" % round_no)
@@ -6249,6 +6261,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     else:
         run["quality_rounds_used"] = 0
     run["agent_escalations"] = escalations
+    review_entries = [item for item in review_rounds
+                      if item.get("kind") == "review"]
+    run["first_review_score"] = (review_entries[0].get("score")
+                                 if review_entries else None)
+    run["review_scores"] = [entry.get("score") for entry in review_entries]
 
     if independent:
         last_review = next((item for item in reversed(review_rounds)

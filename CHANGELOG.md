@@ -5,6 +5,45 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.9.5
+
+### Added
+
+- Fixed `builder-practices` block (v1.0, at most 350 words) injected into
+  builder and revision prompts. A full **code** variant is used for
+  implementation work and a lighter variant for documentation and research
+  tasks. It applies to every build and does not depend on skill detection.
+- `deepseek_mcp/builder_practices.py`, which owns the versioned practice text
+  and selects the variant.
+- Run records now include `builder_practices` (set, version, variant,
+  enabled, words, characters and estimated tokens), `first_review_score`, and
+  `review_scores`, making the first review and the final score available side
+  by side.
+- `scripts/report_scores.py`: first-review versus final score grouped by
+  practice-set version. Run
+  `python3 scripts/report_scores.py --runs <log_dir>` for a table, or add
+  `--json` for machine-readable output.
+
+### Changed
+
+- Builder and revision prompt assembly in `deepseek_mcp/quality.py` appends
+  the practices block when enabled.
+- New `builder_practices` config key (boolean, default `true`) and
+  `DSH_BUILDER_PRACTICES` environment alias. Set `builder_practices` to
+  `false` (or export `DSH_BUILDER_PRACTICES=false`) to disable injection.
+- Version bumped from 3.9.4 to 3.9.5 in package metadata, runtime/serverInfo,
+  observability, the smoke client, the README's version line (line 3), and
+  docs headings.
+- Documentation: new `docs/CREDITS.md`, a "Builder practices (3.9.5)" section
+  in `docs/OPERATIONS.md`, and this changelog entry.
+
+### Tests
+
+- New focused tests: `tests/test_v395_practices_core.py`,
+  `tests/test_v395_prompt_wiring.py`, `tests/test_v395_run_record.py`, and
+  `tests/test_v395_score_report.py`.
+- Existing release tests were updated for the 3.9.5 version.
+
 ## 3.9.4
 
 ### Added

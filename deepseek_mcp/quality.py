@@ -10,6 +10,8 @@ import os
 import re
 from pathlib import Path
 
+from .builder_practices import block as builder_practice_block, record as builder_practice_record
+
 
 DEFAULT_QUALITY_TARGET = 8.5
 DEFAULT_QUALITY_ROUNDS = 3
@@ -985,7 +987,7 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
                        quality_target=DEFAULT_QUALITY_TARGET,
                        concurrency=DEFAULT_CONCURRENCY,
                        independent_review=True, render_hint=None,
-                       task_type=None):
+                       task_type=None, builder_practices=True):
     """Return the full task text sent to ``dsh --profile headless``."""
     parts = [prompt.strip()]
     try:
@@ -1085,6 +1087,11 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
 
     if task_type == "creative":
         parts.append(_creative_builder_contract())
+
+    # Fixed builder practices, after the work method/creative section and
+    # before the render hint and execution-safety contract.
+    if builder_practices:
+        parts.append(builder_practice_block(task_type))
 
     if render_hint:
         parts.append("\n\n## Render environment (connector probe)\n%s\n" % render_hint)
@@ -1591,7 +1598,8 @@ def build_score_reprompt_task(report_text, round_no=1, include_report=True,
 def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
                         skill=None, quality_target=DEFAULT_QUALITY_TARGET,
                         round_no=1, escalation=None, task_type=None,
-                        scope_note=None, score_missing=False):
+                        scope_note=None, score_missing=False,
+                        builder_practices=True):
     """Task text for a connector-owned REVISION run after a failed review.
 
     ``scope_note`` is the operator's manual ``resume_with_scope`` note after a
@@ -1611,6 +1619,8 @@ def build_revision_task(prompt, deliverable_files, fix_list, blocking_defects,
         "REVIEW.md; the reviewer owns that file.\n\n"
         "## Original brief\n\n%s\n" % (prompt or "").strip(),
     ]
+    if builder_practices:
+        parts.append(builder_practice_block(task_type))
     if score_missing:
         parts.append(
             "\n\n## Unscored review (score missing)\n\n"

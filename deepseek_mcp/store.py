@@ -225,6 +225,15 @@ def _md(run):
                              entry.get("total_tokens", "?"), cost_text,
                              " (incl. pre-flight)"
                              if entry.get("preflight_usage") else ""))
+    _practices = run.get("builder_practices")
+    if _practices:
+        if _practices.get("enabled", True):
+            lines.append("- **Builder practices:** %s v%s (%s, %s words)" % (
+                _practices.get("set", "builder-practices"),
+                _practices.get("version", "?"),
+                _practices.get("variant", "?"), _practices.get("words", 0)))
+        else:
+            lines.append("- **Builder practices:** disabled")
     if run.get("skill"):
         lines.append("- **Skill:** %s" % run.get("skill"))
     if run.get("agent_choice_reason"):

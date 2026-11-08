@@ -1,8 +1,35 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.4)
+# Operations: configuration, safety, budgets, traces and retention (v3.9.5)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
 no live paid API or real Harness process is needed.
+
+## Builder practices (3.9.5)
+
+Every builder and revision prompt carries a fixed `builder-practices` block
+(v1.0, at most 350 words) assembled by `deepseek_mcp/builder_practices.py`.
+Implementation work receives the full **code** variant; documentation and
+research work receives a lighter variant. The block is independent of skill
+detection and applies to every build. The text is versioned, so a change in
+the practices is visible in run history, and the report below compares scores
+by that version.
+
+It is on by default. Set the boolean `builder_practices` config key to `false`,
+or export `DSH_BUILDER_PRACTICES=false`, to turn injection off. The run record
+stores the active set and version under `builder_practices`, with the
+variant, word count, character count and an estimated token cost, alongside
+`first_review_score` and `review_scores`, so runs with and without the block
+can be compared.
+
+Measure first-review against final score, grouped by practice-set version:
+
+```bash
+python3 scripts/report_scores.py --runs ~/DeepSeek-MCP/runs
+```
+
+The table reports the first review and final score per practice-set version.
+Add `--json` for machine-readable output. Older runs without the dedicated
+fields are grouped from `review_rounds`, so existing history still appears.
 
 ## Configuration and paths
 

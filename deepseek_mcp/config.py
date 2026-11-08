@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.9.4"
+SERVER_VERSION = "3.9.5"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -63,6 +63,7 @@ _DSH_DEFAULT = ("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/c
 
 # Generic, portable defaults. Every path is overridable.
 DEFAULTS = {
+    "builder_practices": True,
     # P3.4a: optional root for connector-owned mutable state. Empty keeps
     # the historical per-key defaults; when set it derives state_dir,
     # log_dir, jobs_dir and pid_file (four roots, see
@@ -276,6 +277,7 @@ DEFAULTS = {
 # Environment variable -> config key. New names are listed first; legacy v2
 # names keep working so existing MCP launch configs do not need editing.
 ENV_MAP = {
+    "DSH_BUILDER_PRACTICES": "builder_practices",
     "DSH_MAX_HARNESS_JOBS": "max_harness_jobs",
     "DEEPSEEK_MAX_HARNESS_JOBS": "max_harness_jobs",
     "DSH_RESERVE_RESUME_SLOT": "reserve_resume_slot",
@@ -440,7 +442,7 @@ ENV_MAP = {
     "DSH_AUTO_SKILLS_PROMOTE_AFTER": "auto_skills_promote_after",
 }
 
-BOOL_KEYS = {"quality", "independent_review", "child_progress",
+BOOL_KEYS = {"builder_practices", "quality", "independent_review", "child_progress",
              "render_probe", "transient_retry", "checkpoint", "dedupe_active",
              "provider_fallback", "trace", "browser_evidence",
              "workspace_progress", "live_scaling",
