@@ -42,9 +42,64 @@ After the build, the independent reviewer scores the result and lists blocking d
 
 `quality_convergence` defaults to `observe`, which records a would-stop convergence decision but keeps the normal loop. `auto` stops the loop and asks one question when the score stops improving.
 
+### Review scope and follow-up tags
+
+Pre-existing issues in untouched code go under `## Follow-ups (pre-existing,
+non-blocking)`. Every follow-up line starts with exactly one tag: `[security]`
+or `[data-loss]` (blocking) or `[minor]` (non-blocking regardless of wording).
+An untagged follow-up containing a security or data-loss keyword is treated as
+blocking (fail safe), so a double negation cannot hide a real finding. See
+[REVIEWER.md](REVIEWER.md) for the parser mapping and examples.
+
 ## Resumable reviews and pre-flight (new in 3.9.2)
 
 A review checkpoints its completed areas, findings and test reruns to `REVIEW.partial.md` and `REVIEW.partial.json`. If the connector stops, a resume checks only the remaining areas and merges carried findings under their original severity. Before a paid review, a short READY ping through the same reviewer path checks credit, auth and reachability. `review_preflight` defaults to `true`; `review_preflight_timeout` defaults to 45 seconds.
+
+## Multi-agent efficiency (new in 3.10.0)
+
+### Project map
+
+When a workspace has a `PROJECT_MAP.md`, the connector stores a private
+per-project record under the connector state directory, keyed by
+a hash of the workspace path (`project-maps/<hash>.json`, owner-only
+permissions); it holds the bounded map body and the fingerprint and is never
+copied into the repository, a run record or a result. The fingerprint is the git
+HEAD plus the working-tree status when git is available, otherwise the tracked
+file list and mtimes. The map text is bounded at 12,000 characters.
+
+Before the next builder starts, the connector compares the saved fingerprint with
+the current one and offers the map in one of three states: `new` (map present, no
+saved record), `reuse` (fingerprints match, with "Reuse this map; verify only what
+you change."), or `stale` (fingerprints differ, with "This map is stale; refresh
+PROJECT_MAP.md before you finish."). The run record keeps only the compact
+summary - state, presence, bytes, version and a short fingerprint - never the
+workspace path or the map body.
+
+### Slice overlap warnings
+
+Before a wave, the builder writes `SLICES.md`: each wave, then each slice, then a
+`Writes:` line naming the files that slice may touch. The connector parses the
+file and compares write-sets inside the same wave. Two slices in one wave that
+share a file produce an overlap warning. The warning is deliberate: warn, not
+block. It appears in the run record, in the result header and in the run metrics,
+so the lead can reassign the file or accept the overlap. A file used by slices in
+different waves is not an overlap.
+
+### Waste report and team sizing
+
+At the end of a multi-agent run the builder writes `WASTE_REPORT.md` with
+`Agents launched`, `Agents used` and `Agents discarded` (a compact
+`N launched / M used / K discarded` line also parses). The connector stores the
+counts and the waste ratio in the run record. An explicit `Waste ratio:` is
+clamped to 0..1 and still requires a launched count; otherwise the ratio is
+discarded divided by launched, with discarded derived from launched minus used.
+No launched count (or zero launched) means no ratio.
+
+Team sizing reads the mean waste ratio from comparable history. When it is at or
+above `WASTE_NUDGE_THRESHOLD` (0.35), the automatic start is reduced by up to
+`WASTE_NUDGE_STEP` (2 agents), bounded by the configured floor, and the sizing
+reason names the nudge. A lower or absent ratio changes nothing, and an explicit
+`subagents` count is never nudged.
 
 ## Settings
 
@@ -64,3 +119,14 @@ A review checkpoints its completed areas, findings and test reruns to `REVIEW.pa
 | `independent_review` | true | Independent review for real work |
 
 The score target is 8.5/10. A reviewer is a model: its score is judgement, not proof.
+
+## Constants
+
+| Constant | Value | Effect |
+|---|---:|---|
+| `project_map.MAX_MAP_CHARS` | 12000 | Bounded map offered to the next builder |
+| `project_map.MAX_FILES` | 2000 | File-list fingerprint bound |
+| `slices.MAX_TEXT` | 20000 | Bounded slice plan read per wave |
+| `waste_report.MAX_TEXT` | 20000 | Bounded waste report read at the end |
+| `WASTE_NUDGE_THRESHOLD` | 0.35 | Mean waste ratio that nudges the start down |
+| `WASTE_NUDGE_STEP` | 2 | Agents removed by one waste nudge |

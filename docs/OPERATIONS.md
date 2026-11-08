@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.9.5)
+# Operations: configuration, safety, budgets, traces and retention (v3.10.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -644,12 +644,25 @@ live-scaling waves, reviewer, revisions, rescue and retries:
 | `retry_backoff_base_seconds` / `retry_backoff_cap_seconds` | `1.0` / `60.0` | Exponential retry base and hard cap. |
 | `health_gate` | `true` | Block new automatic phases for a quarantined component. |
 | `allow_writing_reviewer` | `false` | Operator-only escape hatch; records `reviewer_override`. |
+| `backup_dsh_bin` | `""` | Optional alternate `dsh` executable or wrapper for a backup reviewer from another vendor. Empty keeps the single-reviewer behaviour. |
+| `backup_reviewer_vendor` | `""` | Optional vendor label used in the backup banner and records (for example `kimi`). |
+| `backup_reviewer_model` | `""` | Optional model label used in the backup banner and records. |
 | `allowed_workspace_roots` | `[]` | Optional allow-list for run/resume workspace roots. |
 | `authority_ttl_seconds` | `604800` | Envelope expiry; a resume reports expiry drift and refreshes it. |
 
 A rescue finisher is deliberately short (at most 8 minutes and 12 tool calls)
 and only runs when the builder left usable output files. It is not a way to
 extend a job past its deadline.
+
+Transient stream drops (`flush on a closed handle`, `STREAM_CLOSED`,
+`ECONNRESET`) are classified as network failures. Builder and reviewer calls
+retry them with exponential backoff (`retry_backoff_base_seconds` /
+`retry_backoff_cap_seconds`) up to the phase attempt cap; a reviewer that is
+still dropping after its bounded retries is a backup-reviewer switch class.
+The reviewer pre-flight retries a transient 5xx/stream failure once before the
+backup reviewer is considered; auth and credit failures switch immediately.
+
+A review that was actually cut off by the whole-job deadline (its `review-N` phase is `failed`, `interrupted` or `running`, or `REVIEW.partial.json` exists) gets **one fresh review window** on resume. A review that never started behind an already-expired deadline still refuses to start. The retry and the resumed reviewer draw from the new window, not the old whole-job clock.
 
 ## Transport
 

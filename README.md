@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.9.5 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.10.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -80,6 +80,8 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 - Team size and exact waves follow the Harness child limit. One whole-job budget covers time and estimated cost for every phase.
 - Every Harness run is saved as Markdown and JSON with token usage, estimated cost and the review trail. Resume a killed run with `resume_deepseek`.
 - Blocking review defects come with an ordered fix list before the next review.
+- If the reviewer's service fails, a backup reviewer from another vendor takes over.
+- Slices that share a file in the same wave are reported as overlap warnings, and waste-aware sizing nudges a high-discard team smaller.
 ## Limits
 - macOS gets a best-effort file-write boundary. Linux and Windows rely on the Harness permission mode and the workspace convention.
 - The reviewer is a model. Its score is judgement, not proof of correctness. Run records are plaintext.

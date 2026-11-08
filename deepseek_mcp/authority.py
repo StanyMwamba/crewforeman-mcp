@@ -26,6 +26,17 @@ import re
 
 from . import safety
 
+
+def _cfg_explicit(cfg, name):
+    """Whether ``name`` came from config file/env, never from DEFAULTS."""
+    checker = getattr(cfg, "is_explicit", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker(name))
+    except Exception:
+        return False
+
 AUTHORITY_VERSION = 1
 BASES = ("direct", "continuation")
 SANDBOX_RANK = {"read-only": 0, "workspace-write": 1,
@@ -542,8 +553,9 @@ class AuthorityEnvelope:
                 updates[name] = cap
                 changed[name] = [old, cap]
 
-        if self.job_max_seconds is not None or _seconds(
-                _cfg(cfg, "job_max_seconds", None)) is not None:
+        if _cfg_explicit(cfg, "job_max_seconds"):
+            # A resume must not re-clamp a saved envelope by the built-in
+            # default; only an operator-configured ceiling may narrow it.
             _cap(self.job_max_seconds, _cfg(cfg, "job_max_seconds", None),
                  "job_max_seconds")
         if self.job_max_cost_usd is not None or _seconds(
@@ -660,7 +672,9 @@ def direct(args, cfg, origin="harness_deepseek", now=None):
                                    "job_max_seconds")
     if requested_seconds is None:
         requested_seconds = cfg_seconds
-    elif cfg_seconds is not None:
+    elif cfg_seconds is not None and _cfg_explicit(cfg, "job_max_seconds"):
+        # The built-in 7200 default must not clamp an explicit caller value;
+        # an operator-configured lower ceiling may.
         requested_seconds = min(requested_seconds, cfg_seconds)
     cfg_cost = _seconds(_cfg(cfg, "job_max_cost_usd", None))
     requested_cost = _requested(args.get("job_max_cost_usd"),

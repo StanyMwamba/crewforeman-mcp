@@ -78,7 +78,8 @@ _PROVIDER_RE = re.compile(
 _NETWORK_RE = re.compile(
     r"(?i)econnreset|econnrefused|socket\s+hang\s*up|connection\s+reset|"
     r"connection\s+refused|network|dns|temporarily\s+unavailable|"
-    r"fetch\s+failed|broken\s+pipe|no\s+route\s+to\s+host")
+    r"fetch\s+failed|broken\s+pipe|no\s+route\s+to\s+host|"
+    r"stream[_\s-]*closed|closed\s+handle|flush\s+on\s+a\s+closed\s+handle")
 _PREPARE_RE = re.compile(
     r"(?i)prepare|preflight|not\s+found\s+or\s+not\s+executable|dsh_bin|"
     r"could\s+not\s+start\s+harness")

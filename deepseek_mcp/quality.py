@@ -441,6 +441,16 @@ def _run_utility(run):
     return round(base - penalty, 4), score
 
 
+WASTE_NUDGE_THRESHOLD = 0.35
+WASTE_NUDGE_STEP = 2
+
+
+def _review_scope_module():
+    """Return the review-scope helper (lazy to keep import order simple)."""
+    from . import review_scope
+    return review_scope
+
+
 def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
                   target=DEFAULT_QUALITY_TARGET):
     """Summarise comparable past runs per starting count.
@@ -483,7 +493,8 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
             seconds = 0.0
         group = groups.setdefault(bucket, {
             "count": bucket, "runs": 0, "utilities": [], "scores": [],
-            "costs": [], "seconds": [], "stalled": 0, "rescued": 0, "errors": 0,
+            "costs": [], "seconds": [], "wastes": [], "stalled": 0,
+            "rescued": 0, "errors": 0,
         })
         group["runs"] += 1
         group["utilities"].append(utility)
@@ -491,6 +502,14 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
             group["scores"].append(score)
         group["costs"].append(cost)
         group["seconds"].append(seconds)
+        try:
+            waste = (run.get("waste_report") or {}).get("waste_ratio")
+            if waste is None:
+                waste = (run.get("metrics") or {}).get("waste_ratio")
+            if waste is not None:
+                group["wastes"].append(min(1.0, max(0.0, float(waste))))
+        except (TypeError, ValueError, AttributeError):
+            pass
         if run.get("stalled") or run.get("stop_reason") == "stalled":
             group["stalled"] += 1
         if run.get("status") == "ok_rescued" or run.get("rescued"):
@@ -512,6 +531,9 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
             "mean_score": mean_score,
             "mean_cost": round(sum(group["costs"]) / runs_n, 4),
             "mean_seconds": round(sum(group["seconds"]) / runs_n, 1),
+            "mean_waste": (round(sum(group["wastes"]) / len(group["wastes"]), 4)
+                           if group["wastes"] else None),
+            "waste_runs": len(group["wastes"]),
             "stalled": group["stalled"],
             "stall_rate": round(group["stalled"] / float(runs_n), 2),
             "rescued": group["rescued"],
@@ -519,11 +541,17 @@ def history_stats(runs, task_type, concurrency=DEFAULT_CONCURRENCY,
         })
     if not rows:
         return {"runs": 0, "best_count": None, "best": None,
-                "groups": [], "target": float(target)}
+                "groups": [], "target": float(target),
+                "mean_waste": None, "waste_runs": 0}
+    waste_runs = sum(row["waste_runs"] for row in rows)
+    mean_waste = (round(sum((row["mean_waste"] or 0.0) * row["waste_runs"]
+                            for row in rows) / float(waste_runs), 4)
+                  if waste_runs else None)
     best = min(rows, key=lambda row: (-row["mean_utility"], row["mean_cost"],
                                       row["mean_seconds"], row["count"]))
     return {"runs": total, "best_count": best["count"], "best": best,
-            "groups": rows, "target": float(target)}
+            "groups": rows, "target": float(target),
+            "mean_waste": mean_waste, "waste_runs": waste_runs}
 
 
 def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
@@ -675,6 +703,21 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
             history_note = "History nudged the start %+d to %d." % (
                 adjusted - start, adjusted)
 
+    waste_note = None
+    mean_waste = history.get("mean_waste")
+    if mean_waste is not None:
+        try:
+            waste_value = float(mean_waste)
+        except (TypeError, ValueError):
+            waste_value = None
+        if (waste_value is not None
+                and waste_value >= WASTE_NUDGE_THRESHOLD
+                and adjusted > floor):
+            waste_step = min(WASTE_NUDGE_STEP, adjusted - floor)
+            adjusted -= waste_step
+            waste_note = ("Waste ratio %.2f nudged the start -%d to %d."
+                          % (waste_value, waste_step, adjusted))
+
     waves = _wave_sizes(adjusted, concurrency)
     pieces = [
         "Task type %s (%s size: %d words, %d deliverable(s), %d file(s)). "
@@ -703,6 +746,8 @@ def choose_agents(prompt, files=None, explicit=None, soft_cap=DEFAULT_SOFT_CAP,
             pieces.append("History did not change the start.")
     else:
         pieces.append("No comparable history yet.")
+    if waste_note:
+        pieces.append(waste_note)
     pieces.append("Waves at concurrency %d: %s." % (
         concurrency, " + ".join(str(item) for item in waves)))
     reason = " ".join(pieces)
@@ -987,9 +1032,13 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
                        quality_target=DEFAULT_QUALITY_TARGET,
                        concurrency=DEFAULT_CONCURRENCY,
                        independent_review=True, render_hint=None,
-                       task_type=None, builder_practices=True):
+                       task_type=None, builder_practices=True,
+                       project_map_hint=None):
     """Return the full task text sent to ``dsh --profile headless``."""
     parts = [prompt.strip()]
+    if project_map_hint:
+        parts.append("\n\n## Persisted project map (connector)\n\n%s\n"
+                     % str(project_map_hint).strip())
     try:
         concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     except (TypeError, ValueError):
@@ -1079,6 +1128,15 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
                 "the best candidate path and list every deliverable file."
             )
             parts.append(section)
+            parts.append(
+                "\n\n## Team artifacts (connector-owned overlap/waste checks)\n"
+                "Before building, write `SLICES.md` in the working folder: one section "
+                "per wave and, under it, one entry per slice naming its exact `Writes:` "
+                "list of files. Keep write-sets disjoint inside a wave; shared files are "
+                "reported as a warning, never a block.\n"
+                "At the end, write `WASTE_REPORT.md` with `Agents launched: N`, "
+                "`Agents used: N` and `Agents discarded: N` so the connector can size "
+                "the next team.\n")
     else:
         parts.append(
             "\n\nWork method: this is a simple task. Do it directly with a single agent; do not "
@@ -1348,6 +1406,12 @@ def build_review_task(prompt, deliverable_files, skill=None,
         "files and the original brief below.\n\n"
         "## Original brief\n\n%s\n" % (prompt or "").strip(),
     ]
+    _scope = _review_scope_module()
+    if _scope is not None:
+        try:
+            parts.append("\n\n" + _scope.prompt_block().strip() + "\n")
+        except Exception:
+            pass
     if skill and skill.get("content"):
         parts.append(
             "\n\n## Skill checklist to review against: %s\n\n%s\n"
@@ -1524,8 +1588,19 @@ def build_review_task(prompt, deliverable_files, skill=None,
         "   `## Blocking defects` (bullets, each with a file path and concrete evidence; write "
         "`None` if there are none)\n"
         "   `## Non-blocking defects` (bullets or `None`)\n"
+        "   `## Follow-ups (pre-existing, non-blocking)` (bullets for pre-existing "
+        "issues in code this change did not touch; every bullet MUST start with "
+        "exactly one tag: `[security]`, `[data-loss]` or `[minor]`; `[security]` "
+        "and `[data-loss]` are blocking, `[minor]` is non-blocking regardless of "
+        "wording; tags must be first on the line; an untagged bullet containing a "
+        "security/data-loss keyword is blocking (fail safe); do not repeat "
+        "follow-ups under Blocking or Non-blocking defects)\n"
         "   `## Fix list` (ordered, concrete, smallest changes that would pass)\n"
-        "5. End your final answer with `Final quality score: X/10` and `Blocking defects: N`.\n"
+        "5. End your final answer with `Final quality score: X/10` and `Blocking defects: N`. "
+        "N counts this change's blocking defects plus every follow-up tagged `[security]` or "
+        "`[data-loss]`; do not count `[minor]` follow-ups. An untagged follow-up containing a "
+        "security or data-loss keyword is blocking (fail safe) and must be counted, as security "
+        "when both kinds of keyword appear.\n"
         "This is review round %d. The target is %.1f/10 with zero blocking defects.\n"
         % (int(round_no), float(quality_target))
     )
@@ -1579,9 +1654,15 @@ def build_score_reprompt_task(report_text, round_no=1, include_report=True,
         "Final quality score: X/10\n"
         "Blocking defects: N\n\n"
         "X must be the 0-10 score supported by the review below and must be "
-        "consistent with its findings. N must be the number of blocking defects "
-        "actually listed under '## Blocking defects' in the report (0 if none "
-        "were listed). Do not invent a defect to explain a score."
+        "consistent with its findings. N must be the number of blocking "
+        "findings: the bullets actually listed under '## Blocking defects' "
+        "plus every follow-up tagged `[security]` or `[data-loss]` (0 if there "
+        "are none). Do not count `[minor]` follow-ups or other pre-existing "
+        "non-blocking follow-ups under '## Follow-ups (pre-existing, "
+        "non-blocking)'. An untagged follow-up "
+        "that contains a security or data-loss keyword is blocking (fail safe) "
+        "and must be counted, as security when both kinds of keyword appear. "
+        "Do not invent a defect to explain a score."
     )
     if fresh:
         task += (" If the report does not state an explicit number, derive X "
@@ -2321,6 +2402,41 @@ def _is_legacy_synthetic_score_defect(text):
     return bool(_LEGACY_SYNTHETIC_SCORE_RE.search(str(text or "")))
 
 
+def _merge_review_texts(report_text, final_text):
+    """Join the report file and the reviewer's answer without doubling it.
+
+    The read-only review flow persists the reviewer's complete final answer as
+    ``REVIEW.md`` and then passes both that file text and the same answer to
+    this parser.  Concatenating identical/contained copies would count every
+    finding twice, so keep only the fuller text in that case.
+    """
+    first = str(report_text or "").strip()
+    second = str(final_text or "").strip()
+    if not first:
+        return second
+    if not second or second == first or second in first:
+        return first
+    if first in second:
+        return second
+    return first + "\n" + second
+
+
+def _dedupe_follow_ups(items):
+    """De-duplicate follow-ups by normalised ``(text, blocking, kind)``."""
+    seen = set()
+    unique = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(str(item.get("text") or "").lower().split())
+        key = (text, bool(item.get("blocking")), str(item.get("kind") or ""))
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def parse_review(report_text="", final_text="", task_type=None,
                  prefer_sections=False):
     """Parse an independent REVIEW.md/final answer.
@@ -2341,7 +2457,29 @@ def parse_review(report_text="", final_text="", task_type=None,
     official score to 7.5 so the normal 8.5 acceptance gate starts a revision.
     A denial such as "not visually plain" does not trigger the cap.
     """
-    combined = "\n".join(part for part in (report_text or "", final_text or "") if part)
+    combined = _merge_review_texts(report_text, final_text)
+    _scope = _review_scope_module()
+    follow_ups = []
+    section_text = combined
+    if _scope is not None:
+        try:
+            # The persisted report is authoritative when present: in the
+            # read-only flow the final answer was materialised into REVIEW.md,
+            # so parsing both texts would count every follow-up twice.  Use the
+            # final answer only when there is no report text, and de-duplicate
+            # as a second guard for partially overlapping copies.
+            follow_source = (report_text
+                             if str(report_text or "").strip() else final_text)
+            follow_ups = _dedupe_follow_ups(
+                _scope.follow_up_items(follow_source or ""))
+            section_text = _scope.strip_follow_ups(combined)
+        except Exception:
+            follow_ups = []
+            section_text = combined
+    blocking_follow_ups = [item for item in follow_ups
+                           if isinstance(item, dict) and item.get("blocking")]
+    non_blocking_follow_ups = [item for item in follow_ups
+                               if not (isinstance(item, dict) and item.get("blocking"))]
     score = extract_quality_score(None, report_text) if report_text else None
     if score is None:
         score = extract_quality_score(None, final_text)
@@ -2352,14 +2490,16 @@ def parse_review(report_text="", final_text="", task_type=None,
     for pattern in (
             r"blocking\s+defects?\s*(?:count)?\s*[:=\-|]\s*(\d+)",
             r"(\d+)\s+blocking\s+defect"):
-        match = re.search(pattern, combined, re.IGNORECASE)
+        # Follow-up sections are removed first: a pre-existing finding that
+        # mentions "2 blocking defects" must never raise this change's count.
+        match = re.search(pattern, section_text, re.IGNORECASE)
         if match:
             try:
                 blocking = int(match.group(1))
                 break
             except ValueError:
                 pass
-    blocking_lines = _section_bullets(combined, ("blocking defect", "blocking"))
+    blocking_lines = _section_bullets(section_text, ("blocking defect", "blocking"))
     # 3.9.3 persisted a connector-invented blocking defect when the score line
     # was missing.  It is not reviewer evidence: drop it (and its contribution
     # to an explicit count) so an old partial/report cannot keep a workspace
@@ -2379,12 +2519,35 @@ def parse_review(report_text="", final_text="", task_type=None,
         blocking = len(blocking_lines)
     elif blocking is None:
         blocking = len(blocking_lines)
-    defects = blocking_lines or _section_bullets(combined, ("defect", "issues"))
+    defects = blocking_lines or _section_bullets(section_text, ("defect", "issues"))
     defects = [item for item in defects
                if not _is_legacy_synthetic_score_defect(item)]
-    fixes = _section_bullets(combined, ("fix list", "fixes", "required changes"))
+    fixes = _section_bullets(section_text, ("fix list", "fixes", "required changes"))
     if not fixes:
         fixes = defects
+    if blocking_follow_ups:
+        # A security/data-loss follow-up is blocking and must be visibly
+        # marked as such wherever the connector repeats it (defects, fix list,
+        # run record, result).  The original wording is kept.
+        follow_texts = []
+        for item in blocking_follow_ups:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            # The parser keeps the reviewer's own tag in ``text``; do not
+            # repeat it when the connector adds its blocking marker.
+            text = re.sub(
+                r"^\s*\[\s*(?:security|data[\s\-_]*loss)\s*\]\s*", "", text,
+                flags=re.IGNORECASE).strip()
+            if not text:
+                continue
+            kind = str(item.get("kind") or "security/data-loss").strip()
+            follow_texts.append("[blocking: %s] %s" % (kind, text))
+        defects = list(defects) + [text for text in follow_texts
+                                   if text not in defects]
+        fixes = list(fixes) + [text for text in follow_texts
+                               if text not in fixes]
+    blocking = max(int(blocking or 0), len(blocking_follow_ups))
     visual = visual_impact_score(combined)
     plain = _review_asserts_plain(combined, defects)
     capped = False
@@ -2405,6 +2568,9 @@ def parse_review(report_text="", final_text="", task_type=None,
         "fixes": fixes,
         "visual_impact": round(float(visual), 2) if visual is not None else None,
         "creative_cap": bool(capped),
+        "follow_ups": follow_ups,
+        "blocking_follow_ups": blocking_follow_ups,
+        "non_blocking_follow_ups": non_blocking_follow_ups,
     }
 
 

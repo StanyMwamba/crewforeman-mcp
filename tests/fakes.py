@@ -128,10 +128,11 @@ def maybe_session_log():
     encoded = project_key(resolved)
     directory = Path(sessions) / encoded / ("session-" + str(os.getpid()))
     directory.mkdir(parents=True, exist_ok=True)
+    model = os.environ.get("FAKE_DSH_MODEL", "deepseek-flash")
     lines = [{"type": "session", "version": 4, "id": "fake", "cwd": resolved}]
     lines.append({"type": "assistant/message", "seq": 1,
                   "data": {"message": {"id": "fake-message", "role": "assistant",
-                                       "source": {"model": "deepseek-flash"}},
+                                       "source": {"model": model}},
                            "usage": {"inputTokens": 1000, "cacheReadTokens": 2000,
                                      "outputTokens": 500}}})
     (directory / "session.v4.jsonl").write_text(
@@ -298,14 +299,26 @@ if "INDEPENDENT REVIEWER" in task:
     defects = ""
     if blocking:
         defects = "- Blocking: fake reviewer found a missing fact in deliverable.md\n"
-    (workspace / "REVIEW.md").write_text(
+    follow_raw = os.environ.get("FAKE_DSH_REVIEW_FOLLOW_UPS", "")
+    follow_items = [item.strip() for item in follow_raw.split("|") if item.strip()]
+    follow_block = ""
+    if follow_items:
+        follow_block = ("\n## Follow-ups (pre-existing, non-blocking)\n"
+                        + "\n".join("- " + item for item in follow_items) + "\n")
+    report = (
         "# Independent review\n\n## Score\nFinal quality score: " + review_score + "/10\n\n"
         "## Blocking defects\n" + (defects or "None\n") +
-        "\n## Non-blocking defects\nNone\n\n## Fix list\n" +
-        ("1. Fix the fake blocking issue in deliverable.md\n" if blocking else "None\n"),
-        encoding="utf-8")
-    emit({"type": "final", "text": "REVIEW.md written. Final quality score: " + review_score +
-          "/10. Blocking defects: " + str(blocking)})
+        "\n## Non-blocking defects\nNone\n" + follow_block + "\n## Fix list\n" +
+        ("1. Fix the fake blocking issue in deliverable.md\n" if blocking else "None\n"))
+    if os.environ.get("FAKE_DSH_REVIEW_READONLY"):
+        # A read-only reviewer cannot write REVIEW.md, so its complete final
+        # answer is the report the connector has to persist itself.  This
+        # exercises the flow where the same text reaches parse_review twice.
+        emit({"type": "final", "text": report})
+    else:
+        (workspace / "REVIEW.md").write_text(report, encoding="utf-8")
+        emit({"type": "final", "text": "REVIEW.md written. Final quality score: " + review_score +
+              "/10. Blocking defects: " + str(blocking)})
     sys.exit(0)
 
 if "REVISION agent" in task:

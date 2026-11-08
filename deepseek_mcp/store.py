@@ -225,6 +225,25 @@ def _md(run):
                              entry.get("total_tokens", "?"), cost_text,
                              " (incl. pre-flight)"
                              if entry.get("preflight_usage") else ""))
+    metrics = run.get("metrics") or {}
+    if metrics:
+        waste = metrics.get("waste_ratio")
+        lines.append(
+            "- **Metrics:** slices %s, %s overlap warning(s), waste ratio %s "
+            "(%s launched / %s discarded), %s follow-up(s), %s blocking" % (
+                "present" if metrics.get("slices_present") else "absent",
+                metrics.get("slices_overlap_warnings", 0),
+                "%.2f" % float(waste) if waste is not None else "n/a",
+                metrics.get("waste_agents_launched", "?"),
+                metrics.get("waste_agents_discarded", "?"),
+                metrics.get("follow_ups", 0),
+                metrics.get("blocking_follow_ups", 0)))
+    if run.get("follow_ups") is not None:
+        follow_ups = run.get("follow_ups") or []
+        blocking_follow = sum(1 for item in follow_ups
+                              if isinstance(item, dict) and item.get("blocking"))
+        lines.append("- **Follow-ups:** %d (%d blocking)" % (
+            len(follow_ups), blocking_follow))
     _practices = run.get("builder_practices")
     if _practices:
         if _practices.get("enabled", True):

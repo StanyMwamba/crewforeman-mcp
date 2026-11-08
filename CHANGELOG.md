@@ -5,6 +5,94 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.10.0
+
+Part A: reviewer resilience, resumable reviews and explicit job deadlines.
+
+### Added
+
+- Optional backup reviewer (`backup_dsh_bin`, default empty = unchanged), with
+  optional `backup_reviewer_vendor` / `backup_reviewer_model` identity labels.
+  The connector switches to the backup only on non-quality failures of the
+  main reviewer: credit/budget exhaustion (429 with budget/quota wording or
+  insufficient balance), auth/invalid key, service unavailable/5xx after the
+  bounded retries, and repeated stream drops after the bounded retry. Low
+  scores, blocking defects and missing-score reprompts are quality outcomes of
+  a successful reviewer and never trigger a switch.
+- A backup review is labelled in the run record, the journal and the result
+  header with `Reviewed by: backup (<vendor/model>) — main failed: <reason
+  class>`. The backup is not sticky: the next job starts with the main
+  reviewer again.
+- Bounded retry for stream drops caused by a closed handle: `flush on a closed
+  handle`, `STREAM_CLOSED` and `ECONNRESET` are treated as transient and
+  retried with backoff up to a hard attempt cap. A repeated drop after the cap
+  becomes a switch class for the backup reviewer.
+
+### Changed
+
+- Interrupted reviews are resumable. A review that actually started and was cut
+  off is reconstructed from its partial checkpoint and re-run on resume rather
+  than being consumed as a completed round.
+- An explicit caller `job_max_seconds` is honoured even when it exceeds the
+  built-in 7200-second default. An explicitly configured lower value still
+  caps it, and resume does not re-clamp a saved envelope by the default. The
+  per-process `stall_cap_hard_max_seconds` ceiling is unchanged.
+
+### Fixed
+
+- A review actually cut off by the whole-job deadline gets one fresh review
+  window on resume; a review that never started behind an already-expired
+  deadline still refuses to start (R5b).
+- If both the main and backup reviewers fail, the run records a clear reviewer
+  error and `quality_score` stays `None`; no score is invented.
+
+### Tests
+
+- Release version assertions updated to 3.10.0, with focused coverage for
+  backup switching, bounded stream-drop retries, resumable interrupted
+  reviews and explicit `job_max_seconds`.
+
+### Part B
+
+- Review scope: the independent reviewer separates findings about the change
+  under review from pre-existing issues in untouched code. Pre-existing findings
+  go under `## Follow-ups (pre-existing, non-blocking)` and do not make the run
+  fail; every follow-up must start with exactly one tag, `[security]`,
+  `[data-loss]` or `[minor]`. `[security]` and `[data-loss]` stay blocking and
+  are counted in `Blocking defects: N`; `[minor]` is never blocking regardless
+  of wording. An untagged follow-up containing a security or data-loss keyword
+  is treated as blocking (fail safe), so a double negation cannot hide a real
+  defect. Blocking follow-ups surface as `[blocking: security]` or
+  `[blocking: data-loss]`. The follow-up list is kept in the run record, a short
+  list appears in the result, and the missing-score re-prompt path is unchanged.
+- 6a Project map: multi-agent workspaces keep a bounded `PROJECT_MAP.md`; the
+  connector stores a private fingerprinted per-project record under its state
+  directory and offers the map to the next builder as reuse (verify only what you
+  change) or refresh (stale). Summaries never carry the map body or workspace
+  path.
+- 6b Slice overlap: a connector-side `SLICES.md` parser reports write-set
+  overlaps between slices in the same wave in the run record, result header and
+  metrics. Warnings only; the run is never blocked.
+- 6c Waste report: `WASTE_REPORT.md` is parsed into launched, used and discarded
+  counts plus a bounded waste ratio (explicit or derived) in the run record; a
+  ratio is only used when a launched count is present. `choose_agents` uses the
+  historical mean waste ratio: at or above 0.35 it reduces the automatic start by
+  up to 2 agents, never below the floor and never for an explicit `subagents`
+  count.
+- 6d Docs: `docs/TEAMS.md` describes the project map, slice overlap warnings and
+  waste-aware sizing, and the README gains one Guarantees line. Version stays
+  3.10.0.
+
+### Part C
+
+- `docs/CLIENTS.md` now carries editor setup guides for Cursor, VS Code with
+  GitHub Copilot, Claude Desktop, Claude Code and the OpenAI Codex CLI, each
+  with the config file location, a copy-paste `mcpServers` entry and a
+  verification step. The snippets were checked against the vendors' official
+  MCP documentation (linked in the guide) and against this server's stdio
+  transport. The guide also shows how to start the server manually before
+  wiring a client.
+
 ## 3.9.5
 
 ### Added

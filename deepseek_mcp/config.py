@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.9.5"
+SERVER_VERSION = "3.10.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -77,6 +77,11 @@ DEFAULTS = {
     "pid_file": os.path.join(BASE_DIR, "keep_awake.pid"),
     "skills_dir": "",
     "dsh_bin": _DSH_DEFAULT,
+    # Optional backup reviewer binary and its vendor/model label. Empty
+    # keeps the historical single-reviewer behaviour.
+    "backup_dsh_bin": "",
+    "backup_reviewer_vendor": "",
+    "backup_reviewer_model": "",
     "harness_workspace": os.path.join(BASE_DIR, "harness-workspace"),
     "dsh_sessions_dir": "~/.dsh/sessions",
     # Optional per-model reviewer rates in USD per million tokens:
@@ -289,6 +294,12 @@ ENV_MAP = {
     "DEEPSEEK_SKILLS_DIR": "skills_dir",
     "DSH_BIN": "dsh_bin",
     "DEEPSEEK_DSH_BIN": "dsh_bin",
+    "DSH_BACKUP_BIN": "backup_dsh_bin",
+    "DEEPSEEK_BACKUP_BIN": "backup_dsh_bin",
+    "DSH_BACKUP_REVIEWER_VENDOR": "backup_reviewer_vendor",
+    "DEEPSEEK_BACKUP_REVIEWER_VENDOR": "backup_reviewer_vendor",
+    "DSH_BACKUP_REVIEWER_MODEL": "backup_reviewer_model",
+    "DEEPSEEK_BACKUP_REVIEWER_MODEL": "backup_reviewer_model",
     "DSH_WORKSPACE": "harness_workspace",
     "DEEPSEEK_WORKSPACE": "harness_workspace",
     "DSH_SESSIONS_DIR": "dsh_sessions_dir",
@@ -494,7 +505,7 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
-             "harness_workspace",
+             "harness_workspace", "backup_dsh_bin",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path"}
 
 # P3.4a: the four connector-owned keys derived from a non-empty state_root
@@ -516,10 +527,20 @@ DERIVED_STATE_ROOT_KEYS = {
 class Config:
     """Small attribute/dict hybrid so values are easy to pass around and test."""
 
-    def __init__(self, values=None):
+    def __init__(self, values=None, explicit=None):
         self._values = dict(DEFAULTS)
         if values:
             self._values.update(values)
+        # Marker kept outside _values/as_dict. A bare mapping passed by a
+        # caller (tests, embedded use) counts as explicit; load_config passes
+        # only the keys that actually came from the config file or env.
+        if explicit is None:
+            explicit = set(values) if values else set()
+        self._explicit = set(explicit)
+
+    def is_explicit(self, name):
+        """True when ``name`` was set by a config file, env or direct mapping."""
+        return name in self._explicit
 
     def __getattr__(self, name):
         try:
@@ -685,21 +706,25 @@ def load_config(config_path=None, env=None, include_file=True):
     # (state/log/jobs/pid only; Harness sessions are never derived). It sits
     # below config-file values and explicit environment aliases, which are
     # applied afterwards and therefore win key by key.
+    explicit = set()
     root = _state_root_value(env, file_values)
     if root:
         for key, leaf in DERIVED_STATE_ROOT_KEYS.items():
             values[key] = os.path.join(root, leaf)
+            explicit.add(key)
 
     for key, value in file_values.items():
         values[key] = value
+        explicit.add(key)
 
     # Iterate oldest alias first so the newer DSH_* name wins if both are set.
     for env_name, key in reversed(list(ENV_MAP.items())):
         if env_name in env and env[env_name] != "":
             values[key] = _coerce(key, env[env_name])
+            explicit.add(key)
 
     # A config-file path is useful for child job processes.
     config_file = (_expand_config_path(config_path) if config_path is not None
                    else default_config_path(env))
     values["_config_path"] = str(config_file.expanduser().resolve())
-    return Config(values)
+    return Config(values, explicit=explicit)

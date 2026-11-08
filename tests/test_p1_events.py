@@ -59,7 +59,8 @@ class EventsTestCase(unittest.TestCase):
     def test_contract_constants(self):
         self.assertEqual(events.EVENT_TYPES,
                          ("admitted", "phase", "progress", "needs_input",
-                          "result", "failed", "cancelled"))
+                          "result", "failed", "cancelled",
+                          "reviewer_backup"))
         self.assertEqual(events.STAGES,
                          ("queued", "running", "needs_human", "review_ready",
                           "terminal"))

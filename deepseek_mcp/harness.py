@@ -34,6 +34,7 @@ from . import progress
 from . import render
 from . import review_context
 from . import review_progress as review_progress_mod
+from . import reviewer_backup as reviewer_backup_mod
 from . import safety
 from . import scaling
 from . import spend as spend_mod
@@ -743,6 +744,156 @@ def _merge_preflight_usage(record, preflight, cfg):
     return merged
 
 
+def _project_map_module():
+    """Return the persisted project-map helper (lazy to keep import order simple)."""
+    from . import project_map
+    return project_map
+
+
+def _project_map_hint(workspace, state_dir, run=None):
+    """Offer the persisted map, store only its summary, capture a first map."""
+    module = _project_map_module()
+    if module is None or not state_dir:
+        return ""
+    try:
+        offered = module.offer(str(workspace), str(state_dir)) or {}
+    except Exception:
+        return ""
+    if run is not None and isinstance(offered.get("summary"), dict):
+        run["project_map"] = offered["summary"]
+    # Only an unrecorded map is registered here.  Capturing a map that was
+    # already classified as stale would store the *current* workspace
+    # fingerprint against the old body and hide the staleness from the next
+    # job; the final capture below only updates a map that was refreshed.
+    if offered.get("state") == "new":
+        try:
+            module.capture(str(workspace), str(state_dir))
+        except Exception:
+            pass
+    return str(offered.get("prompt") or "")
+
+
+def _review_scope_module():
+    """Return the review-scope parser (lazy to keep import order simple)."""
+    from . import review_scope
+    return review_scope
+
+
+def _review_follow_ups(entry):
+    """Follow-ups for one review round, parsing an older report if needed."""
+    if not isinstance(entry, dict):
+        return []
+    follow_ups = entry.get("follow_ups")
+    if isinstance(follow_ups, list) and follow_ups:
+        return list(follow_ups)
+    if "follow_ups" in entry:
+        return list(follow_ups or [])
+    module = _review_scope_module()
+    if module is None:
+        return []
+    try:
+        return list(module.follow_up_items(entry.get("report_text") or ""))
+    except Exception:
+        return []
+
+
+def _team_modules():
+    """Return the (slices, waste_report) helpers."""
+    from . import slices as slices_mod
+    from . import waste_report as waste_mod
+    return slices_mod, waste_mod
+
+
+def _collect_team_artifacts(run, workspace, state_dir=None):
+    """Collect SLICES/WASTE artifacts, metrics and the last review's follow-ups."""
+    slices_mod, waste_mod = _team_modules()
+    empty_slices = {"present": False, "waves": 0, "slices": 0,
+                    "overlaps": [], "warnings": 0}
+    empty_waste = {"present": False, "agents_launched": None,
+                   "agents_used": None, "agents_discarded": None,
+                   "waste_ratio": None, "source": None}
+    try:
+        slices_info = (slices_mod.inspect(str(workspace))
+                       if slices_mod is not None else dict(empty_slices))
+    except Exception:
+        slices_info = dict(empty_slices)
+    try:
+        waste_info = (waste_mod.inspect(str(workspace))
+                      if waste_mod is not None else dict(empty_waste))
+    except Exception:
+        waste_info = dict(empty_waste)
+    if not isinstance(slices_info, dict):
+        slices_info = dict(empty_slices)
+    if not isinstance(waste_info, dict):
+        waste_info = dict(empty_waste)
+    run["slices"] = slices_info
+    run["waste_report"] = waste_info
+    overlap_warnings = int(slices_info.get("warnings") or 0)
+    if overlap_warnings:
+        details = []
+        for item in (slices_info.get("overlaps") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            details.append("wave %s: %s shared by %s" % (
+                item.get("wave", "?"), item.get("file", "?"),
+                ", ".join(str(name) for name in (item.get("slices") or []))))
+        run["slices_overlap_warning"] = (
+            "SLICES.md same-wave write-set overlap (warning only, not "
+            "blocking): " + ("; ".join(details) or "%d overlap(s)"
+                              % overlap_warnings))
+    last_review = None
+    for entry in reversed(run.get("review_rounds") or []):
+        if isinstance(entry, dict) and entry.get("kind") == "review":
+            last_review = entry
+            break
+    follow_ups = _review_follow_ups(last_review)
+    blocking_follow = [item for item in follow_ups
+                       if isinstance(item, dict) and item.get("blocking")]
+    metrics = dict(run.get("metrics") or {})
+    metrics.update({
+        "slices_present": bool(slices_info.get("present")),
+        "slices_overlap_warnings": int(slices_info.get("warnings") or 0),
+        "waste_agents_launched": waste_info.get("agents_launched"),
+        "waste_agents_discarded": waste_info.get("agents_discarded"),
+        "waste_ratio": waste_info.get("waste_ratio"),
+        "follow_ups": len(follow_ups),
+        "blocking_follow_ups": len(blocking_follow),
+    })
+    run["metrics"] = metrics
+    if last_review is not None:
+        run["follow_ups"] = follow_ups
+    else:
+        run.setdefault("follow_ups", [])
+    if state_dir:
+        module = _project_map_module()
+        if module is not None:
+            try:
+                start = dict(run.get("project_map") or {})
+                start_hash = start.get("map_sha256") or ""
+                current_hash = module.map_digest(str(workspace))
+                # Register a map that appeared during the job, or a map the
+                # builder refreshed.  An unchanged stale map stays stale for
+                # the next job instead of being blessed by a new fingerprint.
+                refreshed = bool(current_hash) and current_hash != start_hash
+                appeared = not start.get("present") and bool(current_hash)
+                captured_ok = False
+                if refreshed or appeared:
+                    captured = module.capture(str(workspace), str(state_dir))
+                    captured_ok = bool(captured.get("stored"))
+                # Re-offer after the final capture: the summary then describes
+                # the state the NEXT job will see (reuse/stale/absent), not the
+                # pre-build state.
+                fresh = module.offer(str(workspace), str(state_dir)) or {}
+                summary = dict(fresh.get("summary") or {})
+                if summary:
+                    summary["captured"] = captured_ok
+                    summary["stored"] = captured_ok
+                    run["project_map"] = summary
+            except Exception:
+                pass
+    return metrics
+
+
 def _result_text(run, path):
     tools = run.get("tools_used") or {}
     tool_text = ", ".join("%s x%d" % (name, count)
@@ -774,10 +925,28 @@ def _result_text(run, path):
             if run.get("self_score") is not None:
                 head += " | self_score %.2f/10" % run["self_score"]
             head += " | review rounds %s" % run.get("quality_rounds_used", 0)
+            if run.get("reviewed_by") == "backup":
+                head += " | " + (
+                    run.get("reviewed_by_line")
+                    or "Reviewed by: backup (unknown/unknown)")
         if run.get("quality_report_missing"):
             head += " (QUALITY_REPORT.md missing)"
         if run.get("review_status") == "error":
             head += " (review error: %s)" % (run.get("review_error") or "unknown")
+    metrics = run.get("metrics") or {}
+    metric_bits = []
+    if metrics.get("slices_overlap_warnings"):
+        metric_bits.append("overlaps %d" % int(
+            metrics.get("slices_overlap_warnings") or 0))
+    if metrics.get("waste_ratio") is not None:
+        try:
+            metric_bits.append("waste %.2f" % float(metrics["waste_ratio"]))
+        except (TypeError, ValueError):
+            pass
+    if metrics.get("follow_ups"):
+        metric_bits.append("follow-ups %d" % int(metrics["follow_ups"]))
+    if metric_bits:
+        head += " | " + ", ".join(metric_bits)
     head += " | tools: %s" % tool_text
     if run.get("cost_source") == "session_logs":
         cost_text = ("$%s" % api.fmt_cost(run.get("estimated_cost_usd"))
@@ -818,6 +987,35 @@ def _result_text(run, path):
             else:
                 bit += ", cost unknown (reviewer_prices not configured)"
             head += "\n" + bit
+    overlaps = (run.get("slices") or {}).get("overlaps") or []
+    if overlaps:
+        bits = []
+        for item in overlaps[:3]:
+            if not isinstance(item, dict):
+                continue
+            bits.append("wave %s: %s shared by %s" % (
+                item.get("wave", "?"), item.get("file", "?"),
+                ", ".join(str(name) for name in (item.get("slices") or []))))
+        head += ("\nWARNING: SLICES.md write-set overlap (warn only, run not "
+                 "blocked): " + "; ".join(bits))
+    follow_ups = run.get("follow_ups") or []
+    if follow_ups:
+        follow_lines = []
+        for item in follow_ups[:5]:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text") or ""
+            if item.get("blocking"):
+                kind = item.get("kind") or "security/data-loss"
+                follow_lines.append("- [blocking: %s] %s" % (kind, text))
+            else:
+                follow_lines.append("- [non-blocking] %s" % text)
+        if follow_lines:
+            more = max(0, len(follow_ups) - len(follow_lines))
+            head += ("\nFollow-ups (pre-existing; non-blocking unless marked):\n"
+                     + "\n".join(follow_lines))
+            if more:
+                head += "\n- +%d more" % more
     text = head + "\n\n" + (run.get("answer") or "")
     warning = _log_fallback_warning(run)
     if warning:
@@ -1130,7 +1328,8 @@ def _reprompt_record(executions, method, session_id, error=None,
 
 def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
                            policy=None, transport_name=None, limit=None,
-                           cancel_check=None, budget=None, used_logs=None):
+                           cancel_check=None, budget=None, used_logs=None,
+                           dsh_bin=None):
     """One score re-prompt for one reviewer report.
 
     Resume the same reviewer session when it has an id; only a non-ok/dead
@@ -1172,7 +1371,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
             limit=call_limit,
             label="reviewer score reprompt round %d" % int(round_no or 1),
             exclude_logs=logs, policy=policy, session_id=session_id,
-            transport_name=transport_name, cancel_check=cancel_check)
+            transport_name=transport_name, cancel_check=cancel_check,
+            dsh_bin=dsh_bin)
         executions.append(first)
         logs.update(first.get("session_logs") or [])
         stop_reason = str(first.get("stop_reason") or "").lower()
@@ -1200,7 +1400,7 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
                            % int(round_no or 1)),
                     exclude_logs=logs, policy=policy, session_id=None,
                     transport_name=transport_name,
-                    cancel_check=cancel_check)
+                    cancel_check=cancel_check, dsh_bin=dsh_bin)
                 executions.append(second)
                 logs.update(second.get("session_logs") or [])
         method = ("fresh_after_dead_session" if fallback_used
@@ -1218,7 +1418,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
         limit=call_limit,
         label="reviewer score reprompt fresh round %d" % int(round_no or 1),
         exclude_logs=logs, policy=policy, session_id=None,
-        transport_name=transport_name, cancel_check=cancel_check)
+        transport_name=transport_name, cancel_check=cancel_check,
+        dsh_bin=dsh_bin)
     executions.append(fresh)
     logs.update(fresh.get("session_logs") or [])
     return _reprompt_record(executions, "fresh", None,
@@ -1680,7 +1881,7 @@ def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
 
 def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                    session_id, started, output_slack, cancel_check=None,
-                   live_usage_cb=None):
+                   live_usage_cb=None, dsh_bin=None):
     """Run one task through the documented SDK JSON-RPC transport.
 
     Returns an execution dict on success/failure, or ``{"_sdk_unavailable": ...}``
@@ -1689,7 +1890,7 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
     the caller's cancel check is polled while requests wait; cancellation
     signals the process group through :class:`transport.Cancelled`.
     """
-    dsh = Path(os.path.expanduser(cfg.dsh_bin))
+    dsh = Path(os.path.expanduser(dsh_bin or cfg.dsh_bin))
     env = safety.scrubbed_env(keep=("DEEPSEEK_API_KEY",))
     env.setdefault("NO_COLOR", "1")
     env.update(safety.dsh_env(policy))
@@ -1914,7 +2115,8 @@ def _workspace_signature(workspace, limit=4000):
 def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
                   exclude_logs=None, clock=None, output_slack=2.0,
                   policy=None, session_id=None, cancel_check=None,
-                  transport_name=None, add_dirs=None, live_usage_cb=None):
+                  transport_name=None, add_dirs=None, live_usage_cb=None,
+                  dsh_bin=None):
     """Run one Harness process and return its parsed result.
 
     ``limit`` is a per-process wall-clock limit. ``clock`` is injectable for the
@@ -1924,7 +2126,7 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
     A stall, a time limit and an explicit cancel share one first-writer-wins
     stop reason, so they can never kill the child twice or mislabel the run.
     """
-    dsh = Path(os.path.expanduser(cfg.dsh_bin))
+    dsh = Path(os.path.expanduser(dsh_bin or cfg.dsh_bin))
     policy = policy or safety.resolve({}, cfg, reviewer=label.startswith("reviewer"))
     transport_name = (transport_name or cfg.get("dsh_transport") or "headless").strip().lower()
     started = time.time()
@@ -1933,7 +2135,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
         sdk_result = _sdk_execution(cfg, workspace, task, limit, progress_cb,
                                     label, policy, session_id, started,
                                     output_slack, cancel_check=cancel_check,
-                                    live_usage_cb=live_usage_cb)
+                                    live_usage_cb=live_usage_cb,
+                                    dsh_bin=dsh_bin)
         if "_sdk_unavailable" not in sdk_result:
             sdk_result["sandbox"] = policy
             return sdk_result
@@ -2643,6 +2846,7 @@ def provider_error_message(execution=None, cfg=None, role="reviewer"):
 
 _TRANSIENT_ERROR_RE = re.compile(
     r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|"
+    r"STREAM_CLOSED|stream[ _-]*closed|flush on a closed handle|closed handle|"
     r"network (?:error|failure)|temporarily unavailable|rate limit|"
     r"HTTP\s*(?:429|500|502|503|504)|\b(?:429|502|503|504)\b", re.IGNORECASE)
 _PERMANENT_ERROR_RE = re.compile(
@@ -3578,6 +3782,13 @@ def _review_resume_start(rounds, prior_reviews, prior_revisions):
         review = prior_reviews.get(number)
         if review is None:
             return number, None, "disabled"
+        # A review that failed or was interrupted before it produced a usable
+        # report was never consumed. Re-run that round instead of treating the
+        # failed phase as the predecessor of a missing revision.
+        status = str(review.get("status") or "").strip().lower()
+        if not review.get("accepted") and status not in (
+                "ok", "done", "completed", "accepted"):
+            return number, None, "disabled"
         if number in prior_revisions:
             continue
         unscored = (bool(review.get("score_missing"))
@@ -3942,14 +4153,24 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               getattr(cfg, "builder_practices", True))))
     run["builder_practices"] = practices
 
+    project_map_hint = _project_map_hint(
+        workspace, getattr(cfg, "state_dir", None), run)
     task = build_harness_task(prompt, choice["subagents"], choice["reason"], skill,
                               quality=quality, quality_rounds=rounds,
                               concurrency=child_concurrency,
                               independent_review=independent,
                               render_hint=render_hint,
                               task_type=choice.get("task_type"),
-                              builder_practices=practices["enabled"])
-    run["harness_task"] = task
+                              builder_practices=practices["enabled"],
+                              project_map_hint=project_map_hint)
+    # The audit copy of the builder task must not duplicate the private map
+    # body into the run record; the state directory owns that body.
+    audit_task = task
+    if project_map_hint:
+        audit_task = task.replace(
+            str(project_map_hint).strip(),
+            "[project map body omitted from the run record; see connector state]")
+    run["harness_task"] = audit_task
 
     try:
         limit = float(args["max_seconds"]) if args.get("max_seconds") is not None else None
@@ -3976,6 +4197,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         prior_elapsed = 0.0
     job_budget = budget_mod.JobBudget(
         job_seconds, job_cost, started=time.monotonic() - prior_elapsed)
+    if args.get("_review_deadline_reset"):
+        run["review_deadline_reset"] = True
     run["job_budget_initial"] = job_budget.snapshot(0.0, True)
     run["max_agents"] = envelope.max_agents
     try:
@@ -5348,6 +5571,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 # A provider that cannot answer a one-word prompt must not be
                 # handed the paid review.
                 review_preflight_record = None
+                # 3.10.0: optional backup reviewer. Empty by default, so the
+                # historical single-reviewer path is byte-for-byte unchanged.
+                reviewer_backup = reviewer_backup_mod.configured(cfg)
+                review_backup_used = False
+                review_backup_reason = None
+                review_backup_dsh = None
+                review_backup_identity = None
+                review_backup_error = None
+                review_backup_main_error = None
                 _preflight_requested = args.get("review_preflight")
                 if _preflight_requested is None:
                     _preflight_requested = cfg.get("review_preflight", True)
@@ -5358,18 +5590,77 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     if _remaining is not None:
                         preflight_limit = max(1.0, min(preflight_limit,
                                                        float(_remaining)))
-                    preflight = _execute_once(
-                        cfg, workspace,
-                        ("Reply with exactly READY and nothing else. Do not use "
-                         "tools, do not read or write files, do not run commands."),
-                        limit=preflight_limit, progress_cb=progress_cb,
-                        label="reviewer preflight %d" % round_no,
-                        exclude_logs=used_logs, policy=reviewer_policy,
-                        add_dirs=run["add_dirs"],
-                        transport_name=run["transport"],
-                        cancel_check=cancel_check)
-                    reviewer_executions.append(preflight)
-                    used_logs.update(preflight.get("session_logs") or [])
+                    # 3.10.0: a 5xx/dropped-stream pre-flight failure gets the
+                    # same bounded retry policy as the paid reviewer before the
+                    # backup is considered.  Auth and credit classes stay
+                    # immediate: another attempt cannot fix them.
+                    preflight_policy = health.RetryPolicy(
+                        "reviewer",
+                        base=getattr(cfg, "retry_backoff_base_seconds", 1.0),
+                        cap=getattr(cfg, "retry_backoff_cap_seconds", 60.0),
+                        jitter=0.0)
+                    preflight_attempt = 0
+                    preflight_retry_delays = []
+                    preflight = None
+                    _switch_class = None
+                    while True:
+                        preflight_attempt += 1
+                        _attempt_limit = preflight_limit
+                        _attempt_remaining = job_budget.remaining_seconds()
+                        if _attempt_remaining is not None:
+                            _attempt_limit = max(
+                                1.0, min(float(preflight_limit),
+                                         float(_attempt_remaining)))
+                        preflight = _execute_once(
+                            cfg, workspace,
+                            ("Reply with exactly READY and nothing else. Do not "
+                             "use tools, do not read or write files, do not run "
+                             "commands."),
+                            limit=_attempt_limit, progress_cb=progress_cb,
+                            label="reviewer preflight %d" % round_no,
+                            exclude_logs=used_logs, policy=reviewer_policy,
+                            add_dirs=run["add_dirs"],
+                            transport_name=run["transport"],
+                            cancel_check=cancel_check)
+                        reviewer_executions.append(preflight)
+                        used_logs.update(preflight.get("session_logs") or [])
+                        _answered = (
+                            preflight.get("status") == "ok"
+                            and not preflight.get("stalled")
+                            and not preflight.get("timed_out")
+                            and "READY" in str(
+                                preflight.get("answer") or "").upper())
+                        if _answered:
+                            break
+                        _switch_class = reviewer_backup_mod.switch_class(
+                            preflight)
+                        if _switch_class not in (
+                                "stream dropped",
+                                "service unavailable (5xx)"):
+                            break
+                        _preflight_spent, _preflight_known = _running_cost(
+                            executions + reviewer_executions)
+                        _retry_allowed, _retry_why = (
+                            preflight_policy.should_retry(
+                                preflight_attempt,
+                                health.classify_execution(preflight),
+                                remaining_seconds=job_budget.remaining_seconds(),
+                                spent=_preflight_spent,
+                                ceiling=job_budget.max_cost_usd,
+                                cost_known=_preflight_known))
+                        if not _retry_allowed:
+                            run["reviewer_preflight_retry"] = {
+                                "attempt": preflight_attempt,
+                                "class": _switch_class,
+                                "stopped": _retry_why,
+                            }
+                            break
+                        _preflight_delay = preflight_policy.delay(
+                            preflight_attempt,
+                            health.retry_after(str(
+                                preflight.get("error") or "")))
+                        preflight_retry_delays.append(_preflight_delay)
+                        preflight_policy.sleep(_preflight_delay)
                     _preflight_text = " ".join(
                         str(preflight.get(key) or "")
                         for key in ("error", "stderr_tail", "status_detail"))
@@ -5389,14 +5680,107 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     else:
                         _family = provider_family(execution=preflight, cfg=cfg)
                         _family_execution = preflight
-                    _answered = (
-                        preflight.get("status") == "ok"
-                        and not preflight.get("stalled")
-                        and not preflight.get("timed_out")
-                        and "READY" in str(preflight.get("answer") or "").upper())
+                    # 3.10.0: a main reviewer that cannot even answer READY for
+                    # a non-quality reason is switched before the paid round.
+                    if not _answered and reviewer_backup is not None:
+                        if _switch_class:
+                            review_backup_reason = _switch_class
+                            review_backup_dsh = reviewer_backup["bin"]
+                            review_backup_main_error = (
+                                api.redact_secrets(str(
+                                    preflight.get("error") or ""))[:500])
+                            _backup_limit = preflight_limit
+                            _backup_remaining = job_budget.remaining_seconds()
+                            if _backup_remaining is not None:
+                                _backup_limit = max(
+                                    1.0, min(float(preflight_limit),
+                                             float(_backup_remaining)))
+                            _backup_preflight = _execute_once(
+                                cfg, workspace,
+                                ("Reply with exactly READY and nothing else. Do not "
+                                 "use tools, do not read or write files, do not run "
+                                 "commands."),
+                                limit=_backup_limit, progress_cb=progress_cb,
+                                label="reviewer backup preflight %d" % round_no,
+                                exclude_logs=used_logs, policy=reviewer_policy,
+                                add_dirs=run["add_dirs"],
+                                transport_name=run["transport"],
+                                cancel_check=cancel_check,
+                                dsh_bin=reviewer_backup["bin"])
+                            reviewer_executions.append(_backup_preflight)
+                            used_logs.update(
+                                _backup_preflight.get("session_logs") or [])
+                            review_backup_identity = (
+                                reviewer_backup_mod.identity(
+                                    cfg, _backup_preflight))
+                            _backup_answered = (
+                                _backup_preflight.get("status") == "ok"
+                                and not _backup_preflight.get("stalled")
+                                and not _backup_preflight.get("timed_out")
+                                and "READY" in str(
+                                    _backup_preflight.get("answer") or "").upper())
+                            if _backup_answered:
+                                review_backup_used = True
+                                preflight = _backup_preflight
+                                review_preflight_record = _backup_preflight
+                                _answered = True
+                                _backup_banner = reviewer_backup_mod.banner(
+                                    cfg, _switch_class, _backup_preflight)
+                                run["reviewer_backup"] = {
+                                    "used": True,
+                                    "status": "preflight_ok",
+                                    "vendor": review_backup_identity["vendor"],
+                                    "model": review_backup_identity["model"],
+                                    "reason_class": _switch_class,
+                                    "main_error": review_backup_main_error,
+                                    "banner": _backup_banner,
+                                }
+                                _emit_run_event(run, cfg, "reviewer_backup", {
+                                    "round": round_no,
+                                    "status": "preflight_ok",
+                                    "vendor": review_backup_identity["vendor"],
+                                    "model": review_backup_identity["model"],
+                                    "reason_class": _switch_class,
+                                    "banner": _backup_banner,
+                                })
+                                _persist(run, cfg,
+                                         "review-%d_backup_preflight" % round_no)
+                            else:
+                                review_backup_error = api.redact_secrets(
+                                    str(_backup_preflight.get("error")
+                                        or "backup pre-flight did not answer "
+                                           "READY"))[:500]
                     if not _answered:
                         _message = provider_error_message(
                             _family_execution, cfg, role="reviewer")
+                        if review_backup_error:
+                            _message = (
+                                "%s Backup reviewer also failed: %s"
+                                % (_message, review_backup_error))
+                            run["reviewer_backup"] = {
+                                "used": True,
+                                "status": "error",
+                                "vendor": (review_backup_identity or {}).get(
+                                    "vendor", "unknown"),
+                                "model": (review_backup_identity or {}).get(
+                                    "model", "unknown"),
+                                "reason_class": review_backup_reason,
+                                "main_error": api.redact_secrets(
+                                    str(preflight.get("error") or ""))[:500],
+                                "backup_error": review_backup_error,
+                            }
+                            _emit_run_event(run, cfg, "reviewer_backup", {
+                                "round": round_no,
+                                "status": "error",
+                                "vendor": (review_backup_identity or {}).get(
+                                    "vendor", "unknown"),
+                                "model": (review_backup_identity or {}).get(
+                                    "model", "unknown"),
+                                "reason_class": review_backup_reason,
+                                "main_error": run["reviewer_backup"].get(
+                                    "main_error"),
+                                "error": review_backup_error,
+                            })
                         _raw = api.redact_secrets(
                             str(preflight.get("error") or ""))[:500]
                         run["reviewer_preflight"] = {
@@ -5405,6 +5789,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "message": _message,
                             "vendor": _provider_label(_family),
                             "seconds": preflight.get("seconds"),
+                            "attempts": preflight_attempt,
+                            "retry_delays": list(preflight_retry_delays),
                         }
                         run["review_error"] = _message
                         review_status = "error"
@@ -5428,7 +5814,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     run["reviewer_preflight"] = {
                         "status": "ok",
                         "seconds": preflight.get("seconds"),
-                        "model": getattr(cfg, "dsh_model", None),
+                        "attempts": preflight_attempt,
+                        "retry_delays": list(preflight_retry_delays),
+                        "model": ((review_backup_identity or {}).get("model")
+                                  or getattr(cfg, "dsh_model", None)),
+                        "backend": ("backup" if review_backup_used
+                                    else "main"),
+                        "reviewed_by": ("backup" if review_backup_used
+                                        else "main"),
+                        "vendor": ((review_backup_identity or {}).get("vendor")
+                                   if review_backup_used else None),
                         "checked_at": time.strftime(
                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "tokens_in": preflight.get("tokens_in"),
@@ -5522,12 +5917,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         cfg, workspace, review_task,
                         limit=job_budget.phase_limit(limit),
                         progress_cb=_reviewer_progress_cb,
-                        label="reviewer round %d" % round_no,
+                        label=(("reviewer backup round %d" % round_no)
+                               if review_backup_used
+                               else ("reviewer round %d" % round_no)),
                         exclude_logs=used_logs, policy=reviewer_policy,
                         add_dirs=run["add_dirs"],
                         transport_name=run["transport"],
                         cancel_check=cancel_check,
-                        live_usage_cb=review_live_cb)
+                        live_usage_cb=review_live_cb,
+                        dsh_bin=(review_backup_dsh
+                                 if review_backup_used else None))
                     reviewer_executions.append(review)
                     used_logs.update(review.get("session_logs") or [])
                     _review_answer_text = str(review.get("answer") or "")
@@ -5609,6 +6008,59 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         ceiling=job_budget.max_cost_usd,
                         cost_known=known_now)
                     if not allowed:
+                        _switch_class = None
+                        if (reviewer_backup is not None
+                                and not review_backup_used):
+                            _switch_class = (
+                                reviewer_backup_mod.switch_class(
+                                    review, retries_exhausted=True))
+                        if _switch_class:
+                            # Non-quality transport failure after the bounded
+                            # retries: re-run this same round immediately with
+                            # the backup reviewer. The switch is per round and
+                            # never sticky across jobs.
+                            review_backup_used = True
+                            review_backup_reason = _switch_class
+                            review_backup_dsh = reviewer_backup["bin"]
+                            review_backup_identity = (
+                                reviewer_backup_mod.identity(cfg, review))
+                            review_backup_main_error = api.redact_secrets(
+                                str(review.get("error") or ""))[:500]
+                            review["retry"] = {
+                                "attempt": review_attempt,
+                                "stopped": ("switched to backup reviewer: %s"
+                                            % _switch_class),
+                            }
+                            _switch_banner = reviewer_backup_mod.banner(
+                                cfg, _switch_class, review)
+                            run["reviewer_backup"] = {
+                                "used": True,
+                                "status": "switching",
+                                "vendor": review_backup_identity["vendor"],
+                                "model": review_backup_identity["model"],
+                                "reason_class": _switch_class,
+                                "main_error": review_backup_main_error,
+                                "banner": _switch_banner,
+                            }
+                            _emit_run_event(run, cfg, "reviewer_backup", {
+                                "round": round_no,
+                                "status": "switching",
+                                "vendor": review_backup_identity["vendor"],
+                                "model": review_backup_identity["model"],
+                                "reason_class": _switch_class,
+                                "banner": _switch_banner,
+                            })
+                            _persist(run, cfg,
+                                     "review-%d_backup_switch" % round_no)
+                            if progress_cb:
+                                try:
+                                    progress_cb(
+                                        "reviewer: main failed (%s); retrying "
+                                        "this round with the backup reviewer"
+                                        % _switch_class)
+                                except Exception:
+                                    pass
+                            continue
                         review["retry"] = {
                             "attempt": review_attempt,
                             "stopped": reason,
@@ -5655,6 +6107,61 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               "cost_known": False, "session_logs": []}
                 _materialize_review(workspace, review)
                 review["write_violations"] = violations
+                if review_backup_used:
+                    if review.get("status") == "ok":
+                        # The successful backup execution is authoritative:
+                        # refresh before building the final metadata, otherwise
+                        # an inferred label can still name the failed main
+                        # reviewer's model.
+                        review_backup_identity = reviewer_backup_mod.identity(
+                            cfg, review)
+                    elif review_backup_identity is None:
+                        review_backup_identity = reviewer_backup_mod.identity(
+                            cfg, review)
+                    if review.get("status") == "ok":
+                        run["reviewed_by"] = "backup"
+                        run["reviewed_by_line"] = reviewer_backup_mod.banner(
+                            cfg, review_backup_reason, review)
+                        run["reviewer_backup"] = {
+                            "used": True,
+                            "status": "ok",
+                            "vendor": review_backup_identity["vendor"],
+                            "model": review_backup_identity["model"],
+                            "reason_class": review_backup_reason,
+                            "main_error": review_backup_main_error,
+                            "banner": run["reviewed_by_line"],
+                        }
+                        _emit_run_event(run, cfg, "reviewer_backup", {
+                            "round": round_no,
+                            "status": "ok",
+                            "vendor": review_backup_identity["vendor"],
+                            "model": review_backup_identity["model"],
+                            "reason_class": review_backup_reason,
+                            "banner": run["reviewed_by_line"],
+                        })
+                    else:
+                        _main_error = review_backup_main_error or "unknown"
+                        review["error"] = (
+                            "main reviewer failed (%s); backup reviewer also "
+                            "failed: %s" % (_main_error,
+                                            review.get("error") or "unknown"))
+                        run["reviewer_backup"] = {
+                            "used": True,
+                            "status": "error",
+                            "vendor": review_backup_identity["vendor"],
+                            "model": review_backup_identity["model"],
+                            "reason_class": review_backup_reason,
+                            "main_error": review_backup_main_error,
+                            "backup_error": api.redact_secrets(
+                                str(review.get("error") or ""))[:500],
+                        }
+                        _emit_run_event(run, cfg, "reviewer_backup", {
+                            "round": round_no,
+                            "status": "error",
+                            "vendor": review_backup_identity["vendor"],
+                            "model": review_backup_identity["model"],
+                            "reason_class": review_backup_reason,
+                        })
                 if review.get("status") != "ok":
                     try:
                         interrupted_text, _ = _read_review(workspace)
@@ -5755,7 +6262,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         transport_name=run["transport"],
                         limit=job_budget.phase_limit(limit),
                         cancel_check=cancel_check, budget=job_budget,
-                        used_logs=used_logs)
+                        used_logs=used_logs,
+                        dsh_bin=(review_backup_dsh
+                                 if review_backup_used else None))
                     if reprompt_record.get("attempted"):
                         reviewer_executions.append(reprompt_record)
                         for _log in reprompt_record.get("session_logs") or []:
@@ -5813,6 +6322,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "blocking_defects": blocking,
                     "defects": defects,
                     "fixes": fixes,
+                    # Item 2: pre-existing findings are kept separate from the
+                    # change's blocking defects so the run record and result
+                    # can show them without ever treating them as blockers.
+                    "follow_ups": list(parsed.get("follow_ups") or []),
+                    "blocking_follow_ups": list(
+                        parsed.get("blocking_follow_ups") or []),
+                    "non_blocking_follow_ups": list(
+                        parsed.get("non_blocking_follow_ups") or []),
                     "visual_impact": parsed.get("visual_impact"),
                     "creative_cap": bool(parsed.get("creative_cap")),
                     "seconds": review.get("seconds"),
@@ -5826,6 +6343,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     "models": review.get("models"),
                     "usage_unknown_reason": review.get("usage_unknown_reason"),
                     "status": review.get("status"),
+                    "reviewed_by": ("backup" if review_backup_used
+                                    else "main"),
+                    "reviewer_backend": ("backup" if review_backup_used
+                                         else "main"),
+                    "reviewer_backup": (dict(run.get("reviewer_backup") or {})
+                                        if review_backup_used else None),
                     "error": review.get("error"),
                     "stalled": bool(review.get("stalled")),
                     "stalled_step": review.get("stalled_step"),
@@ -6336,6 +6859,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     review_warning = None
     last_review = next((item for item in reversed(review_rounds)
                         if item.get("kind") == "review"), None)
+    _collect_team_artifacts(run, workspace, getattr(cfg, "state_dir", None))
     final_blocking = int((last_review or {}).get("blocking_defects") or 0)
     current_status = run.get("status")
     hard_stop = current_status in ("cancelled", "deadline_exceeded",
@@ -6904,6 +7428,36 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
     if isinstance(saved_baseline, dict) and saved_baseline.get("dir"):
         saved_baseline_dir = str(saved_baseline["dir"])
         saved_baseline_round = saved_baseline.get("round")
+    # A review cut off by the whole-job deadline must not be refused forever on
+    # resume. If a review phase actually started (failed/interrupted/running) or
+    # a usable partial exists and the saved clock is already exhausted, grant a
+    # fresh window for the remaining review/revision phases only. A review that
+    # is still pending never resets the clock (R5b), and cost is never reset.
+    review_started = bool(saved_review_partial)
+    if not review_started:
+        for name in manifest.get("plan") or []:
+            name = str(name)
+            if not name.startswith("review-"):
+                continue
+            phase_status = str(
+                ((manifest.get("phases") or {}).get(name) or {})
+                .get("status") or "").strip().lower()
+            if phase_status in ("failed", "interrupted", "running"):
+                review_started = True
+                break
+    review_deadline_reset = False
+    if review_started:
+        max_seconds = effective_authority.job_max_seconds
+        try:
+            if max_seconds is not None and float(max_seconds) > 0:
+                elapsed = _saved_elapsed_seconds(saved, manifest, max_seconds)
+                if elapsed >= float(max_seconds):
+                    review_deadline_reset = True
+        except (TypeError, ValueError):
+            review_deadline_reset = False
+    if review_deadline_reset:
+        saved["review_deadline_reset"] = True
+
     resume_args = {
         "prompt": prompt,
         "workspace": workspace,
@@ -6931,7 +7485,9 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "live_scaling_max_extra_waves": saved.get(
             "live_scaling_max_extra_waves", spec.get("live_scaling_max_extra_waves")),
         "_resume_from": run_id,
-        "_job_elapsed_seconds": _saved_elapsed_seconds(saved, manifest),
+        "_job_elapsed_seconds": (0.0 if review_deadline_reset
+                                 else _saved_elapsed_seconds(saved, manifest)),
+        "_review_deadline_reset": review_deadline_reset,
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }

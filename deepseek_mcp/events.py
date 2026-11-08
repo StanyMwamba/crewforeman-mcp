@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover - keeps the module importable standalone
     )
 
 EVENT_TYPES = ("admitted", "phase", "progress", "needs_input", "result",
-               "failed", "cancelled")
+               "failed", "cancelled", "reviewer_backup")
 STAGES = ("queued", "running", "needs_human", "review_ready", "terminal")
 ATTENTIONS = ("none", "answer_question", "review_result", "inspect_failure")
 EVENT_SCHEMA = 1
