@@ -5,6 +5,24 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.9
+
+3.13.9: make the secure-tree unit test host-independent (proof pending the next windows-2025 run)
+
+- **Test assumption, not product behaviour.** `test_private_permissions_and_secure_tree`
+  now stubs `_windows_private_acl` to `False` before asserting that
+  `secure_tree(..., system="Windows")` returns `(0, 0)` and never calls
+  `os.chmod`.  On a real Windows host the ACL helper can succeed and count
+  `(2, 1)`; that success is covered by the ACL unit tests and the real boundary
+  test, while this test's contract is the Windows branch never using POSIX
+  chmod.  No product code and no skip is involved.
+- **Evidence.** Run 42692954782 (3.13.8) ran 1,745 tests on both Windows
+  Pythons: one failure and zero errors each, the failure being this test
+  returning `(2, 1)` against the old unconditional `(0, 0)` assertion.  The
+  boundary gate passed on both Pythons (`sandbox boundary exit code: 0`).  The
+  next `windows-2025` run is the required evidence; no Windows suite claim is
+  made before it.
+
 ## 3.13.8
 
 3.13.8: accept the current logon-session ACE in Windows ACL read-back (proof pending the next windows-2025 run)

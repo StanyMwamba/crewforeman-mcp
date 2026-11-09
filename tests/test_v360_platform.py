@@ -270,9 +270,16 @@ class SandboxAndPermissionsTests(unittest.TestCase):
             modes = [call.args[1] for call in chmod.call_args_list]
             self.assertIn(0o700, modes)
             self.assertIn(0o600, modes)
-            with mock.patch.object(platforms.os, "chmod") as chmod:
+            with mock.patch.object(platforms.os, "chmod") as chmod, \
+                    mock.patch.object(platforms, "_windows_private_acl",
+                                      return_value=False) as acl:
+                # On a real Windows host the ACL helper can succeed and the
+                # counts are non-zero.  This unit test is about the Windows
+                # branch never calling os.chmod, so stub the ACL result and
+                # assert the counts it produces on every host.
                 self.assertEqual(platforms.secure_tree(root, system="Windows"), (0, 0))
                 chmod.assert_not_called()
+                self.assertTrue(acl.called)
 
 
 if __name__ == "__main__":
