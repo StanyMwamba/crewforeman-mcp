@@ -325,7 +325,9 @@ class ConnectorReviewEvidenceTests(unittest.TestCase):
         key_path = (Path(cfg.state_dir) / "review-evidence" / "keys" /
                     "connector.key")
         self.assertTrue(key_path.is_file())
-        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode) & 0o777, 0o600)
+        if os.name != "nt":
+            # Windows privacy is an ACL, not POSIX mode bits.
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode) & 0o777, 0o600)
         self.assertEqual(run["review_status"], "accepted")
         # The reviewer prompt must carry the signed evidence and the diff.
         self.assertIn("Signed test evidence (connector-run)",

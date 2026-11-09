@@ -30,7 +30,7 @@ from deepseek_mcp import health  # noqa: E402
 from deepseek_mcp import safety  # noqa: E402
 from deepseek_mcp.config import load_config  # noqa: E402
 import tests  # noqa: E402
-from tests.fakes import base_env, write_fake_dsh  # noqa: E402
+from tests.fakes import base_env, write_fake_dsh, write_fake_script  # noqa: E402
 
 FC = health.FailureClass
 
@@ -356,8 +356,8 @@ class HarnessReviewerRetryIntegrationTests(unittest.TestCase):
         self.workspace.mkdir()
         self.fake = write_fake_dsh(self.root / "fake-dsh")
         self.counter = self.root / "calls.txt"
-        self.wrapper = self.root / "count-dsh"
-        self.wrapper.write_text(
+        self.wrapper = write_fake_script(
+            self.root / "count-dsh",
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "task = sys.argv[-1] if len(sys.argv) > 1 else ''\n"
@@ -365,9 +365,7 @@ class HarnessReviewerRetryIntegrationTests(unittest.TestCase):
             "with open(os.environ['P2_COUNT_OUT'], 'a') as handle:\n"
             "    handle.write(kind + '\\n')\n"
             "fake = os.environ['P2_FAKE_DSH']\n"
-            "os.execv(fake, [fake] + sys.argv[1:])\n",
-            encoding="utf-8")
-        self.wrapper.chmod(0o755)
+            "os.execv(fake, [fake] + sys.argv[1:])\n")
         self.env = base_env(self.root, fake_dsh=self.wrapper,
                             sessions=self.root / "sessions")
         self.env.update({
@@ -483,15 +481,14 @@ class BuilderSideEffectGuardIntegrationTests(unittest.TestCase):
         workspace.mkdir()
         counter = root / "calls.txt"
         dsh = root / "partial-dsh"
-        dsh.write_text(
+        dsh = write_fake_script(dsh, (
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
             "open(os.environ['P2_COUNT_OUT'], 'a').write('call\\n')\n"
             "pathlib.Path('.fake-partial.json').write_text('partial')\n"
             "print(json.dumps({'type': 'error', 'message': "
             "'fetch failed: ECONNRESET'}), flush=True)\n"
-            "sys.exit(1)\n", encoding="utf-8")
-        dsh.chmod(0o755)
+            "sys.exit(1)\n"))
         env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
         env.update({"P2_COUNT_OUT": str(counter), "DSH_TRANSIENT_RETRY": "1",
                     "DSH_AUTO_SKILLS": "off", "DSH_LIVE_SCALING": "0",

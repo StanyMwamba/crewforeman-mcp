@@ -1,4 +1,4 @@
-"""3.13.1 docs contract: per-OS limits match what the boundary suite proves."""
+"""3.13.2 docs contract: per-OS limits match what the boundary suite proves."""
 
 from pathlib import Path
 import unittest
@@ -35,7 +35,7 @@ class SafetyDocsTest(unittest.TestCase):
         text = read("README.md")
         self.assertLessEqual(len(text.splitlines()), 110)
         self.assertNotIn("$", text)
-        self.assertIn("CrewForeman 3.13.1", text)
+        self.assertIn("CrewForeman 3.13.2", text)
 
     def test_limitations_has_full_per_os_text(self):
         text = read("docs/LIMITATIONS.md")
@@ -44,7 +44,7 @@ class SafetyDocsTest(unittest.TestCase):
                      "delete_outside=unverified", "UNC", "ABI 1-2",
                      "network", "Reviewer"):
             self.assertIn(word, text)
-        self.assertIn("## Platform boundaries (3.13.1)", text)
+        self.assertIn("## Platform boundaries (3.13.2)", text)
 
     def test_install_documents_linux_and_windows(self):
         text = " ".join(read("docs/INSTALL.md").lower().split())
@@ -64,10 +64,23 @@ class SafetyDocsTest(unittest.TestCase):
                      "DEEPSEEK_MCP_SANDBOX_CANARY"):
             self.assertIn(word, text)
 
+    def test_windows_ci_claim_is_admin_scoped_and_not_pending(self):
+        limitations = read("docs/LIMITATIONS.md")
+        operations = read("docs/OPERATIONS.md")
+        install = read("docs/INSTALL.md")
+        self.assertIn("windows-2025", limitations)
+        self.assertIn("Administrator", limitations)
+        self.assertIn("delete_outside=unverified", limitations)
+        for text in (limitations, operations, install):
+            self.assertNotIn("Windows CI is PENDING", text)
+
     def test_changelog_has_current_release(self):
         text = read("CHANGELOG.md")
+        self.assertIn("## 3.13.2", text)
         self.assertIn("## 3.13.1", text)
+        self.assertLess(text.index("## 3.13.2"), text.index("## 3.13.1"))
         self.assertLess(text.index("## 3.13.1"), text.index("## 3.12.2"))
+        self.assertIn("windows-2025", text)
         for word in ("Windows", "Linux", "corrupt", "cleanup", "zero"):
             self.assertIn(word, text)
 

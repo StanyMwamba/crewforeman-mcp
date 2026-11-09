@@ -185,9 +185,11 @@ class ReviewContextTests(unittest.TestCase):
         tampered = dict(evidence)
         tampered["tests"] = 4
         self.assertFalse(rc.verify_evidence(tampered, self.tmp))
-        self.assertEqual(stat.S_IMODE(
-            os.stat(os.path.join(self.tmp, "review-evidence", "keys",
-                                 "connector.key")).st_mode) & 0o777, 0o600)
+        if os.name != "nt":
+            # Windows privacy is an ACL, not POSIX mode bits.
+            self.assertEqual(stat.S_IMODE(
+                os.stat(os.path.join(self.tmp, "review-evidence", "keys",
+                                     "connector.key")).st_mode) & 0o777, 0o600)
 
     def test_test_evidence_block(self):
         block = rc.format_test_evidence({

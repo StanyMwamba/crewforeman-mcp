@@ -16,7 +16,7 @@ from pathlib import Path
 
 from deepseek_mcp import harness
 from deepseek_mcp.config import Config, load_config
-from tests.fakes import base_env
+from tests.fakes import base_env, write_fake_script
 
 
 class FakeClock:
@@ -189,10 +189,8 @@ class HarnessStallIntegrationTests(unittest.TestCase):
 
     def _write_fake_dsh(self, body, name="fake-dsh"):
         path = self.root / name
-        path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body).lstrip(),
-                        encoding="utf-8")
-        path.chmod(0o755)
-        return path
+        script = "#!/usr/bin/env python3\n" + textwrap.dedent(body).lstrip()
+        return write_fake_script(path, script)
 
     def _cfg(self, script, **env_overrides):
         env = base_env(self.root, fake_dsh=script, sessions=self.sessions)

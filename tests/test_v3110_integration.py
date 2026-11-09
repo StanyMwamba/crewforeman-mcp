@@ -15,7 +15,7 @@ from unittest import mock
 
 from deepseek_mcp import failure_notes, harness, quality
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env
+from tests.fakes import base_env, write_fake_script
 
 
 class PromptAbiTests(unittest.TestCase):
@@ -121,9 +121,8 @@ class GateFailureIntegrationTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         (self.workspace / "src").mkdir()
-        fake_dsh = self.root / "dsh"
-        fake_dsh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        fake_dsh.chmod(fake_dsh.stat().st_mode | stat.S_IXUSR)
+        fake_dsh = write_fake_script(
+            self.root / "dsh", "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
         env = base_env(self.root)
         env.update({
             "DSH_BIN": str(fake_dsh),

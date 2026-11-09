@@ -82,9 +82,7 @@ os.execv(fake, [fake] + sys.argv[1:])
 
 
 def _write_script(path, body):
-    path.write_text(body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
+    return fakes.write_fake_script(path, body)
 
 
 class ResumeIntegrationTests(unittest.TestCase):
@@ -335,6 +333,10 @@ class ResumeIntegrationTests(unittest.TestCase):
         self.assertTrue(review_md.is_file(),
                         "REVIEW.md was not restored under the real HOME")
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "the fake reviewer hard-kills itself with signal.SIGKILL, "
+        "which does not exist on Windows")
     def test_r3_killed_reviewer_resumes_without_rerunning_builder(self):
         """SIGKILL a real fake-DSH reviewer, then resume from the checkpoint.
 

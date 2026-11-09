@@ -1,4 +1,4 @@
-"""Contract tests for the thin macOS + Linux CI setup.
+"""Contract tests for the 3-OS / two-job CI setup.
 
 The workflow is read as text on purpose: PyYAML is not a test dependency and
 the checks here are about exact commands, runner labels and pinned SHAs rather
@@ -7,13 +7,14 @@ repository's workflow uses (one ``jobs:`` mapping, two-space job keys, block
 or flow sequences).
 
 ``NEWEST_STABLE_PYTHON`` is deliberately pinned in the test as well as in the
-workflow: 3.15 is the current stable CPython line (3.15.2, released 2026-10-25) and
-actions/setup-python resolves the newest 3.15.x from the live
+workflow: 3.15 is the current stable CPython line (3.15.2, released 2026-10-25)
+and actions/setup-python resolves the newest 3.15.x from the live
 actions/python-versions manifest. Moving CI to 3.16 must update both places,
 which is the point of the cross-check.
 """
 import os
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -21,18 +22,28 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 CI_SCRIPT = ROOT / "scripts" / "ci.sh"
+CI_PS1 = ROOT / "scripts" / "ci.ps1"
+GITATTRIBUTES = ROOT / ".gitattributes"
 
 FLOOR_PYTHON = "3.9"
 NEWEST_STABLE_PYTHON = "3.15"
 NEWEST_STABLE_PATCH = "3.15.2"
-RUNNERS = {"macos-latest", "ubuntu-24.04"}
+RUNNERS = {"macos-latest", "ubuntu-24.04", "windows-2025"}
 CI_RUN_STEP = "bash scripts/ci.sh"
+WINDOWS_RUN_STEP = "pwsh -NoProfile -File scripts/ci.ps1"
 GATE_COMMAND = "-m unittest discover -s tests -q"
+GATE_NEEDLES = (
+    "tools/ci_hygiene.py",
+    "tests/build_fake_dsh.py",
+    "tests/sandbox_probe.py --require",
+    GATE_COMMAND,
+    "CF_REQUIRE_REAL_SANDBOX=1",
+    "tests.test_sandbox_boundary",
+)
 
 SHA_PINNED_ACTION = re.compile(
     r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$"
 )
-WINDOWS_RUNNER = re.compile(r"(?i)\bwindows-(?:latest|20\d\d)\b")
 
 
 def _top_block(text, key):
@@ -88,28 +99,43 @@ def _run_values(block):
     ]
 
 
+def _runs_on(block):
+    match = re.search(r"(?m)^\s+runs-on:\s*(.+?)\s*$", block)
+    if match is None:
+        return None
+    return match.group(1).split("#", 1)[0].strip()
+
+
+def _attribute_rules():
+    """Map ``pattern -> attributes`` from .gitattributes (comments stripped)."""
+    rules = {}
+    for raw in GITATTRIBUTES.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        rules[parts[0].lstrip("/")] = parts[1:]
+    return rules
+
+
 class CiWorkflowContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
         cls.jobs = _job_blocks(cls.text)
 
-    def test_single_matrix_job_and_no_windows_runner(self):
+    def test_workflow_has_exactly_test_and_windows_jobs(self):
         self.assertEqual(
-            set(self.jobs), {"test"},
-            "expected exactly one 'test' job, found %r" % sorted(self.jobs),
+            set(self.jobs), {"test", "windows"},
+            "expected exactly the test and windows jobs, found %r"
+            % sorted(self.jobs),
         )
-        self.assertIsNone(
-            WINDOWS_RUNNER.search(self.text),
-            "workflow still requests a Windows runner; CI is macOS + Linux only",
-        )
-        self.assertNotIn("windows-2025", self.text)
-        self.assertNotIn("windows-latest", self.text)
+        self.assertEqual(len(self.jobs), 2)
 
-    def test_matrix_is_exactly_macos_and_linux(self):
+    def test_runners_are_the_three_os_matrix(self):
         oses = _flow_list(self.text, "os")
         self.assertIsNotNone(oses, "workflow has no matrix os flow list")
-        self.assertEqual(set(oses), RUNNERS)
+        self.assertEqual(set(oses), {"macos-latest", "ubuntu-24.04"})
         self.assertEqual(len(oses), 2, "matrix.os must have exactly two entries")
         self.assertIn("ubuntu-24.04", oses, "Linux runner must be pinned")
         self.assertNotIn(
@@ -117,10 +143,27 @@ class CiWorkflowContractTest(unittest.TestCase):
             "ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 in "
             "actions/setup-python; pin ubuntu-24.04",
         )
+        self.assertNotIn(
+            "windows-2025", oses,
+            "windows-2025 must be a separate job, not part of the "
+            "macOS/Linux matrix",
+        )
 
-        runs_on = re.search(r"(?m)^\s+runs-on:\s*(.+?)\s*$", self.text)
-        self.assertIsNotNone(runs_on, "job has no runs-on")
-        self.assertEqual(runs_on.group(1).strip(), "${{ matrix.os }}")
+        self.assertEqual(_runs_on(self.jobs["test"]), "${{ matrix.os }}")
+        self.assertEqual(
+            _runs_on(self.jobs["windows"]), "windows-2025",
+            "the windows job must be pinned to runs-on: windows-2025",
+        )
+        self.assertIn("windows-2025", self.text)
+        for obsolete in ("windows-latest", "windows-2022", "windows-2019"):
+            self.assertNotIn(
+                obsolete, self.text,
+                "workflow requests %r; only windows-2025 is supported"
+                % obsolete,
+            )
+        self.assertEqual(
+            RUNNERS, {"macos-latest", "ubuntu-24.04", "windows-2025"}
+        )
 
     def test_matrix_python_is_floor_plus_newest_stable(self):
         versions = _flow_list(self.text, "python")
@@ -130,20 +173,26 @@ class CiWorkflowContractTest(unittest.TestCase):
             "matrix.python must be exactly %s and %s, got %r"
             % (FLOOR_PYTHON, NEWEST_STABLE_PYTHON, versions),
         )
+        self.assertEqual(len(versions), 2)
         # State the exact current patch, not just the minor line.
         self.assertIn(
             NEWEST_STABLE_PATCH, self.text,
-            "workflow must state the newest stable patch (%s)" % NEWEST_STABLE_PATCH,
+            "workflow must state the newest stable patch (%s)"
+            % NEWEST_STABLE_PATCH,
         )
 
-    def test_each_job_calls_only_scripts_ci_sh(self):
-        self.assertTrue(self.jobs, "workflow has no jobs")
-        for name, block in self.jobs.items():
-            runs = _run_values(block)
+    def test_each_job_has_exactly_three_steps_and_one_run(self):
+        expected_runs = {
+            "test": [CI_RUN_STEP],
+            "windows": [WINDOWS_RUN_STEP],
+        }
+        for name in ("test", "windows"):
+            self.assertIn(name, self.jobs)
+            block = self.jobs[name]
             self.assertEqual(
-                runs, [CI_RUN_STEP],
+                _run_values(block), expected_runs[name],
                 "job %r must have exactly one run step %r; got %r"
-                % (name, CI_RUN_STEP, runs),
+                % (name, expected_runs[name], _run_values(block)),
             )
             uses = re.findall(r"(?m)^\s*-\s*uses:\s*(\S+)", block)
             self.assertEqual(
@@ -155,17 +204,18 @@ class CiWorkflowContractTest(unittest.TestCase):
             steps = re.findall(r"(?m)^\s{6}-\s+(?:name|uses|run):", block)
             self.assertEqual(
                 len(steps), 3,
-                "job %r must have exactly 3 steps (checkout, setup, ci.sh); "
+                "job %r must have exactly 3 steps (checkout, setup, run); "
                 "got %d" % (name, len(steps)),
             )
         self.assertEqual(
-            len(re.findall(r"(?m)^\s+run:\s*", self.text)), 1,
-            "the workflow must contain exactly one run: step",
+            len(re.findall(r"(?m)^\s+run:\s*", self.text)), 2,
+            "the workflow must contain exactly two run: steps",
         )
 
     def test_actions_are_pinned_to_full_sha(self):
         uses = re.findall(r"(?m)^\s*-\s*uses:\s*(\S+)", self.text)
-        self.assertEqual(len(uses), 2, "expected two pinned actions; got %r" % uses)
+        self.assertEqual(len(uses), 4, "expected four pinned actions; got %r"
+                         % uses)
         for value in uses:
             self.assertRegex(
                 value, SHA_PINNED_ACTION,
@@ -201,24 +251,59 @@ class CiWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("boundary:", lowered)
         self.assertGreaterEqual(self.text.count("timeout-minutes:"), 1)
 
+    def test_gitattributes_pins_line_endings(self):
+        self.assertTrue(
+            GITATTRIBUTES.is_file(),
+            "missing .gitattributes; CI needs deterministic line endings",
+        )
+        rules = _attribute_rules()
+        self.assertIn(
+            "scripts/ci.sh", rules,
+            ".gitattributes must pin scripts/ci.sh explicitly",
+        )
+        ci_attrs = rules["scripts/ci.sh"]
+        self.assertIn("text", ci_attrs)
+        self.assertIn("eol=lf", ci_attrs)
+        self.assertIn("*.ps1", rules, ".gitattributes must cover *.ps1")
+        self.assertIn("eol=crlf", rules["*.ps1"])
+
 
 class CiScriptContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.script = CI_SCRIPT.read_text(encoding="utf-8")
+        cls.ps1 = CI_PS1.read_text(encoding="utf-8")
 
-    def test_script_exists_executable_and_nonempty(self):
+    def test_scripts_exist_and_are_nonempty(self):
         self.assertTrue(CI_SCRIPT.is_file(), "missing %s" % CI_SCRIPT)
         self.assertGreater(CI_SCRIPT.stat().st_size, 0)
         self.assertTrue(
             os.access(str(CI_SCRIPT), os.X_OK),
             "%s must be executable" % CI_SCRIPT,
         )
+        self.assertTrue(CI_PS1.is_file(), "missing %s" % CI_PS1)
+        self.assertGreater(CI_PS1.stat().st_size, 0)
+        self.assertTrue(self.ps1.strip(), "%s must not be empty" % CI_PS1)
+
+    def test_both_scripts_run_the_same_gate(self):
+        for label, text in (("scripts/ci.sh", self.script),
+                            ("scripts/ci.ps1", self.ps1)):
+            for needle in GATE_NEEDLES:
+                self.assertIn(
+                    needle, text,
+                    "%s lacks the gate token %r" % (label, needle),
+                )
+
+    def test_both_scripts_control_the_gate_environment(self):
+        for label, text in (("scripts/ci.sh", self.script),
+                            ("scripts/ci.ps1", self.ps1)):
+            # Accept DSH_OS_SANDBOX=0 and $env:DSH_OS_SANDBOX alike.
+            self.assertIn("DSH_OS_SANDBOX", text, label)
+            self.assertIn("DSH_REVIEW_PREFLIGHT", text, label)
+            self.assertNotIn("CF_REQUIRE_REAL_SANDBOX=0", text, label)
 
     def test_script_runs_the_exact_gate_command(self):
         self.assertIn(GATE_COMMAND, self.script)
-        self.assertIn("DSH_OS_SANDBOX=0", self.script)
-        self.assertIn("DSH_REVIEW_PREFLIGHT=0", self.script)
         self.assertIn('PYTHON="${PYTHON:-python3}"', self.script)
 
     def test_script_requires_the_real_boundary(self):
@@ -230,9 +315,16 @@ class CiScriptContractTest(unittest.TestCase):
         self.assertIn("tests/build_fake_dsh.py", self.script)
         self.assertIn("tests/sandbox_probe.py --require", self.script)
 
-    def test_script_has_no_secrets_and_passes_bash_syntax(self):
-        self.assertNotIn("secrets.", self.script)
-        self.assertNotIn("secrets[", self.script)
+    def test_scripts_have_no_secrets(self):
+        for label, text in (("scripts/ci.sh", self.script),
+                            ("scripts/ci.ps1", self.ps1)):
+            self.assertNotIn("secrets.", text, label)
+            self.assertNotIn("secrets[", text, label)
+
+    def test_bash_script_passes_bash_syntax(self):
+        if shutil.which("bash") is None:
+            self.skipTest("bash is not installed on this host; "
+                          "scripts/ci.sh syntax is unverified here")
         completed = subprocess.run(
             ["bash", "-n", str(CI_SCRIPT)],
             stdout=subprocess.PIPE,
@@ -244,6 +336,33 @@ class CiScriptContractTest(unittest.TestCase):
             completed.returncode, 0,
             "bash -n failed for %s\nstdout:\n%s\nstderr:\n%s"
             % (CI_SCRIPT, completed.stdout, completed.stderr),
+        )
+
+    def test_powershell_script_parses_when_pwsh_is_available(self):
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            self.skipTest("pwsh is not installed on this host; "
+                          "scripts/ci.ps1 syntax is unverified here")
+        escaped = str(CI_PS1).replace("'", "''")
+        command = (
+            "$tokens = $null; $errors = $null; "
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            "'%s', [ref]$tokens, [ref]$errors) | Out-Null; "
+            "if (@($errors).Count -gt 0) { "
+            "$errors | ForEach-Object { Write-Error $_.Message }; exit 1 }"
+            % escaped
+        )
+        completed = subprocess.run(
+            [pwsh, "-NoProfile", "-Command", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            "PowerShell parse failed for %s\nstdout:\n%s\nstderr:\n%s"
+            % (CI_PS1, completed.stdout, completed.stderr),
         )
 
 

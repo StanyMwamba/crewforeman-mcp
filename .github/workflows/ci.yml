@@ -1,9 +1,12 @@
 name: ci
 
-# CI is macOS + Linux only for now. Windows is intentionally absent: the
-# stdlib suite and the Windows sandbox unit tests run on every host, but the
-# real Windows boundary must first pass on the user's non-admin Windows VM.
-# See docs/OPERATIONS.md ("Continuous integration") and WINDOWS_TEST.md.
+# CI runs on macOS, Linux and Windows. The Windows job uses the pinned
+# windows-2025 GitHub-hosted runner, which runs as an Administrator and is
+# x64/UTC. The Windows lane runs the full suite and the real write-restricted
+# boundary, so it exercises the boundary under an elevated token. It does not
+# prove the standard-user path: that is still established only by the manual run
+# on the user's real Windows 11 arm64 VM. See docs/OPERATIONS.md ("Continuous
+# integration") and the Windows VM test package.
 
 on:
   push:
@@ -42,3 +45,25 @@ jobs:
           python-version: "${{ matrix.python }}"
       - name: Run CI
         run: bash scripts/ci.sh
+
+  windows:
+    name: windows-2025 (py${{ matrix.python }})
+    # Pinned: never the floating Windows label. windows-2025 is Windows Server 2025
+    # image and ships PowerShell 7, Git Bash, Git and the VS 2022 C++ tools.
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # actions/python-versions has win32 x64 builds for both lines
+        # (3.9.13 and 3.15.2).
+        python: ["3.9", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "${{ matrix.python }}"
+      - name: Run CI (Windows)
+        run: pwsh -NoProfile -File scripts/ci.ps1

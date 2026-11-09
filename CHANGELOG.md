@@ -5,6 +5,41 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.2
+
+3.13.2: Windows CI (windows-2025, Python 3.9 and 3.15)
+
+- **Windows CI lane.** The matrix is now three OSes — `macos-latest`,
+  `ubuntu-24.04` and `windows-2025` — each on Python 3.9 (the supported floor)
+  and 3.15 (the newest stable CPython line). The Windows job is one step,
+  `pwsh -NoProfile -File scripts/ci.ps1`: a native PowerShell mirror of
+  `scripts/ci.sh` that does not go through Git Bash, so Windows paths are not
+  translated and exit codes surface directly. It runs the full suite and the
+  real write-restricted boundary with `CF_REQUIRE_REAL_SANDBOX=1`.
+- **Boundary on the hosted runner.** The `windows-2025` user is an
+  Administrator, so the job exercises the boundary under an elevated token. The
+  suite requires create, modify, append and truncate denials outside the
+  workspace; delete/rename outside is recorded and stays
+  `delete_outside=unverified` unless a run proves it. The standard-user path is
+  not proven by CI: the user's Windows 11 arm64 VM run remains the only
+  standard-user evidence and must be re-run after this change, so CI makes no
+  no-admin claim.
+- **Line endings.** `.gitattributes` normalizes checkout line endings: LF in the
+  repository for Python, shell and Markdown files, CRLF only where a Windows
+  tool requires it, so a Windows checkout does not feed CRLF into the suite.
+- **Three-OS contract.** macOS Seatbelt, Linux Landlock at ABI 3+ and the
+  Windows write-restricted token now all run the same full suite plus a real
+  boundary in CI. No enforcement claim is widened: the Windows runner is
+  elevated, and the README/LIMITATIONS wording says so.
+- **Gate evidence portability.** The deterministic gate now redacts the test
+  command before storing signed `review_test_evidence` and re-signs the
+  redacted copy. A venv/pyenv interpreter under `$HOME` no longer silently
+  drops the evidence; this was required to keep the macOS 3.15 and Linux proof
+  lanes green.
+- **Version 3.13.2.** Version bumped in `pyproject.toml`, the package,
+  `config.SERVER_VERSION`, `observability.SERVICE_VERSION`, the smoke client and
+  the docs.
+
 ## 3.13.1
 
 3.13.1: CI fixes — timezone-independent expiry test, Linux runner pinned to ubuntu-24.04

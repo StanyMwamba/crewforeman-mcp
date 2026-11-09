@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from deepseek_mcp import transport  # noqa: E402
+from tests.fakes import write_fake_script
 
 
 FAKE_DSH_BODY = r'''
@@ -102,10 +103,9 @@ class TransportTests(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
-        self.script = self.tmp / "fake-dsh"
         body = FAKE_DSH_BODY.replace("__PYTHON__", sys.executable)
-        self.script.write_text("#!" + sys.executable + "\n" + body, encoding="utf-8")
-        self.script.chmod(0o755)
+        self.script = write_fake_script(
+            self.tmp / "fake-dsh", "#!" + sys.executable + "\n" + body)
 
     def tearDown(self):
         self._tmp.cleanup()

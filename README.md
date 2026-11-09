@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.13.1 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.13.2 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -92,7 +92,7 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 ## Limits
 - **macOS:** Seatbelt; the boundary suite proves create, modify, truncate, rename and delete outside the workspace, plus symlink and `..` escapes, are refused; reads and network are unrestricted.
 - **Linux:** Landlock ABI 3+; the same file-write claim is proven on `ubuntu-24.04`, ABI 1-2 is degraded, `os_sandbox=require` refuses with no boundary and `auto` prints `UNSANDBOXED`; network is unrestricted.
-- **Windows:** write-restricted token plus workspace/temp ACE; the suite proves create, modify and truncate denial; delete/rename is claimed only if the boundary job proves it, else `delete_outside=unverified`; network/UNC writes are not blocked and no no-admin claim is made.
+- **Windows:** write-restricted token plus workspace/temp ACE; the suite requires create, modify and truncate denial; delete/rename is claimed only if the boundary job proves it, else `delete_outside=unverified`; network/UNC writes are not blocked and no no-admin claim is made.
 - **Reviewer:** the reviewer is a model; its score is judgement, not proof of correctness.
 ## Documentation
 | Page | Contents |

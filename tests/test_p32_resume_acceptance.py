@@ -9,7 +9,7 @@ from unittest import mock
 
 from deepseek_mcp import harness, quality
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 import tests
 
 os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
@@ -80,8 +80,8 @@ if 'INDEPENDENT REVIEWER' in task:
     print(json.dumps({'type': 'error', 'message': 'Insufficient Balance'}),
           flush=True)
     sys.exit(1)
-os.execv(sys.executable,
-         [sys.executable, os.environ['WRAP_REAL_DSH']] + sys.argv[1:])
+real = os.environ['WRAP_REAL_DSH']
+os.execv(real, [real] + sys.argv[1:])
 '''
 
 
@@ -126,9 +126,7 @@ class ResumeAcceptanceTests(unittest.TestCase):
         workspace = root / "workspace"
         workspace.mkdir()
         fake = write_fake_dsh(root / "dsh")
-        wrapper = root / "dsh-resume-acceptance"
-        wrapper.write_text(_WRAPPER, encoding="utf-8")
-        wrapper.chmod(0o755)
+        wrapper = write_fake_script(root / "dsh-resume-acceptance", _WRAPPER)
         first_path = root / "first-report.md"
         first_path.write_text(first_report, encoding="utf-8")
         resume_path = root / "resume-report.md"

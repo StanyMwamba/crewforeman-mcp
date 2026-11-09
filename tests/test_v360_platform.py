@@ -133,8 +133,10 @@ class ProcessControlTests(unittest.TestCase):
     def test_terminate_tree_posix_killpg(self):
         with mock.patch.object(platforms.os, "getpid", return_value=100), \
                 mock.patch.object(platforms.os, "getpgid",
-                                  side_effect=lambda pid: 123 if pid == 123 else 999), \
-                mock.patch.object(platforms.os, "killpg") as killpg, \
+                                  side_effect=lambda pid: 123 if pid == 123 else 999,
+                                  create=True), \
+                mock.patch.object(platforms.os, "killpg",
+                                  create=True) as killpg, \
                 mock.patch.object(platforms.os, "kill") as kill, \
                 mock.patch.object(platforms, "_pid_alive", return_value=False):
             result = platforms.terminate_tree(123, system="Linux")
@@ -143,7 +145,8 @@ class ProcessControlTests(unittest.TestCase):
         kill.assert_not_called()
 
         with mock.patch.object(platforms.os, "getpid", return_value=100), \
-                mock.patch.object(platforms.os, "killpg") as killpg:
+                mock.patch.object(platforms.os, "killpg",
+                                  create=True) as killpg:
             unsafe = platforms.terminate_tree(0, system="Linux")
         self.assertFalse(unsafe["terminated"])
         self.assertIn("unsafe", unsafe["reason"])

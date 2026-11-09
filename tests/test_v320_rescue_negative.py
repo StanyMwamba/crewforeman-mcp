@@ -14,7 +14,7 @@ from unittest import mock
 
 from deepseek_mcp import harness
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env
+from tests.fakes import base_env, write_fake_script
 
 
 # A self-contained fake Harness CLI. It branches on the task text so the
@@ -101,9 +101,7 @@ class RescueNegativeTests(unittest.TestCase):
         self.workspace.mkdir()
         self.task_log = self.root / "fake-dsh-tasks.jsonl"
 
-        self.dsh = self.root / "dsh"
-        self.dsh.write_text(FAKE_DSH, encoding="utf-8")
-        self.dsh.chmod(0o755)
+        self.dsh = write_fake_script(self.root / "dsh", FAKE_DSH)
 
         self.env = base_env(self.root, fake_dsh=self.dsh)
         self.env.update({

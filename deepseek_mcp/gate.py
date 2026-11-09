@@ -443,6 +443,32 @@ def _redact_command(command):
     return redact_secrets(str(command))
 
 
+_SECRET_COMMAND_RE = re.compile(
+    r"\bsk-[A-Za-z0-9_-]{8,}\b|Bearer\s+[A-Za-z0-9._-]+", re.IGNORECASE)
+
+
+def _command_is_safe(command):
+    """True when a command carries no API key or bearer token.
+
+    Home-path redaction is deliberately not treated as a secret: a Python
+    interpreter under ``$HOME`` (a venv, pyenv, or a CI toolcache) is normal,
+    and the evidence command is redacted before it is stored.  Comparing the
+    redacted command to the original, as an earlier version did, silently
+    dropped signed test evidence for every such interpreter.
+    """
+    if command is None:
+        return True
+    parts = command if isinstance(command, (list, tuple)) else [command]
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    for part in parts:
+        text = str(part)
+        if key and key in text:
+            return False
+        if _SECRET_COMMAND_RE.search(text):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # secret scan
 
@@ -992,11 +1018,17 @@ def _tests_check(cfg, workspace, run, deadline):
     elif tree_changed:
         skipped_reason = "tree_mutated"
     evidence = dict(suite) if isinstance(suite, dict) else {}
-    safe_to_reuse = (_redact_command(evidence.get("command"))
-                     == evidence.get("command"))
-    if status == "ok" and evidence.get("signature") and safe_to_reuse:
+    if (status == "ok" and evidence.get("signature")
+            and _command_is_safe(suite.get("command"))):
         try:
             if isinstance(run, dict):
+                # Redact before storing, then re-sign the redacted copy with
+                # the same evidence key so a verifier can still check it.
+                evidence["command"] = _redact_command(evidence.get("command"))
+                _key_id, secret = review_context.ensure_evidence_key(state_dir)
+                evidence.pop("signature", None)
+                evidence["signature"] = review_context.sign_payload(
+                    evidence, secret)
                 bucket = run.setdefault("review_test_evidence", [])
                 if isinstance(bucket, list):
                     bucket.append(evidence)

@@ -17,6 +17,7 @@ test SIGKILLs the grandchild in ``addCleanup``, so a failing run never leaves a
 
 import os
 import signal
+import sys
 import tempfile
 import textwrap
 import threading
@@ -74,6 +75,10 @@ def _alarm_handler(_signum, _frame):
     raise _RunTimedOut("run_harness did not return within the 15 s test guard")
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "uses signal.SIGALRM/setitimer, SIGKILL and a shebang fake dsh, "
+    "none of which exist on Windows")
 class NormalExitPipeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

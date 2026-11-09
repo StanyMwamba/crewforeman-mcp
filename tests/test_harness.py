@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -154,6 +155,10 @@ class HarnessRunTests(unittest.TestCase):
         self.assertIn("1 revision round", run["harness_task"])
         self.assertIn("quality 8.60/10", text)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "os.access(X_OK) is always true on Windows and chmod cannot "
+        "remove execute permission, so a non-executable dsh cannot be made")
     def test_non_executable_dsh_is_saved_as_an_error(self):
         bad = self.root / "dsh-noexec"
         bad.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")

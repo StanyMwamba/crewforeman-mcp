@@ -16,7 +16,7 @@ recursive-include skills *.md
 include docs/skills.md
 recursive-include docs *
 recursive-include tests *.py
-recursive-include scripts *.py *.sh
+recursive-include scripts *.py *.sh *.ps1
 recursive-include bench *.py
 recursive-include .github *
 

@@ -15,7 +15,7 @@ from unittest import mock
 
 from deepseek_mcp import budget, harness, jobs, safety
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 
 
 class FakeClock:
@@ -495,16 +495,14 @@ class LiveBoundaryIntegrationTests(unittest.TestCase):
         workspace = root / "workspace"
         workspace.mkdir()
         dsh = root / "usage-dsh"
-        dsh.write_text(
+        dsh = write_fake_script(dsh, (
             "#!/usr/bin/env python3\n"
             "import json, time\n"
             "print(json.dumps({'type': 'assistant/message', 'data': {"
             "'message': {'id': 'm1', 'role': 'assistant', 'source': "
             "{'model': 'deepseek-flash'}}, 'usage': {'inputTokens': 9000000, "
             "'outputTokens': 9000000}}}), flush=True)\n"
-            "time.sleep(20)\n",
-            encoding="utf-8")
-        dsh.chmod(0o755)
+            "time.sleep(20)\n"))
         env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
         cfg = load_config(config_path=root / "config.json", env=env)
         policy = safety.resolve({}, cfg, reviewer=False)

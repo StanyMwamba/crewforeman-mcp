@@ -428,6 +428,27 @@ def base_env(root, fake_dsh=None, sessions=None, base_url=None):
     return env
 
 
+def write_fake_script(path, body):
+    """Write a Python helper script and make it runnable on this host.
+
+    On POSIX the script is executed through its shebang.  Windows
+    ``CreateProcess`` cannot run a shebang script, so compile the same
+    test-only launcher used for the fake ``dsh`` and return the ``.exe`` path.
+    Callers must use the returned path, not the script path, as ``DSH_BIN`` or
+    ``DSH_CHROME_BIN``.
+    """
+    path = Path(path)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if os.name == "nt":
+        try:
+            from . import build_fake_dsh
+        except ImportError:  # tests run as top-level modules
+            import build_fake_dsh
+        return build_fake_dsh.build_launcher(path)
+    return path
+
+
 def write_fake_chrome(path):
     """Create an executable fake Chrome for render-probe tests only."""
     content = '''#!/usr/bin/env python3
@@ -450,7 +471,4 @@ if "--dump-dom" in args:
     sys.exit(0)
 sys.exit(2)
 '''
-    path = Path(path)
-    path.write_text(content, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    return write_fake_script(path, content)

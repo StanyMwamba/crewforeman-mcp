@@ -12,7 +12,7 @@ from unittest import mock
 
 from deepseek_mcp import authority, checkpoints, harness, safety
 from deepseek_mcp.config import Config, load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 
 
 class AuthorityTestCase(unittest.TestCase):
@@ -308,15 +308,14 @@ class AuthorityRunIntegrationTests(unittest.TestCase):
         self.fake = write_fake_dsh(self.root / "fake-dsh")
         self.counter = self.root / "calls.txt"
         self.wrapper = self.root / "count-dsh"
-        self.wrapper.write_text(
+        self.wrapper = write_fake_script(
+            self.wrapper,
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "with open(os.environ['P2_COUNT_OUT'], 'a') as handle:\n"
             "    handle.write('call\\n')\n"
             "fake = os.environ['P2_FAKE_DSH']\n"
-            "os.execv(fake, [fake] + sys.argv[1:])\n",
-            encoding="utf-8")
-        self.wrapper.chmod(0o755)
+            "os.execv(fake, [fake] + sys.argv[1:])\n")
         self.env = base_env(self.root, fake_dsh=self.wrapper,
                             sessions=self.root / "sessions")
         self.env.update({

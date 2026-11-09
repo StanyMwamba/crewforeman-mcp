@@ -11,14 +11,15 @@ from unittest import mock
 
 from deepseek_mcp import harness, render
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_chrome, write_fake_dsh
+from tests.fakes import (base_env, write_fake_chrome, write_fake_dsh,
+                         write_fake_script)
 
 
 def fake_chrome(path, **config):
     path = Path(path)
     config_path = Path(str(path) + ".config.json")
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    path.write_text('''#!/usr/bin/env python3
+    content = '''#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -26,7 +27,7 @@ import time
 
 args = sys.argv[1:]
 try:
-    with open(sys.argv[0] + ".config.json", encoding="utf-8") as handle:
+    with open(__file__ + ".config.json", encoding="utf-8") as handle:
         config = json.load(handle)
 except Exception:
     config = {}
@@ -54,9 +55,8 @@ if "--dump-dom" in args:
     print("<html><body>ok</body></html>")
     sys.exit(0)
 sys.exit(2)
-''', encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+'''
+    return write_fake_script(path, content)
 
 
 class RenderProbeTests(unittest.TestCase):

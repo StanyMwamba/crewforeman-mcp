@@ -94,6 +94,15 @@ class GateTest(unittest.TestCase):
             evidence, evidence["signature"], key))
         self.assertIn("passed", gate.format_gate_evidence(result))
 
+    def test_home_path_interpreter_is_safe_but_a_secret_is_not(self):
+        # A venv/pyenv interpreter under $HOME is normal; redacting the home
+        # path for storage must not drop the signed evidence.
+        home_cmd = [os.path.join(os.path.expanduser("~"), "venv", "bin",
+                                 "python3"), "-m", "unittest"]
+        self.assertTrue(gate._command_is_safe(home_cmd))
+        self.assertFalse(gate._command_is_safe(
+            home_cmd + ["sk-" + "A" * 40]))
+
     def test_gate_secret_never_echoed(self):
         secret = "sk-" + "Z" * 40
         before = safety.snapshot_workspace(self.ws)

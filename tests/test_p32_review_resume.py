@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from deepseek_mcp import checkpoints, harness, quality, review_progress
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 import tests
 
 os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
@@ -158,7 +159,7 @@ class ResumeIntegrationTests(unittest.TestCase):
 
     def _wrapper(self, root, fake):
         path = root / "dsh-resume-review"
-        path.write_text(
+        body = (
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
             "task = sys.argv[-1] if len(sys.argv) else ''\n"
@@ -183,11 +184,9 @@ class ResumeIntegrationTests(unittest.TestCase):
             "    print(json.dumps({'type': 'error',\n"
             "                      'message': 'Insufficient Balance'}), flush=True)\n"
             "    sys.exit(1)\n"
-            "os.execv(sys.executable,\n"
-            "         [sys.executable, os.environ['WRAP_REAL_DSH']] + sys.argv[1:])\n",
-            encoding="utf-8")
-        path.chmod(0o755)
-        return path
+            "real = os.environ['WRAP_REAL_DSH']\n"
+            "os.execv(real, [real] + sys.argv[1:])\n")
+        return write_fake_script(path, body)
 
     def test_interrupted_review_resumes_with_prior_findings_and_merges(self):
         tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
@@ -457,6 +456,10 @@ class SeverityMergeTests(unittest.TestCase):
         self.assertTrue(accepted)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "the fake reviewer hard-kills itself with signal.SIGKILL, which "
+    "does not exist on Windows")
 class LiveProgressResumeTests(unittest.TestCase):
     """Emit protocol events, hard-kill the reviewer, then resume."""
 

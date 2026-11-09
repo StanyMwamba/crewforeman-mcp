@@ -109,6 +109,10 @@ class CredentialsResolutionTest(unittest.TestCase):
         self.assertNotIn(FILE_VALUE, provider_text)
         self.assertNotIn(ENV_VALUE, provider_text)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows privacy is an ACL that private_permissions sets and verifies; "
+        "there is no 0644 mode warning to assert")
     def test_group_readable_file_skipped_with_warning(self):
         path = self._path()
         _write(path, "%s: %s\n" % (ENV_NAME, FILE_VALUE), mode=0o644)

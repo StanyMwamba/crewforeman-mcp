@@ -36,6 +36,10 @@ def _walk_values(value, key):
             yield from _walk_values(item, key)
 
 
+@unittest.skipIf(
+    os.name == "nt",
+    "acceptance fakes are POSIX /bin/sh wrappers executed as DSH_BIN; "
+    "Windows uses the compiled launcher from tests.fakes.write_fake_dsh")
 class BackupAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=tests.tempdir())
@@ -377,6 +381,10 @@ os.execv(REAL, [REAL] + sys.argv[1:])
     return path
 
 
+@unittest.skipIf(
+    os.name == "nt",
+    "acceptance fakes are POSIX /bin/sh wrappers executed as DSH_BIN; "
+    "Windows uses the compiled launcher from tests.fakes.write_fake_dsh")
 class BackupIdentityRefreshTests(unittest.TestCase):
     """Paid fallback: final metadata must name the successful backup model."""
 

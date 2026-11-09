@@ -34,9 +34,7 @@ os.execv(fake, [fake] + sys.argv[1:])
 
 
 def _write_script(path, body):
-    path.write_text(body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
+    return fakes.write_fake_script(path, body)
 
 
 class ResumePrefixTests(unittest.TestCase):

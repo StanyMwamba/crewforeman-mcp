@@ -106,6 +106,12 @@ class PlatformConsumerTests(unittest.TestCase):
                                return_value=True):
             self.assertTrue(
                 credentials.private_status(secret, system="Windows")["private"])
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows st_mode does not carry POSIX 0600/0644 permission bits")
+    def test_row7_posix_mode_keeps_0600(self):
+        secret = self.workspace / "credentials.yaml"
+        secret.write_text("TOKEN: x\n", encoding="utf-8")
         os.chmod(secret, 0o600)
         self.assertTrue(credentials._owner_only(secret, system="Linux"))
         os.chmod(secret, 0o644)
@@ -160,6 +166,10 @@ class PlatformConsumerTests(unittest.TestCase):
         try:
             os.symlink(str(outside), str(link))
         except (OSError, NotImplementedError) as exc:
+            if os.name == "nt":
+                self.skipTest(
+                    "creating a symlink needs Developer Mode or the "
+                    "SeCreateSymbolicLinkPrivilege: %s" % exc)
             self.fail("symlink support is required for the escape test: %s" % exc)
         target = link / "state.json"
         with mock.patch.object(progress.platforms, "reparse_point",

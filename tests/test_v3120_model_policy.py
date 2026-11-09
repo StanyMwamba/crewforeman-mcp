@@ -123,7 +123,10 @@ class OverlayTests(unittest.TestCase):
                 overlay = create_overlay(workspace, target, cfg)
                 try:
                     self.assertTrue(os.path.isfile(overlay.path))
-                    self.assertEqual(stat.S_IMODE(os.stat(overlay.path).st_mode), 0o600)
+                    if os.name != "nt":
+                        # Windows privacy is an ACL, not a POSIX mode.
+                        self.assertEqual(
+                            stat.S_IMODE(os.stat(overlay.path).st_mode), 0o600)
                     self.assertEqual(overlay.dir, os.path.dirname(overlay.path))
                     with open(overlay.path, "rb") as handle:
                         digest = __import__("hashlib").sha256(handle.read()).hexdigest()
@@ -225,7 +228,7 @@ class PlanTests(unittest.TestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_new_defaults_and_coercion(self):
-        self.assertEqual(SERVER_VERSION, "3.13.1")
+        self.assertEqual(SERVER_VERSION, "3.13.2")
         self.assertEqual(DEFAULTS["builder_model"], "")
         self.assertIs(DEFAULTS["builder_allow_unlisted_models"], False)
         self.assertEqual(DEFAULTS["builder_model_max_slices"], 8)

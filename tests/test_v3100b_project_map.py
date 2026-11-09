@@ -121,6 +121,9 @@ class ProjectMapTest(unittest.TestCase):
         record = project_map.load(self.workspace, self.state_dir)
         self.assertEqual(len(record["map"]), project_map.MAX_MAP_CHARS)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows state privacy is an ACL check, not POSIX 0600/0700 mode bits")
     def test_state_file_and_directory_permissions(self):
         self.write(project_map.NAME, MAP_BODY)
         saved = project_map.capture(self.workspace, self.state_dir)

@@ -21,7 +21,7 @@ from unittest import mock
 
 from deepseek_mcp import harness
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env
+from tests.fakes import base_env, write_fake_script
 
 
 FAKE_DSH_SOURCE = r'''#!/usr/bin/env python3
@@ -106,9 +106,7 @@ class RescueSuccessTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
-        self.dsh = self.root / "fake-dsh"
-        self.dsh.write_text(FAKE_DSH_SOURCE, encoding="utf-8")
-        self.dsh.chmod(0o755)
+        self.dsh = write_fake_script(self.root / "fake-dsh", FAKE_DSH_SOURCE)
         self.task_log = self.root / "task-log.txt"
         self.env = base_env(self.root, fake_dsh=self.dsh)
         self.env["DSH_MAX_CONCURRENT_CHILDREN"] = "8"

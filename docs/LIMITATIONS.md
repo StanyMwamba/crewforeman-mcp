@@ -1,11 +1,11 @@
-# Known limitations and failure modes (3.13.1)
+# Known limitations and failure modes (3.13.2)
 
 Only limitations that remain in this version are listed here.
 
-## Platform boundaries (3.13.1)
+## Platform boundaries (3.13.2)
 
-Every sentence below is tied to the boundary run for that OS. If a gate is red,
-the claim is narrowed, never widened.
+Every sentence below is tied to the boundary evidence for that OS. If a gate is
+red, or a claim has not been run yet, the claim is narrowed, never widened.
 
 - **macOS:** CrewForeman runs builders under a Seatbelt profile when
   `sandbox-exec` passes the probe. The boundary suite proves that creating,
@@ -21,13 +21,18 @@ the claim is narrowed, never widened.
   not claim the truncate protection it cannot provide. Network access is not
   restricted.
 - **Windows:** CrewForeman runs builders with a write-restricted token and an
-  ACE for the restricting SID on the workspace and its temp directory.
-  The boundary suite proves that creating, modifying and truncating files
-  outside the workspace is refused. Deleting or renaming outside is claimed only
-  if a Windows boundary run proves it; otherwise the run header reports
-  `delete_outside=unverified`. Network and UNC writes are not blocked. Windows
-  CI is PENDING the user's non-admin VM run; no Windows runner elevation is
-  recorded, and this text makes no no-admin claim.
+  ACE for the restricting SID on the workspace and its temp directory. Windows
+  CI runs the unit suite and the real boundary suite on the GitHub-hosted
+  `windows-2025` x64 runner; the runner user is an Administrator, so the job
+  exercises the boundary under an elevated token, not a standard user. The suite
+  requires create, modify, append and truncate denials outside the workspace;
+  delete and rename outside are recorded and remain `delete_outside=unverified`
+  unless a run proves them. The standard-user path is not proven by this job:
+  the user's Windows 11 arm64 VM run (WINDOWS_TEST.md in the VM test package)
+  remains the only standard-user evidence, and it must be re-run after this
+  change. No no-admin
+  claim is made. Network and UNC writes are
+  not blocked.
 - **When no boundary is available:** `os_sandbox=require` refuses to start the
   builder. `os_sandbox=auto` starts it only with `degraded=true`, and the run
   header prints `UNSANDBOXED`. A run record never reports `enforcement=enforced`
@@ -47,7 +52,7 @@ the claim is narrowed, never widened.
 | --- | --- | --- |
 | Packaging | `pip install .` uses a small in-tree PEP 517 backend so it works offline; that backend does not implement editable installs (PEP 660). | Install into a venv with `pip install .`, or run `python -m deepseek_mcp` from the repository root for a source-linked development loop. |
 | Sandbox | The OS boundary is a file-write boundary only, and it differs per platform: macOS Seatbelt, Linux Landlock at ABI 3 or newer, Windows write-restricted token. ABI 1-2 Linux and hosts without a usable wrapper run degraded or `UNSANDBOXED`, never as an enforced boundary. | Read the run's `os_sandbox` object and header, and the per-OS limits below. Review the workspace before accepting output. |
-| Windows | Windows behaviour is exercised with fakes and the Windows unit suites; it has not had the same manual field use as macOS, and no Windows CI job runs yet. The write-restricted token blocks file writes only; network and UNC writes are not blocked. Delete/rename outside is claimed only when a Windows boundary run proves it (CI is macOS/Linux; Windows pending), otherwise `delete_outside=unverified`. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
+| Windows | Windows CI runs the unit suites and the real write-restricted boundary on the GitHub-hosted `windows-2025` x64 runner. That runner's user is an Administrator, so the job does not prove the standard-user path; that path remains established only by the user's Windows 11 VM run, which must be re-run after this change. The token blocks file writes only; network and UNC writes are not blocked. Create/modify/append/truncate denials are required by the boundary suite; delete/rename outside is recorded and stays `delete_outside=unverified` unless a run proves it. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
 | Resume | Resume can only continue from a checkpoint boundary. Work done by a DSH process killed mid-tool-call is repeated. | Skeleton and checkpoints are written before each phase; finished revisions are reused. |
 | Live scaling | The candidate score is a deterministic heuristic, not a model review. It can misjudge unusually formatted output. | Threshold, max extra waves and the whole-job budget are configurable; set `live_scaling=false` to disable. |
 | Reviewer | The reviewer is a fresh Harness process; `reviewer_model`/`reviewers` can put it on another vendor, but a legacy `dsh_bin` wrapper that does not set a vendor label is fail-closed and pauses once. | Configure `reviewers` (see `docs/REVIEWER.md`); the same-vendor question is explicit and labelled. |

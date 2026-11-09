@@ -12,7 +12,7 @@ from unittest import mock
 from deepseek_mcp import harness, jobs, store
 from deepseek_mcp.config import load_config
 import tests
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 
 MODEL = "kimi-k3.1-pro"
 
@@ -26,7 +26,7 @@ def _root(case):
 def _wrapper(root, fake, preflight="ok"):
     """Fake dsh that answers the pre-flight itself and delegates the rest."""
     path = root / "dsh-wrapper"
-    path.write_text(
+    body = (
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         "task = sys.argv[-1] if len(sys.argv) else ''\n"
@@ -41,10 +41,9 @@ def _wrapper(root, fake, preflight="ok"):
         "flush=True)\n"
         "    print(json.dumps({'type': 'final', 'text': 'READY'}), flush=True)\n"
         "    sys.exit(0)\n"
-        "os.execv(sys.executable, [sys.executable, os.environ['WRAP_REAL_DSH']]"
-        " + sys.argv[1:])\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+        "real = os.environ['WRAP_REAL_DSH']\n"
+        "os.execv(real, [real] + sys.argv[1:])\n")
+    return write_fake_script(path, body)
 
 
 class PreflightTests(unittest.TestCase):

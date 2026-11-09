@@ -12,7 +12,7 @@ from unittest import mock
 
 from deepseek_mcp import harness
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 
 PROMPT = ("Build a status page. Required facts: purple header, "
           "striped table, amber footer.")
@@ -39,7 +39,7 @@ class ScalingHarnessTests(unittest.TestCase):
     def _wrap(self, fake, counter):
         """Count builder/reviewer/revision invocations, then exec the fake."""
         path = self.root / "dsh"
-        path.write_text(
+        source = (
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "args = sys.argv[1:]\n"
@@ -54,10 +54,10 @@ class ScalingHarnessTests(unittest.TestCase):
             "    kind = 'builder'\n"
             "with open(%r, 'a', encoding='utf-8') as handle:\n"
             "    handle.write(kind + '\\n')\n"
-            "os.execv(sys.executable, [sys.executable, %r] + args)\n"
-            % (str(counter), str(fake)), encoding="utf-8")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        return path
+            "fake = %r\n"
+            "os.execv(fake, [fake] + args)\n"
+            % (str(counter), str(fake)))
+        return write_fake_script(path, source)
 
     def _cfg(self):
         return load_config(config_path=self.root / "config.json", env=self.env)

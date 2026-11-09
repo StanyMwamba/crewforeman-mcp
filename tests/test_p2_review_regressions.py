@@ -18,7 +18,7 @@ from unittest import mock
 from deepseek_mcp import (authority, budget, checkpoints, harness, health,
                           skill_author, spend, transport)
 from deepseek_mcp.config import Config, load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 from tests.test_v320_rescue import FAKE_DSH_SOURCE
 
 
@@ -596,8 +596,7 @@ class HarnessPhaseIntegrationTests(Base):
 
     def test_rescue_execution_uses_a_continuation_policy(self):
         dsh = self.root / "rescue-dsh"
-        dsh.write_text(FAKE_DSH_SOURCE, encoding="utf-8")
-        dsh.chmod(0o755)
+        dsh = write_fake_script(dsh, FAKE_DSH_SOURCE)
         env = base_env(self.root, fake_dsh=dsh)
         env.update({"DSH_STALL_SECONDS": "1", "DSH_LIVE_SCALING": "0",
                     "DSH_AUTO_SKILLS": "off",
@@ -973,10 +972,7 @@ class SdkLiveBudgetTests(Base):
 
     def _fake_sdk(self, name="fake-sdk"):
         path = self.root / name
-        path.write_text("#!" + sys.executable + "\n" + FAKE_SDK_DSH_SOURCE,
-                        encoding="utf-8")
-        path.chmod(0o755)
-        return path
+        return write_fake_script(path, "#!" + sys.executable + "\n" + FAKE_SDK_DSH_SOURCE)
 
     def _cfg(self, fake):
         return Config({

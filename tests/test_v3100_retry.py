@@ -18,7 +18,7 @@ from deepseek_mcp import harness, health
 from deepseek_mcp.config import load_config
 from deepseek_mcp.health import FailureClass, RetryPolicy
 import tests
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 
 
 STREAM_DROP_MARKERS = (
@@ -140,10 +140,7 @@ os.execv(REAL, [REAL] + sys.argv[1:])
         "review_fails": int(review_fails),
         "review_message": review_message,
     }
-    path = Path(path)
-    path.write_text(source, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    return write_fake_script(path, source)
 
 
 class ProcessRetryTests(unittest.TestCase):

@@ -47,7 +47,11 @@ class OverlayExecutionTests(unittest.TestCase):
                                side_effect=fake_impl):
             result = harness._execute_once(
                 self.cfg, str(self.ws), "task", model_spec=_target())
-        self.assertEqual(seen["mode"], 0o600)
+        if os.name != "nt":
+            # Windows has no POSIX mode bits; the file is still created in the
+            # workspace and removed below, and the ACL path is tested in
+            # tests.test_platform_primitives.
+            self.assertEqual(seen["mode"], 0o600)
         self.assertIn("apiKeyEnv", seen["yaml"])
         self.assertIn("ANTHROPIC_API_KEY", seen["yaml"])
         self.assertNotIn("test-key-not-real", seen["yaml"])

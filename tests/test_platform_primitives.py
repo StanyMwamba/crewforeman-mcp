@@ -69,8 +69,10 @@ class TerminateTreeTests(unittest.TestCase):
 
     def test_posix_signals_own_group_only(self):
         with mock.patch.object(platforms.os, "getpgid",
-                               side_effect=lambda pid: 55 if pid == 55 else 1), \
-                mock.patch.object(platforms.os, "killpg") as killpg, \
+                               side_effect=lambda pid: 55 if pid == 55 else 1,
+                               create=True), \
+                mock.patch.object(platforms.os, "killpg",
+                                  create=True) as killpg, \
                 mock.patch.object(platforms.os, "kill") as kill, \
                 mock.patch.object(platforms, "_pid_alive",
                                   return_value=False):
@@ -105,6 +107,10 @@ class FileLockTests(unittest.TestCase):
 
 
 class PermissionTests(unittest.TestCase):
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows has no POSIX 0600/0700 mode bits; the Windows ACL path is "
+        "covered by test_windows_acl_uses_absolute_icacls")
     def test_posix_file_and_dir_modes(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root) / "d"
@@ -118,6 +124,10 @@ class PermissionTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "creating a symlink and reading POSIX mode bits are not portable to "
+        "a Windows host")
     def test_symlink_target_is_not_chmodded(self):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / "target"

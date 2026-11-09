@@ -1,0 +1,49 @@
+# Normalize every text file to LF in the repository and in CI checkouts. The
+# test suite compares bytes in a few places, and scripts must keep LF shebangs
+# even when a Windows checkout has core.autocrlf enabled.
+* text=auto eol=lf
+
+# Shell/Python/CI entry points: LF so shebangs and byte comparisons stay valid.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.pyi   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.in    text eol=lf
+*.cfg   text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.rst   text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+Makefile text eol=lf
+
+# The two CI entry points are named explicitly so a future broad rule cannot
+# silently change their line endings.
+scripts/ci.sh   text eol=lf
+scripts/ci.ps1  text eol=crlf
+
+# Windows-native scripts: CRLF is the native convention and what cmd.exe and
+# Windows PowerShell expect from checked-out .bat/.cmd/.ps1 files.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Common binaries: never text-normalize or line-ending-convert. The `binary`
+# macro is -text -diff -merge.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.whl   binary
+*.so    binary
+*.dylib binary
+*.dll   binary
+*.exe   binary
+*.pyc   binary
