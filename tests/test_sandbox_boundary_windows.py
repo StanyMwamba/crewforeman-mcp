@@ -15,32 +15,28 @@ import unittest
 WINDOWS = sys.platform == "win32"
 REQUIRE_REAL = os.environ.get("CF_REQUIRE_REAL_SANDBOX") == "1"
 
-CHILD = r"""
-import os, sys
-op, path = sys.argv[1], sys.argv[2]
-try:
-    if op == "create":
-        with open(path, "w") as handle:
-            handle.write("x")
-    elif op == "modify":
-        with open(path, "a") as handle:
-            handle.write("x")
-    elif op == "truncate":
-        with open(path, "w"):
-            pass
-    elif op == "rename":
-        os.replace(path, path + ".moved")
-    elif op == "delete":
-        os.remove(path)
-    elif op == "read":
-        with open(path, "rb") as handle:
-            handle.read()
-    else:
-        sys.exit(4)
-except OSError:
-    sys.exit(3)
-sys.exit(0)
-"""
+#: The boundary child is a minimal native helper (tests/boundary_child.c)
+#: rather than the Python interpreter: Python 3.15.2 on windows-2025 exits
+#: 0xC0000142 before ``main`` under the write-restricted token, the status
+#: CPython itself treats as a desktop-heap startup failure.  The sandbox
+#: policy, ACLs and assertions are unchanged; only the test vehicle differs,
+#: and it performs the same create/modify/append/truncate/rename/delete/read
+#: operations as tests/sandbox_child.py.
+_CHILD_BINARY = None
+
+
+def _boundary_child():
+    """Compile and cache the native boundary child (Windows only)."""
+    global _CHILD_BINARY
+    if _CHILD_BINARY is None:
+        try:
+            from . import build_fake_dsh
+        except ImportError:
+            import build_fake_dsh
+        _CHILD_BINARY = str(build_fake_dsh.build_c(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "boundary_child.c")))
+    return _CHILD_BINARY
 
 
 def _write(path, data="seed"):
@@ -58,6 +54,7 @@ class WindowsBoundaryTests(unittest.TestCase):
                 "Windows-only boundary test: requires a real win32 host "
                 "with CreateRestrictedToken/ACLs; current platform is %s"
                 % sys.platform)
+        cls.child = _boundary_child()
         cls.root = tempfile.mkdtemp(prefix="dsh-win-boundary-")
         cls.workspace = os.path.join(cls.root, "workspace")
         cls.tmpdir = os.path.join(cls.workspace, ".dsh-tmp-boundary")
@@ -80,8 +77,7 @@ class WindowsBoundaryTests(unittest.TestCase):
     def _child(self, op, path):
         policy = json.dumps(self.policy)
         command = [sys.executable, "-m", "deepseek_mcp.sandbox_windows",
-                   "--policy", policy, "--", sys.executable, "-c", CHILD,
-                   op, path]
+                   "--policy", policy, "--", self.child, op, path]
         return subprocess.run(command, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=60)
 
@@ -142,8 +138,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-CHILD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "sandbox_child.py")
 OPS = ("create", "modify", "append", "truncate", "rename", "delete")
 
 
@@ -165,6 +159,7 @@ def run_boundary(tc):
         report_only = bool(probe.get("admin") or probe.get("admin_member"))
     except Exception:
         report_only = False
+    child = _boundary_child()
     policy = {
         "os_sandbox": True, "os_sandbox_mode": "require",
         "sandbox": "workspace-write", "sandbox_canary": "off",
@@ -188,7 +183,7 @@ def run_boundary(tc):
                 if op != "create":
                     _write(target)
                 argv, meta = safety.wrap_command(
-                    [sys.executable, CHILD_SCRIPT, op, target],
+                    [child, op, target],
                     policy, workspace, tmpdir=tmpdir)
                 tc.assertTrue(meta.get("wrapped"), meta)
                 proc = subprocess.run(argv, cwd=workspace,
@@ -204,7 +199,7 @@ def run_boundary(tc):
                 _write(target)
             before = open(target, "rb").read() if os.path.exists(target) else None
             argv, meta = safety.wrap_command(
-                [sys.executable, CHILD_SCRIPT, op, target],
+                [child, op, target],
                 policy, workspace, tmpdir=tmpdir)
             tc.assertTrue(meta.get("wrapped"), meta)
             proc = subprocess.run(argv, cwd=workspace,
@@ -244,7 +239,7 @@ def run_boundary(tc):
             escapes.append(("create", os.path.join(link, "via-symlink.txt")))
         for op, target in escapes:
             argv, meta = safety.wrap_command(
-                [sys.executable, CHILD_SCRIPT, op, target],
+                [child, op, target],
                 policy, workspace, tmpdir=tmpdir)
             proc = subprocess.run(argv, cwd=workspace,
                                   stdout=subprocess.PIPE,

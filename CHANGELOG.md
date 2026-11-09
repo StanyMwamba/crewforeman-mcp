@@ -5,6 +5,39 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.6
+
+3.13.6: Windows ACL verification via Win32 (proof pending the next windows-2025 run)
+
+- **Authoritative ACL read-back.** `platforms._windows_native_acl_private`
+  now reads the file DACL with `GetNamedSecurityInfoW`/`GetAce` and compares
+  each ACE's SID with the current token user, so a localized `icacls` rendering
+  can no longer misclassify a valid owner-only file. Exactly one full-control
+  owner ACE is required; extra ACEs are accepted only for well-known system
+  SIDs (`SYSTEM`, `Administrators`, service accounts, creator/owner rights).
+  Inherited ACEs, foreign SIDs, deny ACEs and weak owner rights fail closed.
+  The `icacls` text parser stays as a fallback when the Win32 call is
+  unavailable.
+- **Visible diagnostics.** The Windows job sets `CF_ACL_DEBUG=1`; a rejected
+  ACL prints the ACE trustees and flags with the path replaced by `<path>`, so
+  the next run explains any remaining read-back failure without logging a home
+  or temporary path.
+- **Native boundary child.** The real Windows boundary test now runs a minimal
+  native helper (`tests/boundary_child.c`) instead of the Python interpreter:
+  Python 3.15.2 on windows-2025 exits `0xC0000142` before `main` under the
+  write-restricted token (CPython treats that status as a desktop-heap startup
+  failure). The sandbox policy, ACLs and every create/modify/append/truncate
+  denial assertion are unchanged; only the test vehicle differs. This is not a
+  skip, and it does not prove that a Python child starts under the token.
+- **Test case normalization.** The sandbox ACL tests compare `normcase` on both
+  sides because `canonical_root` deliberately preserves spelling; the
+  inherited-stdout grandchild runs with its cwd outside the workspace so
+  Windows temp cleanup is not blocked.
+- **Evidence.** Run 42675061105 (3.13.5) ran 1,742 tests: py3.9 `3 failures +
+  5 errors`, py3.15 `9 failures + 5 errors`; the py3.9 boundary passed and
+  py3.15 still exited `0xC0000142`. The next `windows-2025` run is the required
+  evidence; no Windows suite or boundary claim is made before it.
+
 ## 3.13.5
 
 3.13.5: Windows CI follow-up fixes (proof pending the next windows-2025 run)

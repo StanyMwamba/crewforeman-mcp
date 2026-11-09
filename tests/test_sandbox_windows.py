@@ -228,9 +228,9 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertTrue(api.restored)
         self.assertEqual(result["restore_failures"], 0)
         self.assertTrue(result["acl_residue"])
-        restored_paths = {path for path, _ in api.restored}
-        self.assertIn(self.workspace, restored_paths)
-        self.assertIn(self.tmpdir, restored_paths)
+        restored_paths = {os.path.normcase(path) for path, _ in api.restored}
+        self.assertIn(os.path.normcase(self.workspace), restored_paths)
+        self.assertIn(os.path.normcase(self.tmpdir), restored_paths)
 
     def test_unc_rejected(self):
         with self.assertRaises(sw.SandboxError) as caught:
@@ -242,8 +242,9 @@ class WindowsLauncherTests(unittest.TestCase):
         policy = dict(self.policy, mode="read-only")
         acl = sw.build_policy_acl(policy, api=api, sid="S-1-5-21-1-2-3")
         expected = os.path.normcase(os.path.realpath(self.tmpdir))
-        self.assertEqual(acl["granted"], [expected])
-        paths = [data["path"] for name, data in api.events
+        granted = [os.path.normcase(path) for path in acl["granted"]]
+        self.assertEqual(granted, [expected])
+        paths = [os.path.normcase(data["path"]) for name, data in api.events
                  if name == "acl_set"]
         self.assertEqual(paths, [expected])
 
@@ -257,7 +258,7 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("sessions")
                             for path in acl["granted"]))
         self.assertIn(os.path.normcase(os.path.realpath(extra)),
-                      acl["granted"])
+                      [os.path.normcase(path) for path in acl["granted"]])
 
     def test_missing_root_is_skipped_not_granted(self):
         api = FakeAPI()
@@ -265,7 +266,8 @@ class WindowsLauncherTests(unittest.TestCase):
                       tmpdir=os.path.join(self.tmp, "does-not-exist"))
         acl = sw.build_policy_acl(policy, api=api, sid="S-1-5-21-1-2-3")
         self.assertNotIn(os.path.normcase(os.path.realpath(
-            os.path.join(self.tmp, "does-not-exist"))), acl["granted"])
+            os.path.join(self.tmp, "does-not-exist"))),
+            [os.path.normcase(path) for path in acl["granted"]])
         self.assertTrue(any(item["reason"] == "missing_root"
                             for item in acl["skipped"]))
 

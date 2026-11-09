@@ -57,6 +57,33 @@ def _posix_compiler():
     return cc
 
 
+def build_c(source, out=None):
+    """Compile a plain C source (no generated include); returns the binary."""
+    source = Path(source).resolve()
+    if out is None:
+        out = source.with_suffix(".exe" if os.name == "nt" else ".bin")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cf-c-build-") as work:
+        if os.name == "nt":
+            vcvars = _windows_compiler()
+            bat = Path(work) / "build.bat"
+            bat.write_text(
+                '@echo off\r\ncall "%s" >nul || exit /b 1\r\n'
+                'cl /nologo /O2 /Fe:"%s" "%s" || exit /b 1\r\n'
+                % (vcvars, out, source), encoding="utf-8")
+            proc = subprocess.run(["cmd", "/c", str(bat)],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+        else:
+            proc = subprocess.run(
+                [_posix_compiler(), "-O2", "-o", str(out), str(source)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError("C build failed:\n%s" % proc.stdout)
+    return out
+
+
 def build_launcher(script, out=None):
     """Compile the launcher that execs *script*; returns the launcher Path."""
     script = Path(script).resolve()

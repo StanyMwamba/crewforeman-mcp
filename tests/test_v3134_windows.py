@@ -1,9 +1,9 @@
-"""3.13.5 regression tests for Windows-only defects, runnable on any host.
+"""3.13.6 regression tests for Windows-only defects, runnable on any host.
 
 The Windows CI failure set was dominated by host path semantics rather than
 by Windows-only APIs, so these tests force the Windows comparison mode on a
 macOS/Linux host (``_CASE_INSENSITIVE_FS``) or mock the Win32 surface.  The
-path/casefold/ACL/CRLF/sdist tests would have failed before the 3.13.5 fixes;
+path/casefold/ACL/CRLF/sdist tests would have failed before the 3.13.6 fixes;
 a few structural checks (lock file, process flags) guard the fix without
 failing on POSIX beforehand.
 """
@@ -45,7 +45,7 @@ class PlanPathPortabilityTests(unittest.TestCase):
             self.assertEqual(pc.normalize_path("A\\B.py"), "A/B.py")
 
     def test_invalid_path_errors_name_the_field_not_a_previous_path(self):
-        # Dedupe must not rebind the validation field name (a 3.13.5 review
+        # Dedupe must not rebind the validation field name (a 3.13.6 review
         # caught the old ``key = match_key(path)`` shadowing bug).
         _normalised, errors = pc.validate_plan(
             {"version": 1,
@@ -63,7 +63,7 @@ class PlanPathPortabilityTests(unittest.TestCase):
 
 class CanonicalPathCaseTests(unittest.TestCase):
     def test_windows_canonical_path_does_not_normcase(self):
-        # Force the Windows branch and make normcase observable.  The 3.13.5
+        # Force the Windows branch and make normcase observable.  The 3.13.6
         # code lowercased every workspace root on Windows.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "CaseWorkspace")

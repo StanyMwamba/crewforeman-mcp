@@ -1,8 +1,8 @@
-"""Documentation invariants for the current release (3.13.5) plus 3.10.0 Part B.
+"""Documentation invariants for the current release (3.13.6) plus 3.10.0 Part B.
 
 Focused checks only: README's public shape is fixed by a checked-in fixture,
 the product docs describe the Part B efficiency work, and the current release
-is 3.13.5.  Nothing here shells out to version control, so the checks hold in
+is 3.13.6.  Nothing here shells out to version control, so the checks hold in
 a full checkout, an exported tarball and CI alike.
 """
 
@@ -104,7 +104,7 @@ class ReadmeInvariants(unittest.TestCase):
 
     def test_version_line_is_current(self):
         self.assertGreaterEqual(len(self.lines), 3)
-        self.assertIn("CrewForeman 3.13.5", self.lines[2])
+        self.assertIn("CrewForeman 3.13.6", self.lines[2])
 
     def test_guarantees_keep_reviewer_backup_line(self):
         bullets = _guarantees_bullets(self.text)
@@ -175,7 +175,7 @@ class ChangelogDoc(unittest.TestCase):
             self.assertIn(token, body)
 
     def test_version_is_current(self):
-        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.13.5")
+        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.13.6")
         self.assertNotIn("## 3.11.1", self.text)
 
 

@@ -315,10 +315,15 @@ class HarnessStallIntegrationTests(unittest.TestCase):
             import json
             import subprocess
             import sys
+            import tempfile
             from pathlib import Path
 
             Path("deliverable.md").write_text("# done\\n", encoding="utf-8")
-            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+            # Keep the inherited-stdout grandchild out of the workspace: on
+            # Windows a live process cwd blocks TemporaryDirectory cleanup.
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(3)"],
+                cwd=tempfile.gettempdir())
             child.returncode = 0
             print(json.dumps({"type": "final", "text": "done"}), flush=True)
             sys.exit(0)

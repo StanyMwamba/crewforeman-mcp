@@ -535,6 +535,135 @@ def _windows_acl_is_private(aces, names):
     return owner_full
 
 
+#: Well-known SIDs that may appear beside the owner in a default DACL.  They
+#: are trusted system principals; granting them does not make the file readable
+#: by an ordinary user.
+_WINDOWS_TRUSTED_SIDS = {
+    "S-1-5-18",      # NT AUTHORITY\SYSTEM
+    "S-1-5-32-544",  # BUILTIN\Administrators
+    "S-1-5-19",      # NT AUTHORITY\LOCAL SERVICE
+    "S-1-5-20",      # NT AUTHORITY\NETWORK SERVICE
+    "S-1-3-0",       # CREATOR OWNER
+    "S-1-3-1",       # CREATOR GROUP
+    "S-1-3-4",       # OWNER RIGHTS
+}
+_FILE_ALL_ACCESS = 0x001F01FF
+_INHERITED_ACE = 0x10
+
+
+def _windows_native_acl_private(path):
+    """Verify the DACL trustee SIDs with GetNamedSecurityInfoW.
+
+    Returns ``True``/``False``, or ``None`` when the API is unavailable (the
+    caller falls back to the icacls text parser).  This is the authoritative
+    check on Windows: it compares the ACE SID with the current token user and
+    never depends on localized ``icacls`` text.
+    """
+    if os.name != "nt":
+        return None
+    sid_text = _windows_user_sid()
+    if not sid_text:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ACE_HEADER(ctypes.Structure):
+            _fields_ = [("AceType", ctypes.c_ubyte),
+                        ("AceFlags", ctypes.c_ubyte),
+                        ("AceSize", ctypes.c_ushort)]
+
+        class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+            _fields_ = [("Header", _ACE_HEADER),
+                        ("Mask", wintypes.DWORD),
+                        ("SidStart", wintypes.DWORD)]
+
+        class _ACL_SIZE_INFORMATION(ctypes.Structure):
+            _fields_ = [("AceCount", wintypes.DWORD),
+                        ("AclBytesInUse", wintypes.DWORD),
+                        ("AclBytesFree", wintypes.DWORD)]
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetAclInformation.restype = wintypes.BOOL
+        advapi32.GetAclInformation.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
+        advapi32.GetAce.restype = wintypes.BOOL
+        advapi32.GetAce.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+        advapi32.ConvertStringSidToSidW.argtypes = [
+            wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.EqualSid.restype = wintypes.BOOL
+        advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+        expected = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(
+                sid_text, ctypes.byref(expected)):
+            return None
+        sd = ctypes.c_void_p()
+        dacl = ctypes.c_void_p()
+        try:
+            rc = advapi32.GetNamedSecurityInfoW(
+                str(path), 1, 4, None, None, ctypes.byref(dacl), None,
+                ctypes.byref(sd))
+            if rc != 0 or not dacl.value:
+                return None
+            size = _ACL_SIZE_INFORMATION()
+            if not advapi32.GetAclInformation(
+                    dacl, ctypes.byref(size), ctypes.sizeof(size), 2):
+                return None
+            owner_full = False
+            for index in range(int(size.AceCount)):
+                ace = ctypes.c_void_p()
+                if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                    return None
+                if not ace.value:
+                    return None
+                header = ctypes.cast(
+                    ace, ctypes.POINTER(_ACE_HEADER)).contents
+                if header.AceType != 0 or header.AceFlags & _INHERITED_ACE:
+                    return False
+                allowed = ctypes.cast(
+                    ace, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+                ace_sid = ctypes.c_void_p(ace.value + 8)
+                if advapi32.EqualSid(ace_sid, expected):
+                    if (int(allowed.Mask) & _FILE_ALL_ACCESS) != _FILE_ALL_ACCESS:
+                        return False
+                    owner_full = True
+                    continue
+                string_sid = ctypes.c_void_p()
+                if not advapi32.ConvertSidToStringSidW(
+                        ace_sid, ctypes.byref(string_sid)):
+                    return False
+                try:
+                    trusted = ctypes.wstring_at(string_sid.value)
+                finally:
+                    kernel32.LocalFree(string_sid)
+                if trusted not in _WINDOWS_TRUSTED_SIDS:
+                    return False
+            return owner_full
+        finally:
+            if sd.value:
+                kernel32.LocalFree(sd)
+            kernel32.LocalFree(expected)
+    except Exception:
+        return None
+
+
 def _windows_private_acl(path, is_dir):
     sid = _windows_user_sid()
     binary = _icacls_binary()
@@ -566,6 +695,15 @@ def _windows_private_acl(path, is_dir):
                 if line.strip().endswith(")") and ":(" in line]
         if not aces or any("(I)" in line for line in aces):
             return False
+        native = _windows_native_acl_private(path)
+        if os.environ.get("CF_ACL_DEBUG") == "1":
+            # Trustees and flags only; the path is replaced so no home or
+            # temporary path is written to the CI log.
+            safe = [line.replace(str(path), "<path>") for line in aces]
+            sys.stderr.write(
+                "CF-ACL-DEBUG: native=%r aces=%r\n" % (native, safe))
+        if native is not None:
+            return native
         expected = _windows_trustees(sid)
         if _windows_acl_is_private(aces, expected):
             return True
