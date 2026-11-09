@@ -45,9 +45,11 @@ def _workflow_checks(errors):
         errors.append("workflow uses pull_request_target")
     if re.search(r"(?i)\bwindows-(?:latest|20\d\d)\b", text):
         errors.append("workflow requests a Windows runner; Windows CI is PENDING")
-    for label in ("macos-latest", "ubuntu-latest"):
+    for label in ("macos-latest", "ubuntu-24.04"):
         if label not in text:
             errors.append("workflow missing OS label %s" % label)
+    if "ubuntu-latest" in text:
+        errors.append("workflow uses floating ubuntu-latest; pin ubuntu-24.04")
     if not re.search(r"permissions:\s*\{?\s*contents:\s*read", text):
         errors.append("workflow permissions are not contents: read")
     if "scripts/ci.sh" not in text:

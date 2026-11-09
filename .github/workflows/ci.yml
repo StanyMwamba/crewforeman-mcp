@@ -25,7 +25,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # The floating Linux label now resolves to Ubuntu 26.04, where
+        # actions/setup-python has no Python 3.9 build. Pin the runner that
+        # proves the Linux Landlock boundary instead.
+        os: [macos-latest, ubuntu-24.04]
         # 3.9 is the supported floor. 3.15 is the newest stable CPython line
         # (3.15.2, released 2026-10-25); actions/setup-python resolves the newest
         # 3.15.x from the live actions/python-versions manifest.

@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.13.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.13.1)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -560,7 +560,7 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-### OS sandbox modes and config keys (3.13.0)
+### OS sandbox modes and config keys (3.13.1)
 
 `os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
 `true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
@@ -574,7 +574,7 @@ boundary. `off` records `enforcement=none` and does not claim a boundary.
 | `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
 | `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
 | `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
-| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.0 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.1 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
 | `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
 | `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
 | `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
@@ -604,7 +604,7 @@ variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
-### Restart per OS (3.13.0)
+### Restart per OS (3.13.1)
 
 Restart is best-effort and OS-specific; the status file records `state`,
 `verified_by`, `error` and the resolved opener. macOS closes/reopens with
@@ -896,15 +896,23 @@ when the platform or the application cannot be handled.
 
 `.github/workflows/ci.yml` is a thin wrapper: it checks out, installs one matrix
 Python and runs `scripts/ci.sh`. The matrix is `macos-latest` and
-`ubuntu-latest` on Python 3.9 (the supported floor) and 3.15 (the newest stable
+`ubuntu-24.04` on Python 3.9 (the supported floor) and 3.15 (the newest stable
 CPython line, 3.15.2, released 2026-10-25; `actions/setup-python` resolves the
 newest 3.15.x patch).
+The Linux runner is pinned to `ubuntu-24.04` because `ubuntu-latest` now
+resolves to Ubuntu 26.04, where `actions/setup-python` has no Python 3.9 build
+(`The version 3.9 with architecture x64 was not found for Ubuntu 26.04`). The
+Linux Landlock boundary remains proven on `ubuntu-24.04`; do not move the
+Linux leg back to `ubuntu-latest` until that image provides Python 3.9.
 Both actions are pinned by commit SHA, permissions are `contents: read`, and
 the workflow uses no secrets and no `pull_request_target`.
 
 `scripts/ci.sh` is the single source of the checks and is runnable locally with
 the same command CI uses (`bash scripts/ci.sh`, with `PYTHON` overriding the
-interpreter). It runs `tools/ci_hygiene.py`, installs the package, builds the
+interpreter). The gate is timezone-independent: authority timestamps are
+persisted as UTC ISO 8601 (`+00:00`), and the suite passes with
+`TZ=UTC bash scripts/ci.sh` (what GitHub runners use) and under any local
+zone. It runs `tools/ci_hygiene.py`, installs the package, builds the
 test-only fake `dsh`, runs `tests/sandbox_probe.py --require --json`, runs the
 full suite with the documented gate command
 (`python3 -m unittest discover -s tests -q`) and then runs

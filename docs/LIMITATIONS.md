@@ -1,8 +1,8 @@
-# Known limitations and failure modes (3.13.0)
+# Known limitations and failure modes (3.13.1)
 
 Only limitations that remain in this version are listed here.
 
-## Platform boundaries (3.13.0)
+## Platform boundaries (3.13.1)
 
 Every sentence below is tied to the boundary run for that OS. If a gate is red,
 the claim is narrowed, never widened.
@@ -15,7 +15,9 @@ the claim is narrowed, never widened.
 - **Linux:** CrewForeman runs builders under a Landlock ruleset applied by an
   unprivileged launcher when the kernel reports Landlock ABI 3 or newer. The
   same file-write, rename and delete claims apply, and the boundary suite runs
-  on `ubuntu-24.04`. ABI 1-2 hosts run in degraded mode and say so; the run does
+  on `ubuntu-24.04` (CI pins that runner because `ubuntu-latest` is Ubuntu
+  26.04, where `actions/setup-python` has no Python 3.9 build). ABI 1-2 hosts
+  run in degraded mode and say so; the run does
   not claim the truncate protection it cannot provide. Network access is not
   restricted.
 - **Windows:** CrewForeman runs builders with a write-restricted token and an

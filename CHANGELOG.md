@@ -5,6 +5,21 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.1
+
+3.13.1: CI fixes — timezone-independent expiry test, Linux runner pinned to ubuntu-24.04
+
+- Authority `created`/`expires` timestamps are now rendered as UTC ISO 8601
+  (`+00:00`) instead of the host's local offset, so expiry text no longer
+  depends on the host timezone. Stored values with any offset (and `Z`) still
+  parse; naive legacy values are still read as local wall-clock time.
+- `test_expiry_is_preserved_then_reported_as_drift` asserted `2020-01-01`,
+  which only held on a host west of UTC (the real expiry is
+  `2020-01-02T00:00:00+00:00`); it now asserts the exact expiry, and a new test
+  checks `_iso` under several timezones.
+- Linux CI is pinned to `ubuntu-24.04`: `ubuntu-latest` is Ubuntu 26.04, where
+  `actions/setup-python` has no Python 3.9 build.
+
 ## 3.13.0
 
 One OS file-write boundary per host, an honest degraded mode, and docs that

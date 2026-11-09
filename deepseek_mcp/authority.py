@@ -86,8 +86,9 @@ def _now(now=None):
 
 
 def _iso(value):
+    """Render a timestamp as UTC ISO 8601 with an explicit ``+00:00`` offset."""
     if isinstance(value, dt.datetime):
-        return value.astimezone().isoformat(timespec="seconds")
+        return value.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
     return str(value or "")
 
 

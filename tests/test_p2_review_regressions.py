@@ -182,9 +182,30 @@ class AuthorityFailClosedTests(Base):
                "authority_version": 1}
         effective, drift = authority.revalidate_run(run, self.cfg)
         self.assertTrue(drift["changed"].get("expired"))
-        self.assertIn("2020-01-01",
-                          drift["changed"]["expired"][0])
+        self.assertEqual("2020-01-02T00:00:00+00:00",
+                         drift["changed"]["expired"][0])
         self.assertNotEqual(effective.expires, env.expires)
+
+    def test_iso_rendering_is_utc_in_every_timezone(self):
+        import datetime as dt
+        import time
+        if not hasattr(time, "tzset"):
+            self.skipTest("time.tzset is unavailable")
+        moment = dt.datetime(2020, 1, 2, 0, 0, 0, tzinfo=dt.timezone.utc)
+        saved = os.environ.get("TZ")
+        try:
+            for zone in ("UTC", "America/New_York", "Asia/Kolkata",
+                         "Pacific/Kiritimati"):
+                os.environ["TZ"] = zone
+                time.tzset()
+                self.assertEqual(authority._iso(moment),
+                                 "2020-01-02T00:00:00+00:00", zone)
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
 
 
 class PhaseContinuationTests(Base):

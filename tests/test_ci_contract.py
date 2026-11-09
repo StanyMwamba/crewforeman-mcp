@@ -25,7 +25,7 @@ CI_SCRIPT = ROOT / "scripts" / "ci.sh"
 FLOOR_PYTHON = "3.9"
 NEWEST_STABLE_PYTHON = "3.15"
 NEWEST_STABLE_PATCH = "3.15.2"
-RUNNERS = {"macos-latest", "ubuntu-latest"}
+RUNNERS = {"macos-latest", "ubuntu-24.04"}
 CI_RUN_STEP = "bash scripts/ci.sh"
 GATE_COMMAND = "-m unittest discover -s tests -q"
 
@@ -111,6 +111,12 @@ class CiWorkflowContractTest(unittest.TestCase):
         self.assertIsNotNone(oses, "workflow has no matrix os flow list")
         self.assertEqual(set(oses), RUNNERS)
         self.assertEqual(len(oses), 2, "matrix.os must have exactly two entries")
+        self.assertIn("ubuntu-24.04", oses, "Linux runner must be pinned")
+        self.assertNotIn(
+            "ubuntu-latest", oses,
+            "ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 in "
+            "actions/setup-python; pin ubuntu-24.04",
+        )
 
         runs_on = re.search(r"(?m)^\s+runs-on:\s*(.+?)\s*$", self.text)
         self.assertIsNotNone(runs_on, "job has no runs-on")

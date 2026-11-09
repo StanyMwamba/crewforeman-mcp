@@ -1,4 +1,4 @@
-# Installing crewforeman-mcp 3.13.0
+# Installing crewforeman-mcp 3.13.1
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime dependencies**.
 It ships a local MCP stdio server and five skill checklists (`code`, `data`,
@@ -38,7 +38,7 @@ Run these from the repository root (the directory containing `pyproject.toml`).
 `uvx crewforeman-mcp` resolves the package from the configured index;
 `uvx --from . crewforeman-mcp` runs a local checkout before it is published.
 Pin this release for a reproducible install with
-`uvx crewforeman-mcp==3.13.0`. After a `pipx` or `pip` install, both
+`uvx crewforeman-mcp==3.13.1`. After a `pipx` or `pip` install, both
 `crewforeman-mcp` and the shorter alias `deepseek-mcp` are on `PATH`.
 
 ### macOS
@@ -89,7 +89,9 @@ It needs Ubuntu 24.04 or newer with kernel 6.2+ (Landlock ABI 3) and enabled
 Landlock support. There is no extra install step, no root and no `sudo`: the
 launcher restricts itself and then executes `dsh`. Kernel ABI 1-2 runs in
 degraded mode and does not claim truncate protection; `os_sandbox=require`
-refuses to start instead. Network is not restricted.
+refuses to start instead. Network is not restricted. CI proves this boundary
+on `ubuntu-24.04`: the workflow pins that runner because `ubuntu-latest` is
+Ubuntu 26.04, where `actions/setup-python` has no Python 3.9 build.
 
 
 ### Windows
@@ -139,7 +141,7 @@ python -m deepseek_mcp --help
 python -m pip show -f crewforeman-mcp | grep crewforeman-mcp/skills
 ```
 
-Expected: the version prints `3.13.0`, each `--help` exits 0, and the file
+Expected: the version prints `3.13.1`, each `--help` exits 0, and the file
 listing shows the five `.md` skill files. On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
 If the files exist but a run says skills are missing, set `DSH_SKILLS_DIR` to
@@ -159,7 +161,7 @@ under `share/crewforeman-mcp/skills`. A source checkout is untouched. Delete
 
 ## Keys
 
-3.13.0 looks a provider key up by its variable **name**: first the connector's
+3.13.1 looks a provider key up by its variable **name**: first the connector's
 process environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). `config.json` lists variable names,
 never values.
