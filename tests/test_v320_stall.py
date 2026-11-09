@@ -6,6 +6,8 @@ runs a self-contained fake ``dsh`` that emits two tool calls (including
 """
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -180,12 +182,24 @@ class StallContractTests(unittest.TestCase):
 
 class HarnessStallIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # Retry teardown: a Windows grandchild that inherited stdout may still
+        # be exiting, and a live process can hold a directory for a moment.
+        # The test assertion is about returning immediately, not about the
+        # cleanup being instant.
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup_tmp, self.tmp)
+        self.root = Path(self.tmp)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         self.sessions = self.root / "sessions"
+
+    @staticmethod
+    def _cleanup_tmp(path):
+        for _ in range(60):
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                return
+            time.sleep(0.1)
 
     def _write_fake_dsh(self, body, name="fake-dsh"):
         path = self.root / name
@@ -313,17 +327,20 @@ class HarnessStallIntegrationTests(unittest.TestCase):
         # stdout; only stop reasons and true EOF may end the reader early.
         script = self._write_fake_dsh("""
             import json
+            import os
             import subprocess
             import sys
-            import tempfile
             from pathlib import Path
 
             Path("deliverable.md").write_text("# done\\n", encoding="utf-8")
             # Keep the inherited-stdout grandchild out of the workspace: on
             # Windows a live process cwd blocks TemporaryDirectory cleanup.
+            # The product sets TEMP to its workspace tmpdir, so
+            # tempfile.gettempdir() is still inside the tree being cleaned.
+            # Use the filesystem root as the grandchild's cwd instead.
             child = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(3)"],
-                cwd=tempfile.gettempdir())
+                cwd=os.path.abspath(os.sep))
             child.returncode = 0
             print(json.dumps({"type": "final", "text": "done"}), flush=True)
             sys.exit(0)

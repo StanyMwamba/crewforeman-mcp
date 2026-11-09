@@ -432,6 +432,36 @@ def _icacls_binary():
     return os.path.join(_windows_systemroot(), "System32", "icacls.exe")
 
 
+def _bind_windows_token_api(advapi32, kernel32):
+    """Bind the token APIs with explicit pointer-sized signatures.
+
+    ``ctypes`` passes an untyped Python int as a 32-bit C ``int``.  On 64-bit
+    Windows that truncated both the process pseudo-handle and the SID pointer,
+    so ``ConvertSidToStringSidW`` failed and every ACL read-back returned
+    ``False``.  Binding every argument that carries a handle or pointer fixes
+    that class of bug; it is split out so a macOS/Linux test can assert the
+    signatures without Windows.
+    """
+    import ctypes
+    from ctypes import wintypes
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+
 def _windows_user_sid():
     """Return the current user SID string, or ``None``; never raises."""
     try:
@@ -439,6 +469,7 @@ def _windows_user_sid():
         from ctypes import wintypes
         advapi32 = ctypes.windll.advapi32
         kernel32 = ctypes.windll.kernel32
+        _bind_windows_token_api(advapi32, kernel32)
         access_handle = wintypes.HANDLE()
         if not advapi32.OpenProcessToken(
                 kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(access_handle)):
@@ -451,15 +482,16 @@ def _windows_user_sid():
                 return None
             buffer = ctypes.create_string_buffer(needed.value)
             if not advapi32.GetTokenInformation(
-                    access_handle, 1, buffer, needed.value, ctypes.byref(needed)):
+                    access_handle, 1, ctypes.cast(buffer, ctypes.c_void_p),
+                    needed.value, ctypes.byref(needed)):
                 return None
             sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
-            string_sid = ctypes.c_wchar_p()
+            string_sid = ctypes.c_void_p()
             if not advapi32.ConvertSidToStringSidW(
                     sid, ctypes.byref(string_sid)):
                 return None
             try:
-                return str(string_sid.value)
+                return ctypes.wstring_at(string_sid.value)
             finally:
                 kernel32.LocalFree(string_sid)
         finally:
@@ -668,6 +700,11 @@ def _windows_private_acl(path, is_dir):
     sid = _windows_user_sid()
     binary = _icacls_binary()
     if not sid or not os.path.isfile(binary):
+        if os.environ.get("CF_ACL_DEBUG") == "1":
+            # Names only: never print the SID or the path.
+            sys.stderr.write(
+                "CF-ACL-DEBUG: token_sid=%r icacls_present=%r\n"
+                % (bool(sid), os.path.isfile(binary)))
         return False
     try:
         result = subprocess.run(

@@ -1,4 +1,4 @@
-"""3.13.6 documentation contract: README rules, key docs and version.
+"""3.13.7 documentation contract: README rules, key docs and version.
 
 The README checks use only the checked-in fixture and never invoke version
 control; the release version checks cover the package constants, pyproject,
@@ -78,7 +78,7 @@ class ReadmeRules(unittest.TestCase):
 
     def test_line_budget_version_and_builder_row(self):
         self.assertLessEqual(len(self.lines), 110)
-        self.assertIn("CrewForeman 3.13.6", self.lines[2])
+        self.assertIn("CrewForeman 3.13.7", self.lines[2])
         rows = _roles_rows(self.text)
         self.assertIn(BUILDER_ROW, rows)
         self.assertNotIn("| Builder | DeepSeek Harness (default) |", self.text)
@@ -117,14 +117,14 @@ class ReadmeRules(unittest.TestCase):
 
 class DocsCoverage(unittest.TestCase):
     def test_release_version_everywhere(self):
-        self.assertEqual(__version__, "3.13.6")
-        self.assertEqual(config.SERVER_VERSION, "3.13.6")
-        self.assertEqual(observability.SERVICE_VERSION, "3.13.6")
+        self.assertEqual(__version__, "3.13.7")
+        self.assertEqual(config.SERVER_VERSION, "3.13.7")
+        self.assertEqual(observability.SERVICE_VERSION, "3.13.7")
         pyproject = _read(REPO / "pyproject.toml")
-        self.assertIn('version = "3.13.6"', pyproject)
+        self.assertIn('version = "3.13.7"', pyproject)
         changelog = _read(CHANGELOG)
         self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", changelog, re.M).group(1),
-                         "3.13.6")
+                         "3.13.7")
         self.assertIn("## 3.11.0", changelog)  # history is kept
 
     def test_docs_document_new_keys_and_status(self):

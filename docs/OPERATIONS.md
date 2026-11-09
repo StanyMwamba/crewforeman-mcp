@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.13.6)
+# Operations: configuration, safety, budgets, traces and retention (v3.13.7)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -560,7 +560,7 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-### OS sandbox modes and config keys (3.13.6)
+### OS sandbox modes and config keys (3.13.7)
 
 `os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
 `true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
@@ -574,7 +574,7 @@ boundary. `off` records `enforcement=none` and does not claim a boundary.
 | `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
 | `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
 | `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
-| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.6 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.7 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
 | `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
 | `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
 | `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
@@ -600,7 +600,7 @@ the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`,
 `usable=false`). 3.13.3 fixed the wrong-DLL bindings; run 42648360100 then
 proved the probe (`usable=true`, `write_restricted=true` on py3.9 and py3.15)
 but the suite was red and `admin_member` could not be measured (`WinError
-1309`). 3.13.6 contains the suite fixes; the next GitHub run is the required Windows evidence
+1309`). 3.13.7 contains the suite fixes; the next GitHub run is the required Windows evidence
 of the suite and the boundary. The runner account is an Administrators member,
 but that is not the same as an elevated process token; the probe records
 `admin` (token elevation) and `admin_member` (account group) separately. This
@@ -612,7 +612,7 @@ variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
-### Restart per OS (3.13.6)
+### Restart per OS (3.13.7)
 
 Restart is best-effort and OS-specific; the status file records `state`,
 `verified_by`, `error` and the resolved opener. macOS closes/reopens with
@@ -946,7 +946,7 @@ The admin-runner caveat is stated rather than hidden: the first
 `windows-2025` run (42629362611) failed in the probe, so its `admin=False` was
 not a measured elevation result. Run 42648360100 proved the probe on both
 Pythons but was red in the suite, and its Administrators-membership query
-failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.6
+failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.7
 records token elevation and group membership separately; the next GitHub run
 is the only Windows proof of the suite and the boundary. Until it is green, no
 create/modify/append/truncate denial is claimed, delete/rename outside stays

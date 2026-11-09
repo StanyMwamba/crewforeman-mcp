@@ -250,5 +250,30 @@ class StdoutPumpTests(unittest.TestCase):
             stream.close()
 
 
+class WindowsTokenApiBindingTests(unittest.TestCase):
+    def test_pointer_sized_handles_and_sids_are_bound(self):
+        # ctypes passes an untyped int as a 32-bit C int.  The 3.13.6 code left
+        # ConvertSidToStringSidW and GetCurrentProcess unbound, so on 64-bit
+        # Windows the SID pointer and process handle were truncated and every
+        # ACL read-back was reported as non-private.  Assert the signatures
+        # that prevent that truncation.
+        import ctypes
+        from ctypes import wintypes
+        advapi = mock.Mock()
+        kernel = mock.Mock()
+        platforms._bind_windows_token_api(advapi, kernel)
+        self.assertEqual(advapi.OpenProcessToken.argtypes[0], wintypes.HANDLE)
+        self.assertEqual(advapi.OpenProcessToken.argtypes[2],
+                         ctypes.POINTER(wintypes.HANDLE))
+        self.assertEqual(advapi.GetTokenInformation.argtypes[0],
+                         wintypes.HANDLE)
+        self.assertEqual(advapi.ConvertSidToStringSidW.argtypes[0],
+                         ctypes.c_void_p)
+        self.assertEqual(advapi.ConvertSidToStringSidW.argtypes[1],
+                         ctypes.POINTER(ctypes.c_void_p))
+        self.assertEqual(kernel.GetCurrentProcess.restype, wintypes.HANDLE)
+        self.assertEqual(kernel.LocalFree.argtypes[0], ctypes.c_void_p)
+
+
 if __name__ == "__main__":
     unittest.main()

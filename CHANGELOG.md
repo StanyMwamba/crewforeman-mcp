@@ -5,6 +5,30 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.7
+
+3.13.7: 64-bit Win32 token bindings and Windows temp-cleanup fixes (proof pending the next windows-2025 run)
+
+- **64-bit token and SID binding.** `platforms._bind_windows_token_api` now
+  sets `argtypes`/`restype` for `GetCurrentProcess`, `OpenProcessToken`,
+  `GetTokenInformation`, `ConvertSidToStringSidW`, `LocalFree` and
+  `CloseHandle`.  Unbound ctypes calls pass a Python int as a 32-bit C `int`,
+  so on 64-bit Windows the process pseudo-handle and the SID pointer were
+  truncated; `ConvertSidToStringSidW` failed, `_windows_private_acl` returned
+  `False`, every credentials file was skipped as non-private, and five tests
+  failed on both Windows Pythons.  `CF_ACL_DEBUG` now also prints booleans when
+  the SID or `icacls` lookup fails before the ACE check.
+- **Windows teardown.** The inherited-stdout grandchild in the stall test runs
+  with its cwd at the filesystem root (the product sets `TEMP` inside the
+  workspace tmpdir), and the fixture retries removal for up to six seconds.
+  The 2-second "returns immediately" assertion is unchanged; a live grandchild
+  can no longer fail cleanup with `WinError 32`.
+- **Evidence.** Run 42683356739 (3.13.6) ran 1,742 tests on both Windows
+  Pythons: one failure and five errors, all in the credential-resolution set
+  plus the `WinError 32` teardown.  The boundary gate passed on both
+  (`sandbox boundary exit code: 0`).  The next `windows-2025` run is the
+  required evidence; no Windows suite claim is made before it.
+
 ## 3.13.6
 
 3.13.6: Windows ACL verification via Win32 (proof pending the next windows-2025 run)
