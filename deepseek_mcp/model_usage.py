@@ -105,32 +105,45 @@ def _norm_prices(entry):
         return None
 
 
-def _lookup_prices(table, *names):
+def _price_key_match(name, key, prefix=False):
+    """Match full ``provider/model`` keys and bare model ids."""
+    name = str(name or "")
+    key = str(key or "")
+    if not name or not key:
+        return False
+    name_bare = name.split("/", 1)[1] if "/" in name else name
+    key_bare = key.split("/", 1)[1] if "/" in key else key
+    if prefix:
+        return (name.startswith(key)
+                or (bool(name_bare) and name_bare.startswith(key_bare)))
+    return (name == key
+            or (bool(name_bare) and name_bare == key_bare))
+
+
+def _lookup_prices(table, *names, prefix=False):
     if not isinstance(table, dict):
         return None
     for name in names:
         for key, entry in table.items():
-            if str(name) == str(key):
-                found = _norm_prices(entry)
-                if found is not None:
-                    return found
-    for name in names:
-        if not name:
-            continue
-        for key, entry in table.items():
-            if str(name).startswith(str(key)):
+            if _price_key_match(name, key, prefix=prefix):
                 found = _norm_prices(entry)
                 if found is not None:
                     return found
     return None
 
 
-def _prices_for(model, bare, table):
-    found = _lookup_prices(table, model, bare)
-    if found is not None:
-        return found
+def _prices_for(model, bare, table, fallback=None):
+    for prefix in (False, True):
+        for candidate in (table, fallback):
+            found = _lookup_prices(candidate, model, bare, prefix=prefix)
+            if found is not None:
+                return found
     builtin = getattr(api, "HARNESS_PRICES", {}) if api is not None else {}
-    return _lookup_prices(builtin, bare, model)
+    for prefix in (False, True):
+        found = _lookup_prices(builtin, bare, model, prefix=prefix)
+        if found is not None:
+            return found
+    return None
 
 
 def _provider_for(model, execution=None, role_map=None):
@@ -343,7 +356,8 @@ class ModelUsage:
             if source not in row["cost_sources"]:
                 row["cost_sources"].append(source)
             bare = label.split("/", 1)[1] if "/" in label else label
-            resolved = _prices_for(label, bare, table)
+            resolved = _prices_for(
+                label, bare, table, self.prices if reviewer else None)
             supplied = (entry.get("estimated_cost_usd")
                         if entry.get("estimated_cost_usd") is not None
                         else execution.get("estimated_cost_usd"))

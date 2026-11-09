@@ -1,11 +1,11 @@
-# Installing crewforeman-mcp 3.12.1
+# Installing crewforeman-mcp 3.12.2
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime dependencies**.
 It ships a local MCP stdio server and five skill checklists (`code`, `data`,
 `document`, `poster`, `web`) installed as data files under
 `share/crewforeman-mcp/skills`.
 
-3.12.1 is a patch release on the 3.12.0 line. The package name, console
+3.12.2 is a patch release on the 3.12.0 line. The package name, console
 scripts, skills layout and zero-dependency install contract are unchanged, so
 there is no migration step. The 3.12.1 change is key lookup: a provider key is
 resolved by the **name** of its variable, first from the connector's process
@@ -38,7 +38,7 @@ Run these from the repository root (the directory containing `pyproject.toml`).
 `uvx crewforeman-mcp` resolves the package from the configured index;
 `uvx --from . crewforeman-mcp` runs a local checkout before it is published.
 Pin this release for a reproducible install with
-`uvx crewforeman-mcp==3.12.1`. After a `pipx` or `pip` install, both
+`uvx crewforeman-mcp==3.12.2`. After a `pipx` or `pip` install, both
 `crewforeman-mcp` and the shorter alias `deepseek-mcp` are on `PATH`.
 
 ### macOS
@@ -121,7 +121,7 @@ python -m deepseek_mcp --help
 python -m pip show -f crewforeman-mcp | grep crewforeman-mcp/skills
 ```
 
-Expected: the version prints `3.12.1`, each `--help` exits 0, and the file
+Expected: the version prints `3.12.2`, each `--help` exits 0, and the file
 listing shows the five `.md` skill files. On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
 If the files exist but a run says skills are missing, set `DSH_SKILLS_DIR` to
@@ -141,7 +141,7 @@ under `share/crewforeman-mcp/skills`. A source checkout is untouched. Delete
 
 ## Keys
 
-3.12.1 looks a provider key up by its variable **name**: first the connector's
+3.12.2 looks a provider key up by its variable **name**: first the connector's
 process environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). `config.json` lists variable names,
 never values.

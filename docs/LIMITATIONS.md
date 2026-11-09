@@ -1,4 +1,4 @@
-# Known limitations and failure modes (3.12.1)
+# Known limitations and failure modes (3.12.2)
 
 Only limitations that remain in this version are listed here.
 

@@ -5,6 +5,43 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.12.2
+
+PLAN bookkeeping on both declared and actual sides, one generic per-model
+price map for reviewer and builder cost, and README fixtures that no longer
+need git metadata.
+
+### Added
+
+- **Generic `model_prices`.** One per-model USD-per-million-token map now
+  prices builders and serves as the fallback for reviewers. Reviewer cost is
+  resolved as `reviewer_prices` -> `model_prices` -> the built-in DeepSeek
+  `HARNESS_PRICES`. `reviewer_prices` is an optional reviewer-only override and
+  is never applied to a builder. Partial or unknown rows keep cost unknown
+  (`null`), never `0`.
+- README fixture tests that run without git metadata, so they pass from an
+  exported tree or a nested checkout.
+
+### Changed
+
+- Unknown-cost text now reads `no configured model price`.
+- PLAN.json is ignored for PLAN bookkeeping on both the declared and actual
+  sides, so bookkeeping writes are not reported as undeclared changes.
+- A `write_set` entry of `.` is accepted as the workspace root.
+- Version 3.12.2.
+
+### Fixed
+
+- Reviewer cost for a model absent from `reviewer_prices` now falls back to
+  `model_prices` instead of being reported as unknown.
+- Builder cost and reviewer cost share the same generic model map, so pricing
+  does not depend on the role-specific table alone.
+
+### Tests
+
+- Release, install-doc, acceptance, server and policy tests now expect 3.12.2.
+- README fixture tests are git-independent.
+
 ## 3.12.1
 
 Provider keys from the Harness credentials file, product-relative PLAN paths,

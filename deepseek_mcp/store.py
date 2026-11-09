@@ -216,7 +216,7 @@ def _md(run):
             lines.append(detail)
             cost_text = ("$%s" % fmt_cost(entry.get("cost"))
                          if entry.get("cost") is not None
-                         else "cost unknown (reviewer_prices not configured)")
+                         else "cost unknown (no configured model price)")
             lines.append("    - usage: input %s (uncached) / cache read %s / "
                          "output %s / total %s / %s%s" % (
                              entry.get("tokens_in", "?"),

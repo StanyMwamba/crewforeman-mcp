@@ -1,11 +1,13 @@
-"""Documentation invariants for the current release (3.12.1) plus 3.10.0 Part B.
+"""Documentation invariants for the current release (3.12.2) plus 3.10.0 Part B.
 
-Focused checks only: README's public shape is fixed, the three product docs
-describe the Part B efficiency work, and the current release is 3.12.1.
+Focused checks only: README's public shape is fixed by a checked-in fixture,
+the product docs describe the Part B efficiency work, and the current release
+is 3.12.2.  Nothing here shells out to version control, so the checks hold in
+a full checkout, an exported tarball and CI alike.
 """
 
+import json
 import re
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -13,28 +15,22 @@ REPO = Path(__file__).resolve().parents[1]
 README = REPO / "README.md"
 TEAMS = REPO / "docs" / "TEAMS.md"
 CHANGELOG = REPO / "CHANGELOG.md"
+FIXTURE = REPO / "tests" / "fixtures" / "readme_invariants.json"
+
+RUN_ID_RE = re.compile(r"\b\d{8}-\d{6}-[0-9a-f]{6}\b")
+RUN_PREFIX_RE = re.compile(r"\brun_[0-9a-f]{8,}\b")
+BOLD_VENDOR = ("**Using a reviewer from a different vendor means a model "
+               "never grades its own work.**")
+BUILDER_ROW = ("| Builder | Harness, any model (default DeepSeek) | "
+               "Sizes the team, builds in waves, revises on notes. |")
 
 
 def _read(path):
     return path.read_text(encoding="utf-8")
 
 
-def _head_readme():
-    """The committed README (pre-Part A), used as the protected-byte baseline."""
-    try:
-        proc = subprocess.run(
-            ["git", "show", "HEAD:README.md"],
-            cwd=str(REPO),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.decode("utf-8")
+def _fixture():
+    return json.loads(_read(FIXTURE))
 
 
 def _roles_table(text):
@@ -42,13 +38,20 @@ def _roles_table(text):
     return match.group(1) if match else None
 
 
-def _roles_bold_line(text):
-    match = re.search(r"^\*\*Using a reviewer from a different vendor.*\*\*$", text, re.M)
-    return match.group(0) if match else None
+def _roles_rows(text):
+    table = _roles_table(text)
+    if table is None:
+        return []
+    return [line for line in table.splitlines() if line.startswith("|")]
+
+
+def _bold_lines(text):
+    return re.findall(r"^\*\*Using a reviewer from a different vendor.*\*\*$",
+                      text, re.M)
 
 
 def _convergence_table(text):
-    match = re.search(r"## Convergence\n.*?\n\n((?:\|[^\n]*\|\n)+)", text)
+    match = re.search(r"## Convergence\n.*?\n\n((?:\|[^\n]*\|\n)+)", text, re.S)
     return match.group(1) if match else None
 
 
@@ -60,60 +63,56 @@ def _guarantees_bullets(text):
     match = re.search(r"## Guarantees\n(.*?)(?=\n## )", text, re.S)
     if not match:
         return []
-    return [line.strip() for line in match.group(1).splitlines() if line.startswith("- ")]
+    return [line.strip() for line in match.group(1).splitlines()
+            if line.startswith("- ")]
 
 
 class ReadmeInvariants(unittest.TestCase):
     def setUp(self):
         self.text = _read(README)
-        self.head = _head_readme()
-        if self.head is None:
-            self.skipTest("git HEAD:README.md is unavailable")
+        self.lines = self.text.splitlines()
+        self.fixture = _fixture()
 
     def test_line_budget_and_no_dollar(self):
-        self.assertLessEqual(len(self.text.splitlines()), 110)
+        self.assertLessEqual(len(self.lines), 110)
         self.assertNotIn("$", self.text)
 
-    def test_at_most_three_new_guarantees_bullets(self):
-        current = _guarantees_bullets(self.text)
-        head = _guarantees_bullets(self.head)
-        self.assertGreaterEqual(len(current), len(head))
-        added = [bullet for bullet in current if bullet not in head]
-        # A release may add at most three Guarantees bullets.  The 3.10.0
-        # Part B release added three; later releases must not grow the list
-        # beyond that envelope.
-        self.assertLessEqual(len(added), 3, added)
-        text = " ".join(current).lower()
-        for token in ("model", "cost", "reviewer"):
-            self.assertIn(token, text)
-        # The reviewer backup + quota-attribution sentence stays one line.
-        reviewer = [line for line in current if "backup reviewer" in line.lower()]
-        self.assertEqual(len(reviewer), 1, reviewer)
+    def test_no_run_ids(self):
+        self.assertIsNone(RUN_ID_RE.search(self.text))
+        self.assertIsNone(RUN_PREFIX_RE.search(self.text))
 
-    def test_roles_table_and_bold_line_unchanged(self):
-        self.assertIsNotNone(_roles_table(self.head))
-        head_rows = [row for row in _roles_table(self.head).splitlines()
-                     if row.startswith("|")]
-        rows = [row for row in _roles_table(self.text).splitlines()
-                if row.startswith("|")]
-        self.assertEqual(rows[0], head_rows[0])
-        self.assertEqual(rows[1], "|---|---|---|")
-        self.assertIn("| Builder | Harness, any model (default DeepSeek) | "
-                      "Sizes the team, builds in waves, revises on notes. |",
-                      rows)
-        # Reviewer and client rows are byte-identical.
-        self.assertEqual(rows[-2:], head_rows[-2:])
-        self.assertIsNotNone(_roles_bold_line(self.head))
-        self.assertEqual(_roles_bold_line(self.text), _roles_bold_line(self.head))
+    def test_roles_table_is_exact(self):
+        rows = _roles_rows(self.text)
+        self.assertEqual(len(rows), 5, rows)
+        self.assertEqual(rows, self.fixture["roles_table"])
+        self.assertIn(BUILDER_ROW, rows)
 
-    def test_convergence_table_and_mermaid_unchanged(self):
-        self.assertIsNotNone(_convergence_table(self.head))
-        self.assertEqual(_convergence_table(self.text), _convergence_table(self.head))
-        self.assertEqual(_mermaid_blocks(self.text), _mermaid_blocks(self.head))
-        self.assertEqual(len(_mermaid_blocks(self.text)), 2)
+    def test_bold_vendor_line_is_exact_once(self):
+        bold = _bold_lines(self.text)
+        self.assertEqual(len(bold), 1, bold)
+        self.assertEqual(bold[0], self.fixture["bold_vendor_line"])
+        self.assertEqual(bold[0], BOLD_VENDOR)
+
+    def test_convergence_and_mermaid_are_byte_identical(self):
+        self.assertEqual(_convergence_table(self.text),
+                         self.fixture["convergence"])
+        blocks = _mermaid_blocks(self.text)
+        self.assertEqual(len(blocks), 2, blocks)
+        for block, expected in zip(blocks, self.fixture["mermaid"]):
+            self.assertEqual(block, expected)
+        self.assertEqual(blocks, self.fixture["mermaid"])
 
     def test_version_line_is_current(self):
-        self.assertIn("3.12.1", self.text.splitlines()[2])
+        self.assertGreaterEqual(len(self.lines), 3)
+        self.assertIn("CrewForeman 3.12.2", self.lines[2])
+
+    def test_guarantees_keep_reviewer_backup_line(self):
+        bullets = _guarantees_bullets(self.text)
+        backups = [line for line in bullets if "backup reviewer" in line.lower()]
+        self.assertEqual(len(backups), 1, backups)
+        text = " ".join(bullets).lower()
+        for token in ("model", "cost", "reviewer"):
+            self.assertIn(token, text)
 
 
 class TeamsDoc(unittest.TestCase):
@@ -176,7 +175,7 @@ class ChangelogDoc(unittest.TestCase):
             self.assertIn(token, body)
 
     def test_version_is_current(self):
-        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.12.1")
+        self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", self.text, re.M).group(1), "3.12.2")
         self.assertNotIn("## 3.11.1", self.text)
 
 

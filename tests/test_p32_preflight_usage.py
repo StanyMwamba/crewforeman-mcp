@@ -191,8 +191,8 @@ class UsageVisibilityTests(unittest.TestCase):
         run = dict(self.run, review_rounds=[entry])
         md = store._md(run)
         text = harness._result_text(run, "/tmp/run-usage.md")
-        self.assertIn("cost unknown (reviewer_prices not configured)", md)
-        self.assertIn("cost unknown (reviewer_prices not configured)", text)
+        self.assertIn("cost unknown (no configured model price)", md)
+        self.assertIn("cost unknown (no configured model price)", text)
 
     def test_run_json_keeps_usage_fields(self):
         blob = json.loads(json.dumps(self.run))

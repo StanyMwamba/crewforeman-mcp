@@ -1,4 +1,4 @@
-"""Release metadata checks for crewforeman-mcp 3.12.1 (S6).
+"""Release metadata checks for crewforeman-mcp 3.12.2 (S6).
 
 These are static/fast checks that keep the shipped version strings in code,
 packaging and the smoke client aligned with the release.
@@ -16,7 +16,7 @@ from deepseek_mcp import config, observability, server
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 SMOKE = ROOT / "scripts" / "smoke_mcp.py"
-EXPECTED = "3.12.1"
+EXPECTED = "3.12.2"
 
 
 class VersionIdentityTests(unittest.TestCase):

@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.12.1"
+SERVER_VERSION = "3.12.2"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -84,9 +84,9 @@ DEFAULTS = {
     "backup_reviewer_model": "",
     "harness_workspace": os.path.join(BASE_DIR, "harness-workspace"),
     "dsh_sessions_dir": "~/.dsh/sessions",
-    # Optional per-model reviewer rates in USD per million tokens:
-    # {"model": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}. Empty means
-    # tokens are recorded but reviewer cost stays unknown.
+    # Optional reviewer-only override in USD per million tokens:
+    # {"model": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}. Empty falls
+    # back to model_prices and then the built-in DeepSeek rates.
     "reviewer_prices": {},
     "state_dir": os.path.join(BASE_DIR, "state"),
     "zstd_bin": "zstd",
@@ -325,6 +325,8 @@ DEFAULTS = {
     "slice_models": {},
     "model_candidates_max": 3,
     "model_plan_enforcement": "warn",
+    # Generic per-model rates for builders and reviewer fallback:
+    # {"provider/model": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}.
     "model_prices": {},
     "model_usage_max_models": 8,
     "history_model_min_runs": 2,

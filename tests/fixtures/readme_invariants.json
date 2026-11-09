@@ -1,0 +1,15 @@
+{
+  "roles_table": [
+    "| Role | Who | What it does |",
+    "|---|---|---|",
+    "| Builder | Harness, any model (default DeepSeek) | Sizes the team, builds in waves, revises on notes. |",
+    "| Independent reviewer | Configurable, any vendor (e.g. Kimi) | Scores 0–10 and lists blocking defects. |",
+    "| Client / coordinator | Your MCP client (e.g. Claude) | Sends the brief and reads the result. |"
+  ],
+  "bold_vendor_line": "**Using a reviewer from a different vendor means a model never grades its own work.**",
+  "convergence": "| Round | What the reviewer checked | Review length | Score | Blocking defects |\n|---:|---|---|---:|---:|\n| 1 | Full review | Long | 7.5 | 1 |\n| 2 | Flagged defects + new changes | Shorter | 8.5 | 0 |\n",
+  "mermaid": [
+    "```mermaid\nflowchart LR\n    A[Request<br/>optional idempotency_key] --> B{Admit + work_id<br/>active duplicate?}\n    B -- yes --> R[Return existing run]\n    B -- no --> D[New attempt<br/>classify + bounded waves]\n    D --> E[Independent review]\n    E --> F{Pass?}\n    F -- no --> G[Revise<br/>quality_rounds] --> E\n    F -- yes --> H[Journal + result<br/>MCP task completes]\n```",
+    "```mermaid\nflowchart LR\n    A[Team builds] -- done --> R{Review<br/>score ≥ 8.5?}\n    A -- stalls --> X[Rescue team<br/>finishes the work]\n    X --> R\n    R -- yes --> OK([Accepted])\n    R -- no --> T{Tries left?}\n    T -- yes --> F[Fix with<br/>reviewer notes]\n    F --> R\n    T -- no --> N([Returned<br/>with notes])\n\n    classDef good fill:#e6f4ea,stroke:#1a7f37,color:#0f3d1e;\n    classDef warn fill:#fff4e5,stroke:#9a6700,color:#4d3300;\n    classDef step fill:#f6f8fa,stroke:#57606a,color:#1f2328;\n    classDef rescue fill:#ddf4ff,stroke:#0969da,color:#0a3069;\n    class OK good;\n    class N warn;\n    class A,R,T,F step;\n    class X rescue;\n```"
+  ]
+}

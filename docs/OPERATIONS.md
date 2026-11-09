@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.12.1)
+# Operations: configuration, safety, budgets, traces and retention (v3.12.2)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -319,15 +319,17 @@ evidence-aware: a clean signed suite says do not rerun the whole suite; a
 skipped suite says run only the relevant tests and never claim a pass.
 
 `review_test_timeout_seconds` (default 300) is the connector test hard timeout.
-`reviewer_prices` (default `{}`) is an optional per-model table of USD per
-million tokens for reviewer accounting:
+`model_prices` (default `{}`) is the generic per-model table of USD per
+million tokens used for builders and as the fallback for reviewers:
 `{"kimi-k3.1-pro": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}`.
-With the empty default the reviewer's input/cached/output tokens are still
-recorded in each review round and in `reviewer_usage`, while cost stays
-explicitly unknown. No prices are shipped. Both transports use the same table:
-headless session logs resolve each observed model, and the SDK transport prices
-its reviewer usage through this table (built-in DeepSeek rates remain the
-fallback).
+`reviewer_prices` (default `{}`) is an optional reviewer-only override with the
+same shape; it is never applied to a builder. Reviewer cost resolves in the
+order `reviewer_prices` -> `model_prices` -> the built-in DeepSeek
+`HARNESS_PRICES`. Partial or unknown rows keep cost unknown and are never
+zero-filled. With the empty defaults the reviewer's input/cached/output tokens
+are still recorded in each review round and in `reviewer_usage`. Both transports
+use the same tables: headless session logs resolve each observed model, and the
+SDK transport prices its reviewer usage through them.
 
 ### Incremental review checkpoints and resumable reviews (P3.2)
 
@@ -370,8 +372,9 @@ Reviewer token usage is written to each `review_rounds` entry
 structured fields, the run `.md` shows one usage line per round, the job result
 text shows the same, and `deepseek_job_status run_id=<id> events_since=0`
 returns `reviewer_usage` plus a compact `review_rounds` view. Cost is included
-when `reviewer_prices` resolves every observed model; otherwise the record says
-`cost unknown (reviewer_prices not configured)`.
+when `reviewer_prices` or `model_prices` resolves every observed model, with the
+built-in DeepSeek `HARNESS_PRICES` as the final fallback; otherwise the record
+says `cost unknown (no configured model price)`.
 
 ### Review score re-prompt and `score_missing`
 
@@ -1071,9 +1074,9 @@ argument. This table is the operator-facing summary of the registry in
 | `slice_models` | `{}` | Default slice -> model map; a tool argument wins |
 | `model_candidates_max` | `3` | Extra competing candidates per job |
 | `model_plan_enforcement` | `warn` | `warn` degrades; `strict` stops before review |
-| `model_prices` | `{}` | USD/M-token builder rows: `{input, cache_read, output}` |
+| `model_prices` | `{}` | Generic USD/M-token rows for builders and reviewer fallback: `{input, cache_read, output}` |
 | `credentials_file` | `~/.dsh/.credentials.yaml` | Provider-key file read after the process environment |
-| `reviewer_prices` | `{}` | Same shape, reviewer executions only |
+| `reviewer_prices` | `{}` | Optional reviewer-only override, never applied to builders |
 | `model_usage_max_models` | `8` | Named rows before the `__other__` fold |
 | `history_model_min_runs` | `2` | Floor before a model can be `best_model` |
 | `history_model_max` | `6` | Model history rows kept in sizing history |
@@ -1112,8 +1115,11 @@ cost, `cost_known`, cost source, aggregate scores (no score lists), wins and
 losses, an `__other__` fold, `unpriced_models`, `unattributed_scores` and
 `totals`. If any contributing model is unpriced, that row and the total are
 `null`; the connector never zero-fills, proxies the parent price or splits a
-total by token share. `model_prices` prices builders; `reviewer_prices` prices
-reviewer/revision executions and is never applied to a builder.
+total by token share. `model_prices` is the generic table for builders and the
+reviewer fallback; `reviewer_prices` optionally overrides reviewer/revision
+pricing and is never applied to a builder. Resolution is `reviewer_prices` ->
+`model_prices` -> built-in DeepSeek `HARNESS_PRICES`; partial or unknown rows
+stay `null`, never `0`. Unknown-cost text reads `no configured model price`.
 
 `MODEL_AUDIT.json` is required when a model plan is supplied. The connector
 cross-checks requested pairs, observed model ids and existing files and records

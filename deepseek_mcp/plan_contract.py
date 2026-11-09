@@ -194,6 +194,11 @@ def is_plan_path(path, cfg):
     return normal == plan_path(cfg)
 
 
+def _is_bookkeeping(path, cfg):
+    """True for the plan file or an artifact that actual_changes ignores."""
+    return is_plan_path(path, cfg) or path_scope.is_artifact(path, cfg)
+
+
 def _glob_regex(pattern):
     out = []
     index = 0
@@ -238,6 +243,8 @@ def _prefix_matches(entry, path):
     entry = entry.rstrip("/")
     if not entry:
         return False
+    if entry == ".":
+        return True
     if _has_glob(entry):
         regex = _glob_regex(entry)
         if regex.match(path):
@@ -259,7 +266,17 @@ def _is_test_path(path):
 # ---------------------------------------------------------------------------
 # validation
 
-def _path_list(data, key, errors):
+def _is_root_path(value):
+    """True for ``.`` / ``./`` style declarations of the workspace root."""
+    if not isinstance(value, str):
+        return False
+    raw = value.strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or _DRIVE_RE.match(raw):
+        return False
+    return all(segment in ("", ".") for segment in raw.split("/"))
+
+
+def _path_list(data, key, errors, allow_root=False):
     raw = data.get(key, [])
     if raw is None:
         return []
@@ -269,10 +286,13 @@ def _path_list(data, key, errors):
     result = []
     seen = set()
     for item in raw:
-        path = normalize_path(item)
-        if path is None:
-            errors.append("%s: invalid path" % key)
-            continue
+        if allow_root and _is_root_path(item):
+            path = "."
+        else:
+            path = normalize_path(item)
+            if path is None:
+                errors.append("%s: invalid path" % key)
+                continue
         if path not in seen:
             seen.add(path)
             result.append(path)
@@ -298,7 +318,7 @@ def validate_plan(data, cfg):
 
     files = _path_list(data, "files_expected", errors)
     tests = _path_list(data, "tests_expected", errors)
-    write_set = _path_list(data, "write_set", errors)
+    write_set = _path_list(data, "write_set", errors, allow_root=True)
 
     max_files = _cfg_int(cfg, "plan_max_files", 200, 1, 10000)
     max_risks = _cfg_int(cfg, "plan_max_risks", 20, 1, 10000)
@@ -634,7 +654,7 @@ def _verified_product_prefix(changed, declared, actual):
     return ""
 
 
-def compare_plan(plan, actual):
+def compare_plan(plan, actual, cfg=None):
     """Return a bounded, deterministic mismatch list for a normalised plan."""
     if not isinstance(plan, dict):
         return []
@@ -650,9 +670,18 @@ def compare_plan(plan, actual):
     extra = set(
         path for path in (actual.get("extra_wave_paths") or []) if isinstance(path, str)
     )
-    files = [p for p in (plan.get("files_expected") or []) if isinstance(p, str)]
-    tests = [p for p in (plan.get("tests_expected") or []) if isinstance(p, str)]
-    write_set = [p for p in (plan.get("write_set") or []) if isinstance(p, str)]
+    files = [
+        p for p in (plan.get("files_expected") or [])
+        if isinstance(p, str) and not _is_bookkeeping(p, cfg)
+    ]
+    tests = [
+        p for p in (plan.get("tests_expected") or [])
+        if isinstance(p, str) and not _is_bookkeeping(p, cfg)
+    ]
+    write_set = [
+        p for p in (plan.get("write_set") or [])
+        if isinstance(p, str) and not _is_bookkeeping(p, cfg)
+    ]
     mismatches = []
 
     # When the workspace wraps the product in one checkout subfolder
@@ -965,7 +994,7 @@ def check_plan_contract(workspace, cfg, run, before, after, builder_started, tas
                       else "tiny_job_invalid_plan")
             mismatches = []
     elif status == "ok":
-        mismatches = compare_plan(data or {}, actual)
+        mismatches = compare_plan(data or {}, actual, cfg)
         stale = False
         started = _started_seconds(builder_started)
         if started is not None and mtime is not None and mtime < started - _STALE_SLACK:

@@ -138,6 +138,18 @@ class CompareTests(unittest.TestCase):
             [m["path"] for m in pc.compare_plan(plan, actual)], ["src2/b.py"]
         )
 
+    def test_bookkeeping_filter_uses_configured_artifact_globs(self):
+        cfg = {"gate_noproduct_globs": ["notes/**"]}
+        plan = {
+            "version": 1,
+            "files_expected": ["notes/audit.txt", "src/a.py"],
+            "tests_expected": [],
+            "risks": [],
+            "write_set": [],
+        }
+        mismatches = pc.compare_plan(plan, {"created": ["src/a.py"]}, cfg)
+        self.assertEqual(mismatches, [])
+
     def test_risk_hit_path_and_text(self):
         with tempfile.TemporaryDirectory() as workspace:
             auth = os.path.join(workspace, "src")

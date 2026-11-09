@@ -263,30 +263,79 @@ def _normalise_prices(entry):
         return None
 
 
-def _prices_for(model, prices=None):
-    """Resolve model prices, preferring configured reviewer prices.
+def _config_prices(cfg, name):
+    """Return one configured price map (never a non-dict)."""
+    try:
+        getter = getattr(cfg, "get", None)
+        value = getter(name, None) if callable(getter) else getattr(cfg, name, None)
+    except Exception:
+        value = None
+    return value if isinstance(value, dict) else {}
 
-    Configured rows accept ``input``/``cache_read``/``output`` (or the legacy
-    ``miss``/``hit``/``out`` aliases). DeepSeek's built-in HARNESS_PRICES stay
-    authoritative whenever the configured table has no row for the model.
+
+def _price_key_match(model, key, prefix=False):
+    """Match a full ``provider/model`` or a bare model id, exact before prefix."""
+    model = str(model or "")
+    key = str(key or "")
+    if not model or not key:
+        return False
+    model_bare = model.split("/", 1)[1] if "/" in model else model
+    key_bare = key.split("/", 1)[1] if "/" in key else key
+    if prefix:
+        return (model.startswith(key)
+                or (bool(model_bare) and model_bare.startswith(key_bare)))
+    return (model == key
+            or (bool(model_bare) and model_bare == key_bare))
+
+
+def _lookup_price_table(model, table, prefix=False):
+    if not isinstance(table, dict):
+        return None, None
+    for known, entry in table.items():
+        if _price_key_match(model, known, prefix=prefix):
+            resolved = _normalise_prices(entry)
+            if resolved is not None:
+                return resolved, known
+    return None, None
+
+
+def _prices_for(model, prices=None, fallback_prices=None,
+                include_builtin=True):
+    """Resolve model prices from up to two maps, then the built-in table.
+
+    Exact keys win over prefixes. A partial/invalid row is ignored instead of
+    becoming zero, so it falls through to the next map or HARNESS_PRICES.
     """
-    table = prices if isinstance(prices, dict) else {}
-    for known, entry in table.items():
-        if model == known:
-            resolved = _normalise_prices(entry)
+    for prefix in (False, True):
+        for table in (prices, fallback_prices):
+            resolved, known = _lookup_price_table(model, table, prefix=prefix)
             if resolved is not None:
                 return resolved, known
-    for known, entry in table.items():
-        if model and str(model).startswith(str(known)):
-            resolved = _normalise_prices(entry)
-            if resolved is not None:
-                return resolved, known
-    if model in api.HARNESS_PRICES:
-        return api.HARNESS_PRICES[model], model
-    for known, known_prices in api.HARNESS_PRICES.items():
-        if model and str(model).startswith(known):
-            return known_prices, known
+    if not include_builtin:
+        return None, model or "unknown"
+    for prefix in (False, True):
+        resolved, known = _lookup_price_table(model, api.HARNESS_PRICES,
+                                              prefix=prefix)
+        if resolved is not None:
+            return resolved, known
     return None, model or "unknown"
+
+
+def _reviewer_price_table(cfg):
+    """Reviewer prices with model_prices as fallback for the headless path.
+
+    Reviewer entries are inserted first so a reviewer-only row wins even when
+    the two maps spell the same model differently (``model`` vs
+    ``provider/model``); invalid reviewer rows never displace a valid generic
+    row.
+    """
+    merged = {}
+    for table in (_config_prices(cfg, "reviewer_prices"),
+                  _config_prices(cfg, "model_prices")):
+        for key, entry in table.items():
+            if _normalise_prices(entry) is not None:
+                merged.setdefault(key, entry)
+    return merged
 
 
 def parse_session_usage(text, default_model="deepseek-flash", prices=None):
@@ -668,10 +717,10 @@ def _review_round_usage(record, cfg):
     if cost is None or known is False:
         priced = 0.0
         resolvable = True
+        reviewer_prices = _reviewer_price_table(cfg)
         for name, bucket in models.items():
             bucket = bucket if isinstance(bucket, dict) else {}
-            rates, _hit = _prices_for(
-                name, getattr(cfg, "reviewer_prices", None))
+            rates, _hit = _prices_for(name, reviewer_prices)
             if rates is None:
                 resolvable = False
                 break
@@ -1024,7 +1073,7 @@ def _result_text(run, path):
             if entry.get("cost") is not None:
                 bit += ", $%s" % api.fmt_cost(entry["cost"])
             else:
-                bit += ", cost unknown (reviewer_prices not configured)"
+                bit += ", cost unknown (no configured model price)"
             head += "\n" + bit
     overlaps = (run.get("slices") or {}).get("overlaps") or []
     if overlaps:
@@ -2148,10 +2197,10 @@ def _reviewer_home(cfg, workspace, policy, label):
 def _sdk_usage_cost(cfg, raw_usage, label=None):
     """Normalise SDK usage and price it; ``(usage, cost_or_None)``.
 
-    Reviewer phases price ``cfg.dsh_model`` through :func:`_prices_for` against
-    ``cfg.reviewer_prices``: a configured row wins, DeepSeek's built-in table
-    is the fallback, and an unresolvable/partial row leaves cost unknown.
-    Builder phases keep the historical built-in pricing.
+    Reviewer phases price ``cfg.dsh_model`` from ``reviewer_prices`` first,
+    then ``model_prices``, then DeepSeek's built-in table.  Builder phases use
+    ``model_prices`` when it resolves the model and otherwise keep the
+    historical built-in pricing.
     """
     raw_usage = raw_usage if isinstance(raw_usage, dict) else {}
     usage = {
@@ -2161,12 +2210,24 @@ def _sdk_usage_cost(cfg, raw_usage, label=None):
     }
     if usage.get("input_tokens") is None:
         return usage, None
-    model = str(cfg.get("dsh_model") or "deepseek-flash")
+    getter = getattr(cfg, "get", None)
+    model = str((getter("dsh_model", None) if callable(getter)
+                 else getattr(cfg, "dsh_model", None)) or "deepseek-flash")
     if _phase_kind(label) == "reviewer":
-        rates, _name = _prices_for(
-            model, getattr(cfg, "reviewer_prices", None))
+        rates, _name = _prices_for(model, _reviewer_price_table(cfg))
         if rates is None:
             return usage, None
+        uncached = max(
+            (usage.get("input_tokens") or 0)
+            - (usage.get("cache_read_tokens") or 0), 0)
+        return usage, (
+            uncached * rates["miss"]
+            + (usage.get("cache_read_tokens") or 0) * rates["hit"]
+            + (usage.get("output_tokens") or 0) * rates["out"]
+        ) / 1_000_000
+    rates, _name = _prices_for(
+        model, _config_prices(cfg, "model_prices"), include_builtin=False)
+    if rates is not None:
         uncached = max(
             (usage.get("input_tokens") or 0)
             - (usage.get("cache_read_tokens") or 0), 0)
@@ -2936,8 +2997,8 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         usage, session_logs, usage_reason = read_session_usage(
             cfg, workspace, started, session_ids=session_ids or None,
             exclude_paths=exclude_logs, session_dirs=reviewer_session_dirs,
-            prices=(getattr(cfg, "reviewer_prices", None) or {})
-            if reviewer_pricing else None,
+            prices=(_reviewer_price_table(cfg) if reviewer_pricing
+                    else _config_prices(cfg, "model_prices")),
             default_model=("unknown-reviewer-model" if reviewer_pricing
                            else "deepseek-flash"))
     except Exception as exc:
