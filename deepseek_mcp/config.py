@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.12.0"
+SERVER_VERSION = "3.12.1"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -211,6 +211,8 @@ DEFAULTS = {
     "dedupe_active": True,
     # Optional OpenAI-compatible fallbacks. Config holds env-var NAMES only;
     # API keys are never stored here. Empty list keeps DeepSeek-only behaviour.
+    # 3.12.1: provider keys may also live in the Harness credentials file.
+    "credentials_file": "~/.dsh/.credentials.yaml",
     "providers": [],
     "consult_models": [],
     "provider_fallback": False,
@@ -401,6 +403,8 @@ ENV_MAP = {
     "DEEPSEEK_BACKUP_REVIEWER_VENDOR": "backup_reviewer_vendor",
     "DSH_BACKUP_REVIEWER_MODEL": "backup_reviewer_model",
     "DEEPSEEK_BACKUP_REVIEWER_MODEL": "backup_reviewer_model",
+    "CREWFOREMAN_CREDENTIALS_FILE": "credentials_file",
+    "DSH_CREDENTIALS_FILE": "credentials_file",
     "DSH_WORKSPACE": "harness_workspace",
     "DEEPSEEK_WORKSPACE": "harness_workspace",
     "DSH_SESSIONS_DIR": "dsh_sessions_dir",
@@ -709,7 +713,7 @@ PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path",
              "failure_notes_store", "pipeline_worktree_root",
-             "pipeline_patch_dir"}
+             "pipeline_patch_dir", "credentials_file"}
 
 # P3.4a: the four connector-owned keys derived from a non-empty state_root
 # (env CREWFOREMAN_STATE_DIR or config file state_root). This sits below

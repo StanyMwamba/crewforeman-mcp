@@ -351,6 +351,15 @@ def _worker_env(cfg):
         pass
     env = safety.scrubbed_env(keep=tuple(keep))
     try:
+        # The credentials path is configuration, not a secret: a detached
+        # worker must resolve provider keys from the same file as the parent
+        # even when the path came from CREWFOREMAN_CREDENTIALS_FILE (which the
+        # scrubber drops because its name contains "CREDENTIAL").
+        from . import credentials as credentials_mod
+        env["CREWFOREMAN_CREDENTIALS_FILE"] = credentials_mod.credentials_path(cfg)
+    except Exception:
+        pass
+    try:
         base_url = cfg.get("base_url")
         if base_url:
             env["DEEPSEEK_BASE_URL"] = str(base_url)
@@ -873,6 +882,8 @@ def _materialize_pipeline_worktree(cfg, record_data, run_id):
             return record_data
         canonical = (pipe.get("canonical_workspace")
                      or args.get("_canonical_workspace"))
+        if canonical:
+            canonical = os.path.abspath(os.path.expanduser(str(canonical)))
         if not canonical:
             pipe.update({"eligible": False,
                          "unavailable_reason": "pipeline_lost"})
@@ -1167,8 +1178,8 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 "unavailable_reason": "pipeline_setup_failed",
                 "detail": redact_secrets(str(exc))[:300],
                 "slot": "base", "worktree": None,
-                "canonical_workspace": str(
-                    call_args.get("workspace") or cfg.harness_workspace),
+                "canonical_workspace": os.path.abspath(os.path.expanduser(str(
+                    call_args.get("workspace") or cfg.harness_workspace))),
                 "write_set": [], "write_set_source": "none",
                 "write_set_impl": "builtin",
                 "install": {"status": "n/a", "applied": [], "reason": None},

@@ -72,6 +72,7 @@ class FakeDeepSeekServer:
 def write_fake_dsh(path, mode="ok"):
     """Create an executable fake Harness CLI that emits --json events."""
     content = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import sys
@@ -149,6 +150,15 @@ if os.environ.get("FAKE_DSH_ENV_OUT"):
     Path(os.environ["FAKE_DSH_ENV_OUT"]).write_text(json.dumps({
         "TMPDIR": os.environ.get("TMPDIR"),
         "HOME": os.environ.get("HOME"),
+    }), encoding="utf-8")
+key_name = os.environ.get("FAKE_DSH_KEY_NAME")
+if key_name and os.environ.get("FAKE_DSH_ENV_OUT"):
+    value = os.environ.get(key_name) or ""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12] if value else ""
+    Path(os.environ["FAKE_DSH_ENV_OUT"] + ".key").write_text(json.dumps({
+        "name": key_name,
+        "present": bool(value),
+        "sha256_12": digest,
     }), encoding="utf-8")
 if task.lstrip().startswith("Reply with exactly READY"):
     emit({"type": "final", "text": "READY"})

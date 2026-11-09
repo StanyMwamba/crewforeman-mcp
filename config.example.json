@@ -72,6 +72,7 @@
   "backup_reviewer_model": "",
   "checkpoint": true,
   "dedupe_active": true,
+  "credentials_file": "~/.dsh/.credentials.yaml",
   "providers": [],
   "consult_models": [],
   "provider_fallback": false,

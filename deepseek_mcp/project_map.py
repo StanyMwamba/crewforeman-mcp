@@ -46,12 +46,16 @@ def _sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _root(value):
+    return os.path.abspath(os.path.expanduser(str(value)))
+
+
 def _read_map(workspace):
     """Read at most MAX_MAP_CHARS characters of the workspace map.
 
     Returns None when the file is missing or unreadable.
     """
-    path = os.path.join(os.path.abspath(workspace), NAME)
+    path = os.path.join(_root(workspace), NAME)
     try:
         # UTF-8 is at most 4 bytes per character; reading this much guarantees
         # we can produce MAX_MAP_CHARS characters without slurping a huge file.
@@ -73,7 +77,7 @@ def _git(workspace, args, timeout):
         timeout = 0.05
     try:
         process = subprocess.Popen(
-            ["git", "-C", os.path.abspath(workspace)] + list(args),
+            ["git", "-C", _root(workspace)] + list(args),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             shell=False,
@@ -102,7 +106,7 @@ def _git(workspace, args, timeout):
 
 def _files_fingerprint(workspace, limit=MAX_FILES):
     """Deterministic, bounded fingerprint of a directory's files."""
-    root = os.path.abspath(workspace)
+    root = _root(workspace)
     entries = []
     try:
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -137,7 +141,7 @@ def fingerprint(workspace, timeout=2.0):
     uses a bounded, sorted tracked-file list with mtimes and sizes.
     """
     try:
-        root = os.path.abspath(str(workspace))
+        root = _root(workspace)
     except Exception:
         return {"kind": "files", "files": 0, "sha256": _sha256("")}
 
@@ -171,10 +175,10 @@ def fingerprint(workspace, timeout=2.0):
 def _state_path(workspace, state_dir):
     """Private state file for a workspace under the connector state dir."""
     try:
-        identity = _sha256(os.path.abspath(str(workspace)))[:16]
+        identity = _sha256(_root(workspace))[:16]
     except Exception:
         identity = _sha256("")[:16]
-    return os.path.join(os.path.abspath(str(state_dir)), "project-maps", identity + ".json")
+    return os.path.join(_root(state_dir), "project-maps", identity + ".json")
 
 
 def load(workspace, state_dir):
@@ -270,7 +274,7 @@ def _store(workspace, state_dir, current, map_text):
         os.chmod(directory, 0o700)
         payload = {
             "version": VERSION,
-            "workspace": os.path.abspath(str(workspace)),
+            "workspace": _root(workspace),
             "fingerprint": current,
             "bytes": len(map_text.encode("utf-8", "replace")),
             "map": map_text,

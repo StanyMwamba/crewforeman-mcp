@@ -9,9 +9,10 @@ that holds a key.
 from __future__ import annotations
 
 import importlib
-import os
 import re
 from dataclasses import dataclass
+
+from . import credentials
 
 SERVER_MODEL_VERSION = 1
 DEFAULT_PROVIDER = "deepseek-official"
@@ -375,10 +376,10 @@ def resolve_target(cfg, provider="", model="", source="config", allow_legacy=Fal
     # installed Harness resolve its own credential.  An explicit provider entry
     # that names a variable must have that variable set before a paid call.
     if (entry.get("api_key_env_explicit") and not allow_legacy
-            and not os.environ.get(key_env)):
+            and credentials.resolve_key(key_env, cfg) is None):
         raise BuilderModelError(
             "builder_provider_key_missing",
-            "environment variable %s is not set" % key_env)
+            credentials.missing_message(key_env))
 
     vendor = _text(entry.get("vendor"), 80)
     vendor = canonical_vendor(vendor, entry.get("name"), chosen_model)

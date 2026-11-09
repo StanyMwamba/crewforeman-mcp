@@ -16,6 +16,8 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from . import credentials
+
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
@@ -128,14 +130,24 @@ def load_providers(cfg, env=None):
     return providers
 
 
-def resolve_key(provider, env=None):
-    """Read the key from the configured env var only; never return a default."""
+def resolve_key(provider, env=None, cfg=None):
+    """Resolve the key from the environment or Harness credentials file.
+
+    The value is returned to the caller only; error text names the variable
+    and never the value.
+    """
     env = os.environ if env is None else env
     name = str((provider or {}).get("api_key_env") or "")
-    key = env.get(name) if name else None
+    key = credentials.resolve_key(name, cfg, env) if name else None
     if not key:
+        message = (
+            credentials.missing_message(name)
+            if name
+            else "no api_key_env is configured for provider %s"
+            % ((provider or {}).get("name") or "<unknown>")
+        )
         raise ProviderError(
-            "environment variable %s is not set" % (name or "<unknown>"),
+            message,
             provider=(provider or {}).get("name"),
             transient=False,
         )
@@ -223,7 +235,8 @@ def _attempt(provider, status, error=None):
 
 
 def complete(messages, model=None, providers=None, timeout=60.0, env=None,
-             max_tokens=None, temperature=None, reasoning_effort=None):
+             max_tokens=None, temperature=None, reasoning_effort=None,
+             cfg=None):
     """Try providers in order; fall back only on transient failures."""
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a non-empty list")
@@ -245,7 +258,7 @@ def complete(messages, model=None, providers=None, timeout=60.0, env=None,
     for provider in ordered:
         name = provider.get("name")
         try:
-            key = resolve_key(provider, env)
+            key = resolve_key(provider, env, cfg)
         except ProviderError as exc:
             exc.provider = name
             last = exc
@@ -343,7 +356,7 @@ def complete(messages, model=None, providers=None, timeout=60.0, env=None,
 
 def consult(prompt, models=None, providers=None, timeout=60.0, env=None,
             max_workers=4, system=None, reasoning_effort=None,
-            max_tokens=None, temperature=None):
+            max_tokens=None, temperature=None, cfg=None):
     """Ask each requested model once in parallel; never synthesise answers."""
     env = os.environ if env is None else env
     ordered = list(providers or load_providers({}, env))
@@ -378,7 +391,7 @@ def consult(prompt, models=None, providers=None, timeout=60.0, env=None,
             messages.append({"role": "user", "content": prompt})
             result = complete(
                 messages, model=chosen, providers=target, timeout=timeout,
-                env=env, reasoning_effort=reasoning_effort,
+                env=env, reasoning_effort=reasoning_effort, cfg=cfg,
                 max_tokens=max_tokens, temperature=temperature,
             )
             result["model_requested"] = spec

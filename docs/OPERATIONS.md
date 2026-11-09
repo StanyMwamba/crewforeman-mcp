@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.12.0)
+# Operations: configuration, safety, budgets, traces and retention (v3.12.1)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -565,6 +565,26 @@ variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
+### Provider key lookup
+
+A provider's `api_key_env` name is resolved in this order: the process
+environment first, then the Harness credentials file
+(`~/.dsh/.credentials.yaml` by default; override with `credentials_file`,
+`CREWFOREMAN_CREDENTIALS_FILE` or `DSH_CREDENTIALS_FILE`). The reader accepts
+the wrappers' flat `NAME: value` form and the nested `records` / `refs`
+layouts. A credentials file readable by group or others is skipped with a
+warning, so keep it owner-only (`chmod 600`). The resolved value is injected
+only into the child `dsh` environment under that variable name; overlays, run
+records, logs, events, checkpoints and errors carry the name only. Example
+provider entry (variable names only, no value):
+
+```json
+{"name": "anthropic", "base_url": "https://api.anthropic.com",
+ "api": "anthropic-messages", "api_key_env": "ANTHROPIC_API_KEY",
+ "models": ["claude-opus-4-1"]}
+```
+
+
 ## Release safety: the builder never pushes, tags or publishes
 
 **The builder agent must never run `git push`, `git tag`, `gh release`, a
@@ -1052,6 +1072,7 @@ argument. This table is the operator-facing summary of the registry in
 | `model_candidates_max` | `3` | Extra competing candidates per job |
 | `model_plan_enforcement` | `warn` | `warn` degrades; `strict` stops before review |
 | `model_prices` | `{}` | USD/M-token builder rows: `{input, cache_read, output}` |
+| `credentials_file` | `~/.dsh/.credentials.yaml` | Provider-key file read after the process environment |
 | `reviewer_prices` | `{}` | Same shape, reviewer executions only |
 | `model_usage_max_models` | `8` | Named rows before the `__other__` fold |
 | `history_model_min_runs` | `2` | Floor before a model can be `best_model` |

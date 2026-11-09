@@ -5,6 +5,39 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.12.1
+
+Provider keys from the Harness credentials file, product-relative PLAN paths,
+a single `~` expansion for the canonical workspace, and a wider literal secret
+rule.
+
+### Added
+
+- **Credential lookup by variable name.** A provider's `api_key_env` is
+  resolved from the process environment first, then from the Harness
+  credentials file (`~/.dsh/.credentials.yaml` by default; override it with
+  `credentials_file`, `CREWFOREMAN_CREDENTIALS_FILE` or
+  `DSH_CREDENTIALS_FILE`). The flat `NAME: value` form and the `records`/`refs`
+  layouts are read. A file readable by group or others is skipped with a
+  warning. The value is injected only into the child `dsh` environment;
+  overlays, run records, logs, events and errors carry the variable name only.
+
+### Documentation
+
+- REVIEWER and OPERATIONS document the key lookup order and the provider
+  example, using variable names only.
+
+### Fixed
+
+- PLAN.json entries written relative to the product checkout (no `repo/`
+  prefix) now match the job's write-set and diff when the product lives in a
+  `repo/` subfolder of the workspace.
+- `canonical_workspace` expands `~` once and is never re-joined to a base, so
+  pipeline and admission records no longer contain a doubled `.../~/...` path.
+- The generic secret rule flags JSON/YAML-style literal values such as
+  `"password": "..."` and `api_key: ...`; non-literal references and the known
+  split fixtures stay excluded.
+
 ## 3.12.0
 
 Configurable builders and reviewers, mixed-model teams, per-model cost and

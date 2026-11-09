@@ -590,6 +590,50 @@ def _read_sample(root, path):
     return raw.decode("utf-8", "ignore").lower()
 
 
+_PRODUCT_MARKERS = (
+    ".git", "pyproject.toml", "setup.py", "package.json", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json",
+)
+
+
+def _verified_product_prefix(changed, declared, actual):
+    """Return a checkout subfolder that wraps the product, or ``""``.
+
+    Verification is deliberately conservative.  The prefix must be the single
+    top-level segment of every changed path, must not already appear in a
+    declared entry, and must be evidenced by the workspace layout: the
+    workspace root is not itself a checkout while ``<root>/<prefix>`` is one
+    (a ``.git`` entry or a product manifest).  Without a known root there is
+    no evidence, so no normalisation happens.
+    """
+    prefix = path_scope.common_leading_dir(changed)
+    if not prefix:
+        return ""
+    for entry in declared:
+        if not isinstance(entry, str):
+            continue
+        if entry == prefix or entry.startswith(prefix + "/"):
+            return ""
+    root = actual.get("_root") if isinstance(actual, dict) else None
+    if not isinstance(root, str) or not root or not os.path.isdir(root):
+        return ""
+    base = os.path.join(root, prefix)
+    if not os.path.isdir(base):
+        return ""
+    if os.path.exists(os.path.join(root, ".git")):
+        # The workspace itself is the checkout: paths are already relative.
+        return ""
+    if os.path.exists(os.path.join(base, ".git")):
+        return prefix
+    root_marker = any(os.path.exists(os.path.join(root, marker))
+                      for marker in _PRODUCT_MARKERS)
+    base_marker = any(os.path.exists(os.path.join(base, marker))
+                      for marker in _PRODUCT_MARKERS)
+    if base_marker and not root_marker:
+        return prefix
+    return ""
+
+
 def compare_plan(plan, actual):
     """Return a bounded, deterministic mismatch list for a normalised plan."""
     if not isinstance(plan, dict):
@@ -611,10 +655,38 @@ def compare_plan(plan, actual):
     write_set = [p for p in (plan.get("write_set") or []) if isinstance(p, str)]
     mismatches = []
 
+    # When the workspace wraps the product in one checkout subfolder
+    # (``repo/``), the diff paths carry that leading segment while PLAN.json
+    # declares product-relative paths.  Only strip a prefix that is *verified*
+    # from the workspace layout: a lone top-level directory is not enough, or
+    # a plan that drops a package directory would silently "match".
+    prefix = _verified_product_prefix(
+        changed, files + tests + write_set, actual)
+    if prefix:
+        variants = {
+            path: path_scope.relative_variants(path, prefix) for path in changed
+        }
+    else:
+        variants = {path: [path] for path in changed}
+
+    def _matches_changed(entry):
+        for path in changed:
+            for variant in variants[path]:
+                if _entry_matches(entry, variant):
+                    return True
+        return False
+
+    def _write_set_covers(path):
+        for candidate in variants.get(path) or [path]:
+            for entry in write_set:
+                if _prefix_matches(entry, candidate):
+                    return True
+        return False
+
     for entry in files:
         if _is_test_path(entry):
             continue
-        if not any(_entry_matches(entry, path) for path in changed):
+        if not _matches_changed(entry):
             mismatches.append(
                 {"type": "missing_file", "path": entry, "detail": "declared file was not changed"}
             )
@@ -624,7 +696,7 @@ def compare_plan(plan, actual):
         if entry in seen_tests:
             continue
         seen_tests.add(entry)
-        if not any(_entry_matches(entry, path) for path in changed):
+        if not _matches_changed(entry):
             mismatches.append(
                 {"type": "missing_test", "path": entry, "detail": "declared test was not changed"}
             )
@@ -632,11 +704,13 @@ def compare_plan(plan, actual):
     for path in sorted(changed_set):
         if path in extra:
             continue
-        if any(_entry_matches(entry, path) for entry in files):
+        if any(_entry_matches(entry, variant)
+               for variant in variants[path] for entry in files):
             continue
-        if any(_entry_matches(entry, path) for entry in tests):
+        if any(_entry_matches(entry, variant)
+               for variant in variants[path] for entry in tests):
             continue
-        if any(_prefix_matches(entry, path) for entry in write_set):
+        if _write_set_covers(path):
             continue
         if _is_test_path(path):
             mismatches.append(

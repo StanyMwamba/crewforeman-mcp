@@ -53,9 +53,14 @@ _BUILTIN_RULES = (
     ("provider-api-key", re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), 0),
     ("generic-secret-assignment",
      re.compile(r"(?i)\b(api[_-]?key|secret|token|password|client[_-]?secret)"
-                r"\b\s*[:=]\s*(?:['\"][^'\"\r\n]{8,}['\"]"
+                r"\b['\"]?\s*[:=]\s*(?:['\"][^'\"\r\n]{8,}['\"]"
                 r"|(?:sk-|gh[pousr]_|AKIA|AIza|xox[abprs]-|-----BEGIN)"
                 r"[^\s\"',;#]{4,})"), 0),
+    ("generic-secret-literal",
+     re.compile(r"(?i)\b(?:api[_-]?key|secret|token|password|client[_-]?secret)"
+                r"\b['\"]?\s*[:=]\s*"
+                r"([A-Za-z0-9][A-Za-z0-9_.+/=-]{7,})"
+                r"(?![A-Za-z0-9_\[\(])"), 1),
 )
 
 
@@ -482,6 +487,110 @@ def _secret_skip_globs(cfg):
     return [str(item) for item in raw if item]
 
 
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+_DOTTED_NAME_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+# A bare word that mixes upper and lower case is a class/type/function
+# reference (``Optional``, ``SecretStr``, ``getToken``), not a hard-coded value.
+_MIXED_CASE_WORD_RE = re.compile(r"^[A-Za-z]+$")
+_PLACEHOLDER_PREFIXES = (
+    "your_", "your-", "example", "sample", "changeme", "change-me",
+    "placeholder", "replace", "dummy", "redacted", "xxxx", "todo",
+    "none", "null", "true", "false",
+)
+_LITERAL_EXCLUDED_CHARS = frozenset("(){}$[]'\"`")
+# Values that label themselves as fixtures/placeholders are not real secrets.
+# The strong provider-prefix rule still fires independently of this filter.
+_FAKE_MARKERS = (
+    "-fake", "_fake", "fake-", "fake_", "-dummy", "_dummy",
+    "-example", "_example", "-sample", "_sample", "-test", "_test",
+    "-placeholder", "_placeholder", "-redacted", "_redacted",
+)
+
+
+def _self_identifying_fake(value):
+    lowered = str(value or "").lower()
+    return any(marker in lowered for marker in _FAKE_MARKERS)
+
+
+def _literal_like(value):
+    """Return True when *value* looks like a hard-coded literal secret."""
+    if value is None:
+        return False
+    text = str(value)
+    if len(text) < 8:
+        return False
+    if any(ch.isspace() for ch in text):
+        return False
+    if any(ch in _LITERAL_EXCLUDED_CHARS for ch in text):
+        return False
+    if _ENV_NAME_RE.match(text):
+        return False
+    if _SNAKE_CASE_RE.match(text):
+        return False
+    if _DOTTED_NAME_RE.match(text):
+        return False
+    if _MIXED_CASE_WORD_RE.match(text) and not (
+            text.islower() or text.isupper()):
+        return False
+    lowered = text.lower()
+    if lowered.startswith(_PLACEHOLDER_PREFIXES):
+        return False
+    if _self_identifying_fake(text):
+        return False
+    if text[0] in ".-/=" or text[-1] in ".-/":
+        return False
+    body = text.rstrip("=")
+    if not body or "=" in body:
+        # ``=`` is only valid as trailing base64 padding.
+        return False
+    if "+" in text:
+        # ``+`` is valid base64 content, not an arithmetic expression.  Only
+        # accept it in a base64-shaped value that also mixes cases/digits.
+        if not re.match(r"^[A-Za-z0-9+/]+={0,2}$", text):
+            return False
+        if not re.search(r"[A-Z]", text) or not re.search(r"[a-z0-9]", text):
+            return False
+    return True
+
+
+def _quoted_literal(match_text):
+    """Return the quoted value of an assignment match, or None."""
+    sep = re.search(r"[:=]\s*", match_text)
+    if sep is None:
+        return None
+    rest = match_text[sep.end():]
+    if len(rest) >= 2 and rest[0] in "'\"" and rest[-1] == rest[0]:
+        return rest[1:-1]
+    return None
+
+
+_TEMPLATE_MARKERS = ("${", "{{", "os.environ", "getenv(", "env.",
+                     "process.env", "%s", "$(")
+
+
+def _reference_like(value):
+    """True for a quoted *reference*, not a literal value.
+
+    Quoted strings are literals by definition, so this is deliberately narrow:
+    templates/interpolations, environment-variable names and obvious
+    placeholders.  A real quoted password stays a finding.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if any(marker in text for marker in _TEMPLATE_MARKERS):
+        return True
+    if text.startswith(("$", "{", "<", "%", "*")):
+        return True
+    if _ENV_NAME_RE.match(text):
+        return True
+    if _self_identifying_fake(text):
+        return True
+    return text.lower().startswith(_PLACEHOLDER_PREFIXES)
+
+
 def _scan_rel_file(cfg, workspace, rel, rules, findings):
     """Scan one repo-relative file. Returns (scanned, binary, large) counts."""
     full = _safe_join(workspace, rel)
@@ -513,6 +622,13 @@ def _scan_rel_file(cfg, workspace, rel, rules, findings):
         for rule_id, pattern, group in rules:
             for match in pattern.finditer(line):
                 value = match.group(group) if group else match.group(0)
+                if rule_id == "generic-secret-literal":
+                    if not _literal_like(value):
+                        continue
+                elif rule_id == "generic-secret-assignment":
+                    quoted = _quoted_literal(match.group(0))
+                    if quoted is not None and _reference_like(quoted):
+                        continue
                 _add_finding(findings, rule_id, rel, line_no,
                              str(value or "")[:4], allow)
                 if len(findings) >= MAX_FINDINGS:

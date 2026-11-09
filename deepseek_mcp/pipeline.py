@@ -38,6 +38,8 @@ import tempfile
 import time
 import uuid
 
+from . import path_scope
+
 try:  # Keep the module importable in isolation while using the shared helper.
     from .api import redact_secrets
 except Exception:  # pragma: no cover - api always exists in the package
@@ -113,6 +115,10 @@ def _arg(args, key, default=None):
     return getattr(args, key, default)
 
 
+def _absolute(value):
+    return os.path.abspath(os.path.expanduser(str(value)))
+
+
 def _state_dir(cfg):
     value = _cfg(cfg, "state_dir", "") or ""
     if not value:
@@ -124,12 +130,14 @@ def _workspace_from(args, cfg, run=None):
     for key in ("workspace", "canonical_workspace", "repo", "repo_path"):
         value = _arg(args, key, None)
         if value:
-            return os.path.abspath(str(value))
+            return _absolute(value)
     pipe = run.get("pipeline") if isinstance(run, dict) else None
+    if not isinstance(pipe, dict) and isinstance(args, dict):
+        pipe = args.get("_pipeline")
     if isinstance(pipe, dict) and pipe.get("canonical_workspace"):
-        return os.path.abspath(str(pipe["canonical_workspace"]))
+        return _absolute(pipe["canonical_workspace"])
     value = _cfg(cfg, "workspace", "") or _cfg(cfg, "repo", "") or ""
-    return os.path.abspath(str(value)) if value else os.getcwd()
+    return _absolute(value) if value else os.getcwd()
 
 
 def _run_id(run):
@@ -153,7 +161,7 @@ def _clean_text(value, workspace=None):
     text = text.replace("\x00", "")
     if workspace:
         try:
-            text = text.replace(os.path.abspath(str(workspace)), "<workspace>")
+            text = text.replace(_absolute(workspace), "<workspace>")
         except Exception:
             pass
     return text[:2000]
@@ -669,7 +677,7 @@ def _update_sidecar(record, **fields):
 def _ensure_queue(cfg, canonical_workspace):
     """Create/repair the private queue ref and return its metadata."""
 
-    canonical = os.path.abspath(str(canonical_workspace))
+    canonical = _absolute(canonical_workspace)
     head = _git_head(canonical)
     if not head:
         return {"ok": False, "reason": "not_git_repo"}
@@ -732,7 +740,7 @@ def advance_queue_base(cfg, canonical_workspace, commit):
     """Fast-forward the queue ref to *commit* and record it."""
 
     try:
-        canonical = os.path.abspath(str(canonical_workspace))
+        canonical = _absolute(canonical_workspace)
         ref = queue_base_ref(canonical)
         if not commit:
             return {"ok": False, "reason": "missing_commit", "base_ref": ref}
@@ -802,7 +810,7 @@ def _eligibility(cfg, canonical_workspace, write_set=None):
     isolation = str(_cfg(cfg, "pipeline_isolation", "worktree") or "worktree")
     if isolation.strip().lower() != "worktree":
         return False, "isolation_unsupported", {}
-    canonical = os.path.abspath(str(canonical_workspace or ""))
+    canonical = _absolute(canonical_workspace or "")
     if not canonical or not os.path.isdir(canonical):
         return False, "workspace_missing", {}
     version, raw_version = _git_version(cfg)
@@ -864,7 +872,7 @@ def create_worktree(cfg, canonical_workspace, run_id):
     result = {"ok": False, "run_id": _safe_id(run_id), "path": None,
               "base_ref": None, "base_commit": None}
     try:
-        canonical = os.path.abspath(str(canonical_workspace or ""))
+        canonical = _absolute(canonical_workspace or "")
         result["base_ref"] = queue_base_ref(canonical)
         queue = _ensure_queue(cfg, canonical)
         if not queue.get("ok"):
@@ -940,8 +948,8 @@ def prepare_args(cfg, args, run=None):
         # base, dirty-state and repository checks belong to the canonical
         # checkout. jobs.py passes that explicitly with the frozen pipeline
         # metadata it created at admission.
-        workspace = str(args.get("_canonical_workspace")
-                        or _workspace_from(args, cfg, run))
+        workspace = _absolute(args.get("_canonical_workspace")
+                              or _workspace_from(args, cfg, run))
         declared = declared_write_set(args, cfg)
         pre_source = declared.get("source") in {"arg", "slice", "prompt"}
         check_set = declared.get("write_set") if pre_source else []
@@ -1097,8 +1105,20 @@ def note_plan(run, plan_path):
         expected, _bad = _normalise_items(
             data.get("files_expected") or data.get("filesExpected") or []
         )
+        # The write-set may be workspace-relative (repo/src/) while PLAN.json
+        # speaks product-relative (src/).  Relate the two exactly like
+        # plan_contract.compare_plan does, without ever widening the set.
+        prefix = path_scope.common_leading_dir(reserved)
+        if prefix and any(item == prefix or item.startswith(prefix + "/")
+                          for item in expected):
+            prefix = ""
+        if prefix:
+            comparable = [path_scope.strip_leading_dir(item, prefix)
+                          for item in reserved]
+        else:
+            comparable = reserved
         outside_expected = [item for item in expected
-                            if not write_set_contains(reserved, item)]
+                            if not write_set_contains(comparable, item)]
         pipe["plan_files_outside_write_set"] = outside_expected[:100]
         if isinstance(run, dict):
             run["pipeline"] = pipe
@@ -1153,7 +1173,7 @@ def capture_patch(run, cfg, workspace):
         if isinstance(pipe, dict) and pipe.get("enabled") is False:
             result["reason"] = "pipeline_disabled"
             return result
-        ws = os.path.abspath(str(workspace or ""))
+        ws = _absolute(workspace or "")
         if not ws or not os.path.isdir(ws):
             result["reason"] = "workspace_missing"
             return result
@@ -1505,7 +1525,7 @@ def install_pending(cfg, canonical_workspace, run_id):
     temp = ""
     lock_held = False
     try:
-        canonical = os.path.abspath(str(canonical_workspace or ""))
+        canonical = _absolute(canonical_workspace or "")
         if not canonical or not os.path.isdir(canonical):
             result.update({"status": "skipped", "reason": "workspace_missing"})
             return result

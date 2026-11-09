@@ -2,6 +2,27 @@
 
 CrewForeman can use an independent reviewer from a different vendor. The reviewer scores the result from 0 to 10 and lists blocking defects. It is read-only by default and runs in a private home, so it does not share the builder's session state.
 
+## Provider keys and the credentials file
+
+A provider entry names its key variable; it never stores the key:
+
+```json
+{"name": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", ...}
+```
+
+The connector resolves that name in this order:
+
+1. the process environment (an explicit export always wins);
+2. the Harness credentials file, `~/.dsh/.credentials.yaml` by default. Set
+   `credentials_file` in the config, or `CREWFOREMAN_CREDENTIALS_FILE` /
+   `DSH_CREDENTIALS_FILE` in the environment, to use another path. The legacy
+   flat `NAME: value` form and the nested `records` / `refs` layouts are read.
+
+A file that is readable by group or others is skipped with a warning; make it
+owner-only with `chmod 600`. The value is copied only into the child `dsh`
+process environment under that name. Overlays, run records, logs, events and
+errors carry the variable name only, never the value.
+
 ## Reviewer routing (new in 3.12.0)
 
 The connector, not a hand-edited wrapper, chooses the reviewer. `reviewer_model`

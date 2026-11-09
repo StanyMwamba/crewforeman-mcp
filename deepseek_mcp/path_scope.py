@@ -196,6 +196,46 @@ def classify_path(rel, cfg=None, plan_rel="PLAN.json"):
     return CATEGORY_PRODUCT
 
 
+def common_leading_dir(paths):
+    """Return the one top-level directory that prefixes every path.
+
+    ``["repo/a.py", "repo/b.py"]`` -> ``"repo"``.  Returns ``""`` when the
+    paths disagree, when one lives at the root, or when the list is empty.
+    Used to relate repo-relative plan entries to workspace-relative diffs when
+    the product lives in one subdirectory of the workspace (for example
+    ``repo/``).
+    """
+    heads = set()
+    for raw in paths or []:
+        path = normalize_rel(raw)
+        if not path or "/" not in path:
+            return ""
+        heads.add(path.split("/", 1)[0])
+    if len(heads) != 1:
+        return ""
+    return heads.pop()
+
+
+def strip_leading_dir(path, prefix):
+    """Remove one leading directory segment when it matches ``prefix``."""
+    text = normalize_rel(path)
+    if not prefix:
+        return text
+    head = normalize_rel(prefix).rstrip("/")
+    if head and text.startswith(head + "/"):
+        return text[len(head) + 1:]
+    return text
+
+
+def relative_variants(path, prefix):
+    """The path plus its product-relative form (deduplicated, ordered)."""
+    text = normalize_rel(path)
+    stripped = strip_leading_dir(text, prefix)
+    if stripped != text:
+        return [text, stripped]
+    return [text]
+
+
 def changed_paths(changes):
     """Collect path strings from change dicts, snapshots or plain strings."""
     out = []

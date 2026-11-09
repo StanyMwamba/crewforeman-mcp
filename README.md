@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.12.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.12.1 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -71,7 +71,9 @@ crewforeman-mcp --help
 ```
 Add the server to the client's MCP configuration:
 ```json
-{"mcpServers": {"crewforeman-mcp": {"command": "crewforeman-mcp", "env": {"DEEPSEEK_API_KEY": "YOUR_DEEPSEEK_API_KEY", "DSH_BIN": "/absolute/path/to/dsh"}}}}
+{"mcpServers": {"crewforeman-mcp": {"command": "crewforeman-mcp",
+  "env": {"DEEPSEEK_API_KEY": "YOUR_DEEPSEEK_API_KEY",
+  "DSH_BIN": "/absolute/path/to/dsh"}}}}
 ```
 Call `harness_deepseek` with a prompt and a workspace. A long run may return a job id to poll with `deepseek_job_status`.
 

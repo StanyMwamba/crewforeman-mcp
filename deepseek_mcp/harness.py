@@ -25,6 +25,7 @@ from . import api
 from . import authority
 from . import budget as budget_mod
 from . import checkpoints
+from . import credentials
 from . import health
 from . import concurrency
 from . import events as events_mod
@@ -2222,6 +2223,22 @@ def _sdk_budget_execution(cfg, policy, sandbox_meta, started, raw_usage,
     }
 
 
+def _child_env(cfg, policy, model_spec):
+    """Build the child dsh environment; the resolved key goes here only."""
+    keep = ["DEEPSEEK_API_KEY"]
+    name = str(getattr(model_spec, "api_key_env", "") or "")
+    if name and name not in keep:
+        keep.append(name)
+    env = safety.scrubbed_env(keep=tuple(keep))
+    if name:
+        value = credentials.resolve_key(name, cfg)
+        if value:
+            env[name] = value
+    env.setdefault("NO_COLOR", "1")
+    env.update(safety.dsh_env(policy))
+    return env
+
+
 def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                    session_id, started, output_slack, cancel_check=None,
                    live_usage_cb=None, dsh_bin=None, model_spec=None,
@@ -2235,14 +2252,7 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
     signals the process group through :class:`transport.Cancelled`.
     """
     dsh = Path(os.path.expanduser(dsh_bin or cfg.dsh_bin))
-    keep = ["DEEPSEEK_API_KEY"]
-    if model_spec is not None:
-        key_env = str(getattr(model_spec, "api_key_env", "") or "")
-        if key_env and key_env not in keep:
-            keep.append(key_env)
-    env = safety.scrubbed_env(keep=tuple(keep))
-    env.setdefault("NO_COLOR", "1")
-    env.update(safety.dsh_env(policy))
+    env = _child_env(cfg, policy, model_spec)
     reviewer_home = _reviewer_home(cfg, workspace, policy, label)
     if reviewer_home is not None:
         env["DSH_HOME"] = str(reviewer_home)
@@ -2517,14 +2527,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     if session_id:
         cmd += ["--session-id", str(session_id)]
     cmd.append(task)
-    keep = ["DEEPSEEK_API_KEY"]
-    if model_spec is not None:
-        key_env = str(getattr(model_spec, "api_key_env", "") or "")
-        if key_env and key_env not in keep:
-            keep.append(key_env)
-    env = safety.scrubbed_env(keep=tuple(keep))
-    env.setdefault("NO_COLOR", "1")
-    env.update(safety.dsh_env(policy))
+    env = _child_env(cfg, policy, model_spec)
     # Chrome/macOS resolve temporary directories through TMPDIR.  Inside the
     # Harness sandbox the system temp area is not writable, which is what made
     # headless Chrome fail in a live first-wave run.  Give the whole

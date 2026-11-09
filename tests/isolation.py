@@ -61,7 +61,7 @@ DIR_ENV_VARS = (
     "TEMP",
     "PYTHONPYCACHEPREFIX",
 )
-FILE_ENV_VARS = ()
+FILE_ENV_VARS = ("CREWFOREMAN_CREDENTIALS_FILE", "DSH_CREDENTIALS_FILE")
 CONFIG_ENV_VARS = ("DEEPSEEK_MCP_CONFIG",)
 
 # Per-key path aliases that outrank the state root.  These are cleared (not
@@ -101,6 +101,11 @@ def case_env(case):
         "TMP": str(case / "tmp"),
         "TEMP": str(case / "tmp"),
         "PYTHONPYCACHEPREFIX": str(case / "pycache"),
+        # Tests must never read the operator's real provider keys.  The case
+        # path does not exist, so the resolver falls back to the explicit
+        # temp file each test configures.
+        "CREWFOREMAN_CREDENTIALS_FILE": str(case / "credentials.yaml"),
+        "DSH_CREDENTIALS_FILE": str(case / "credentials.yaml"),
         # An empty config file keeps load_config() away from the operator's
         # real ~/.config/deepseek-harness-mcp/config.json and its custom paths.
         "DEEPSEEK_MCP_CONFIG": str(case / "config.json"),
