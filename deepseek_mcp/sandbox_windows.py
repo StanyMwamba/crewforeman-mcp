@@ -60,6 +60,7 @@ STARTF_USESTDHANDLES = 0x00000100
 CREATE_SUSPENDED = 0x00000004
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
 STARTF_USESHOWWINDOW = 0x00000001
 SW_HIDE = 0
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
@@ -309,15 +310,18 @@ def last_result():
 def _process_flags():
     """Creation flags for the restricted child.
 
-    ``CREATE_NO_WINDOW`` is deliberately absent.  Every 3.13.3 boundary child
-    exited with STATUS_DLL_INIT_FAILED (0xC0000142) before Python ran; the log
-    does not identify the cause.  ``CREATE_NO_WINDOW`` under the
-    write-restricted token is the believed cause, to be confirmed by the next
-    windows-2025 run.  The console is hidden through
-    STARTF_USESHOWWINDOW/SW_HIDE on the STARTUPINFO instead.
+    ``CREATE_NO_WINDOW`` is deliberately absent, and the child is created
+    detached so no console is allocated at all.  Every 3.13.3 boundary child
+    exited with STATUS_DLL_INIT_FAILED (0xC0000142) before Python ran; CPython
+    records that status as a generic DLL-init failure, likely from low desktop
+    heap memory when a console is created.  3.13.4 hid the console with
+    STARTF_USESHOWWINDOW/SW_HIDE but still allocated one, and py3.15 hit the
+    same status on windows-2025; DETACHED_PROCESS avoids conhost/desktop-heap
+    initialization entirely.  Standard handles are still supplied through
+    STARTF_USESTDHANDLES, so stdout/stderr remain the normal pipes.
     """
     return (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
-            | EXTENDED_STARTUPINFO_PRESENT)
+            | EXTENDED_STARTUPINFO_PRESENT | DETACHED_PROCESS)
 
 
 # ---------------------------------------------------------------------------
@@ -864,14 +868,17 @@ def canonical_root(path, api=None):
             raise
         except Exception:
             pass
-    real = os.path.normcase(_strip_extended(long_path))
-    parent = os.path.dirname(lexical) or lexical
-    # Compare like with like: ``real`` is normcased above, so the parent must
-    # be normcased too.  On Windows the old comparison mixed ``d:\\...`` with
-    # ``D:\\...`` and rejected every root as a reparse escape.
+    real = _strip_extended(long_path)
+    compare_real = os.path.normcase(real)
+    parent = os.path.dirname(real) or real
+    # Compare like with like: both sides are normcased for the containment
+    # check, but the returned path stays case-preserving so records and
+    # restore callbacks keep the caller's spelling.  The old comparison mixed
+    # ``d:\\...`` with ``D:\\...`` and rejected every root as a reparse
+    # escape; the old return value then leaked the lower-cased spelling.
     parent_real = os.path.normcase(os.path.realpath(parent))
     try:
-        if os.path.commonpath([real, parent_real]) != parent_real:
+        if os.path.commonpath([compare_real, parent_real]) != parent_real:
             raise PolicyError("reparse_escape")
     except ValueError:
         raise PolicyError("reparse_escape")
@@ -880,19 +887,20 @@ def canonical_root(path, api=None):
                             "st_file_attributes", 0) or 0)
     except OSError:
         attrs = 0
-    if attrs & FILE_ATTRIBUTE_REPARSE_POINT and real == os.path.normcase(
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT and compare_real == os.path.normcase(
             _strip_extended(lexical)):
         raise PolicyError("reparse_unresolved")
     return real
 
 
 def _forbidden_root(path, policy):
+    folded = os.path.normcase(path)
     home = os.path.normcase(os.path.realpath(os.path.expanduser("~")))
-    if path == home:
+    if folded == home:
         return "home_root"
     dsh_root = os.path.normcase(os.path.realpath(
         os.path.join(home, ".dsh")))
-    if path == dsh_root and policy.get("dsh_home"):
+    if folded == dsh_root and policy.get("dsh_home"):
         return "dsh_home_root"
     drive, tail = os.path.splitdrive(path)
     if tail in ("\\", "/"):

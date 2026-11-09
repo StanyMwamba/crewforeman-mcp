@@ -1,9 +1,9 @@
-"""3.13.4 regression tests for Windows-only defects, runnable on any host.
+"""3.13.5 regression tests for Windows-only defects, runnable on any host.
 
 The Windows CI failure set was dominated by host path semantics rather than
 by Windows-only APIs, so these tests force the Windows comparison mode on a
 macOS/Linux host (``_CASE_INSENSITIVE_FS``) or mock the Win32 surface.  The
-path/casefold/ACL/CRLF/sdist tests would have failed before the 3.13.4 fixes;
+path/casefold/ACL/CRLF/sdist tests would have failed before the 3.13.5 fixes;
 a few structural checks (lock file, process flags) guard the fix without
 failing on POSIX beforehand.
 """
@@ -45,7 +45,7 @@ class PlanPathPortabilityTests(unittest.TestCase):
             self.assertEqual(pc.normalize_path("A\\B.py"), "A/B.py")
 
     def test_invalid_path_errors_name_the_field_not_a_previous_path(self):
-        # Dedupe must not rebind the validation field name (a 3.13.4 review
+        # Dedupe must not rebind the validation field name (a 3.13.5 review
         # caught the old ``key = match_key(path)`` shadowing bug).
         _normalised, errors = pc.validate_plan(
             {"version": 1,
@@ -63,7 +63,7 @@ class PlanPathPortabilityTests(unittest.TestCase):
 
 class CanonicalPathCaseTests(unittest.TestCase):
     def test_windows_canonical_path_does_not_normcase(self):
-        # Force the Windows branch and make normcase observable.  The 3.13.4
+        # Force the Windows branch and make normcase observable.  The 3.13.5
         # code lowercased every workspace root on Windows.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "CaseWorkspace")
@@ -127,9 +127,15 @@ class WindowsPrivateAclTests(unittest.TestCase):
         self.assertFalse(self._run(
             self._ace(r"DOMAIN\runneradmin", "(I)(F)")))
 
-    def test_extra_ace_is_rejected(self):
+    def test_owner_plus_system_aces_are_accepted(self):
         output = (self._ace(r"DOMAIN\runneradmin")
-                  + b"\n                DOMAIN\\runneradmin:(F)")
+                  + b"\n                NT AUTHORITY\\SYSTEM:(F)"
+                  + b"\n                BUILTIN\\Administrators:(F)")
+        self.assertTrue(self._run(output))
+
+    def test_extra_foreign_ace_is_rejected(self):
+        output = (self._ace(r"DOMAIN\runneradmin")
+                  + b"\n                Everyone:(F)")
         self.assertFalse(self._run(output))
 
 
@@ -145,8 +151,11 @@ class ProjectMapPortabilityTests(unittest.TestCase):
 
     def test_store_survives_missing_os_fchmod(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # os.fchmod does not exist at all on Windows Python 3.9, so the
+            # patch must create the attribute before making it fail.
             with mock.patch.object(project_map.os, "fchmod",
-                                   side_effect=AttributeError("no fchmod")):
+                                   side_effect=AttributeError("no fchmod"),
+                                   create=True):
                 ok = project_map._store(
                     tmp, os.path.join(tmp, "state"),
                     {"sha256": "x"}, "# Map\n")
@@ -186,6 +195,7 @@ class SandboxWindowsUnitTests(unittest.TestCase):
     def test_create_process_does_not_use_create_no_window(self):
         flags = sw._process_flags()
         self.assertFalse(flags & sw.CREATE_NO_WINDOW)
+        self.assertTrue(flags & sw.DETACHED_PROCESS)
         self.assertTrue(flags & sw.CREATE_SUSPENDED)
         self.assertTrue(flags & sw.EXTENDED_STARTUPINFO_PRESENT)
 
@@ -201,7 +211,10 @@ class SandboxWindowsUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = sw.canonical_root(tmp, api)
             self.assertTrue(os.path.isdir(root))
-            self.assertEqual(root, os.path.normcase(os.path.realpath(tmp)))
+            # Case is preserved on return; only the containment comparison
+            # is normcased.
+            self.assertEqual(os.path.normcase(root),
+                             os.path.normcase(os.path.realpath(tmp)))
 
 
 class StdoutPumpTests(unittest.TestCase):

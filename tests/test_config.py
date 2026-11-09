@@ -81,12 +81,19 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_paths_are_expanded(self):
         cfg = load_config(config_path=self.config_path, env={})
-        self.assertSamePath(cfg.log_dir, os.path.expanduser("~/DeepSeek-MCP/runs"))
-        self.assertSamePath(cfg.jobs_dir, os.path.expanduser("~/DeepSeek-MCP/jobs"))
-        self.assertSamePath(
-            cfg.harness_workspace,
-            os.path.expanduser("~/DeepSeek-MCP/harness-workspace"))
-        self.assertSamePath(cfg.state_dir, os.path.expanduser("~/DeepSeek-MCP/state"))
+        # The product keeps the historical ~/DeepSeek-MCP root on POSIX but
+        # uses %LOCALAPPDATA%\DeepSeek-MCP on Windows (config._default_root).
+        if os.name == "nt":
+            root = os.path.join(
+                os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                "DeepSeek-MCP")
+        else:
+            root = os.path.expanduser("~/DeepSeek-MCP")
+        self.assertSamePath(cfg.log_dir, os.path.join(root, "runs"))
+        self.assertSamePath(cfg.jobs_dir, os.path.join(root, "jobs"))
+        self.assertSamePath(cfg.harness_workspace,
+                             os.path.join(root, "harness-workspace"))
+        self.assertSamePath(cfg.state_dir, os.path.join(root, "state"))
         self.assertFalse(str(cfg.log_dir).startswith("~"))
 
     def test_path_expansion(self):

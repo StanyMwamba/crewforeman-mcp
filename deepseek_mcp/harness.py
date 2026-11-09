@@ -118,6 +118,14 @@ class _StdoutPump:
                         continue
         finally:
             self._eof.set()
+            # The pump owns the pipe once started: close it here, after the
+            # blocking read has returned, never from the waiting thread (a
+            # close racing a pending Windows read can wait for the grandchild
+            # that inherited the write end).
+            try:
+                self._stream.close()
+            except Exception:
+                pass
 
     def read(self, timeout):
         """Return bytes, ``b""`` at EOF, or ``None`` when idle."""
@@ -2550,11 +2558,13 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
     usage, cost = _sdk_usage_cost(cfg, result.get("usage") or {},
                                   label=label)
     try:
+        # as_posix(): records and PLAN matching use POSIX relative paths on
+        # every host; str(Path) would leak backslashes on Windows.
         outputs = sorted(
-            str(path.relative_to(workspace))
+            path.relative_to(workspace).as_posix()
             for path in workspace.rglob("*")
             if path.is_file() and path.stat().st_mtime >= started - output_slack
-            and not _noise_output(str(path.relative_to(workspace)))
+            and not _noise_output(path.relative_to(workspace).as_posix())
         )[:100]
     except Exception:
         outputs = []
@@ -3048,11 +3058,14 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         except Exception:
             code = proc.poll()
         if pump is not None:
+            # The daemon reader owns proc.stdout; closing it here can block
+            # until a grandchild that inherited the write end exits.
             pump.close()
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+        else:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
         try:
             errfile.seek(0)
             stderr_text = errfile.read().decode("utf-8", "replace")
@@ -3132,11 +3145,13 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         stop_reason = "time_limit" if reason == "timeout" else reason
 
     try:
+        # as_posix(): records and PLAN matching use POSIX relative paths on
+        # every host; str(Path) would leak backslashes on Windows.
         outputs = sorted(
-            str(path.relative_to(workspace))
+            path.relative_to(workspace).as_posix()
             for path in workspace.rglob("*")
             if path.is_file() and path.stat().st_mtime >= started - output_slack
-            and not _noise_output(str(path.relative_to(workspace)))
+            and not _noise_output(path.relative_to(workspace).as_posix())
         )[:100]
     except Exception:
         outputs = []

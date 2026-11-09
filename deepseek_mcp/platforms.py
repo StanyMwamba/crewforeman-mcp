@@ -505,6 +505,36 @@ def _windows_whoami_trustees():
             if "\\" in line.strip()}
 
 
+#: Trustees that are part of the normal Windows DACL for a file created by an
+#: elevated process.  They are trusted system principals, not ordinary users;
+#: their presence does not make the file readable by other accounts.
+_WINDOWS_TRUSTED_ACE_TRUSTEES = (
+    "nt authority\\system",
+    "builtin\\administrators",
+    "nt authority\\local service",
+    "nt authority\\network service",
+    "creator owner",
+    "creator group",
+    "owner rights",
+)
+
+
+def _windows_acl_is_private(aces, names):
+    """True when one explicit F ACE names *names* and the rest are trusted."""
+    owner_full = False
+    for line in aces:
+        folded = line.casefold()
+        if any(("%s:(" % name) in folded for name in names):
+            if not folded.endswith("(f)"):
+                return False
+            owner_full = True
+            continue
+        if not any(("%s:" % trusted) in folded
+                   for trusted in _WINDOWS_TRUSTED_ACE_TRUSTEES):
+            return False
+    return owner_full
+
+
 def _windows_private_acl(path, is_dir):
     sid = _windows_user_sid()
     binary = _icacls_binary()
@@ -526,36 +556,24 @@ def _windows_private_acl(path, is_dir):
             return False
         # icacls renders a trustee as DOMAIN\user, not as S-1-5-...; the old
         # ``sid in output`` test therefore always failed on a normal runner.
-        # Accept exactly one explicit full-control ACE and verify its trustee
-        # is this user: the grant above used ``*SID:F``, so any other trustee
-        # (including a foreign account that somehow inherited in) is a failed
-        # read-back.  Parsing the display path is safe because we pass the
-        # exact path to icacls and only strip that known prefix.
+        # A file created in a hosted temp directory can also carry explicit
+        # SYSTEM/Administrators ACEs from the creator's default DACL, so a
+        # single-ACE test is too strict.  Accept the current user's full-control
+        # ACE plus only well-known system principals; any other trustee
+        # (Everyone, Users, a foreign account) fails the read-back.  Inherited
+        # or inherit-only ACEs mean /inheritance:r did not take effect.
         aces = [line.strip() for line in output.splitlines()
-                if line.strip().endswith(")")]
-        if len(aces) != 1 or "(I)" in aces[0] or not aces[0].endswith("(F)"):
+                if line.strip().endswith(")") and ":(" in line]
+        if not aces or any("(I)" in line for line in aces):
             return False
-        line = aces[0]
-        marker = line.rfind(":(")
-        if marker <= 0:
-            return False
-        left = line[:marker].strip()
-        path_text = str(path)
-        if left.casefold().startswith(path_text.casefold()):
-            trustee = left[len(path_text):].strip()
-        else:
-            # icacls may normalise the displayed path (short 8.3 name, a
-            # trailing separator).  In that case keep the whole left side and
-            # require it to be exactly a known trustee; any leftover path text
-            # makes the check fail closed.
-            trustee = left
-        if not trustee:
-            return False
-        folded = trustee.casefold()
         expected = _windows_trustees(sid)
-        if folded in expected:
+        if _windows_acl_is_private(aces, expected):
             return True
-        return folded in _windows_whoami_trustees()
+        # The account name can differ from the environment spelling (renamed
+        # account, Microsoft/AzureAD alias); one SID-bound whoami lookup
+        # covers that case, then re-check.
+        return _windows_acl_is_private(
+            aces, expected | _windows_whoami_trustees())
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
 

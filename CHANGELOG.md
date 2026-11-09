@@ -5,6 +5,38 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.5
+
+3.13.5: Windows CI follow-up fixes (proof pending the next windows-2025 run)
+
+- **Windows ACL read-back.** A file created in a hosted temp directory can
+  carry explicit `SYSTEM`/`Administrators` ACEs from the creator's default
+  DACL, so requiring exactly one ACE rejected valid credential files. The
+  read-back now requires one explicit full-control ACE for the current account
+  (name or SID, plus a `whoami` alias fallback) and accepts only well-known
+  system principals alongside it; `Everyone`, `Users`, a foreign trustee, an
+  inherited ACE, or a non-full-control owner ACE still fails closed.
+- **Case-preserving sandbox roots.** `sandbox_windows.canonical_root` now
+  returns the on-disk spelling and normcases only the containment comparison,
+  so ACL restore callbacks and records no longer get a lower-cased workspace.
+- **POSIX output paths.** `run["output_files"]` uses `Path.as_posix()` on every
+  host instead of leaking backslashes on Windows.
+- **Restricted child console.** 3.13.4 hid the console with
+  `SW_HIDE` but still allocated one; the py3.15 boundary child still exited
+  `0xC0000142` (`STATUS_DLL_INIT_FAILED`) before Python ran. The child is now
+  created with `DETACHED_PROCESS`, so conhost/desktop-heap initialization is
+  avoided; standard handles still come from `STARTF_USESTDHANDLES`. The
+  boundary assertions are unchanged.
+- **Windows test fixes.** The default-path assertion uses the product's
+  `%LOCALAPPDATA%\DeepSeek-MCP` root on Windows; the missing-`os.fchmod` mock
+  creates the attribute Python 3.9 does not have; the stdout pump closes its
+  own pipe so a normal run does not wait for a grandchild that inherited the
+  write end.
+- **Evidence.** Run 42669314081 (3.13.4) cut the Windows failures from 194 ids
+  to 11 (py3.9) and 16 (py3.15); its boundary passed on py3.9 and still hit
+  `0xC0000142` on py3.15. The next `windows-2025` run is the required
+  evidence; no Windows suite or boundary claim is made before it.
+
 ## 3.13.4
 
 3.13.4: Windows test-suite portability fixes (proof pending the next windows-2025 run)
