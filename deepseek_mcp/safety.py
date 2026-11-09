@@ -266,15 +266,23 @@ def _windows_status(cfg):
     except Exception as exc:
         probe = {"ok": False, "reason": "launcher import failed: %s"
                  % exc.__class__.__name__}
+    diag_keys = ("admin", "admin_elevated", "admin_member", "admin_source",
+                 "admin_error", "admin_member_error", "restricting_sid",
+                 "logon_sid", "write_restricted", "step", "error")
+    diag = {key: probe.get(key) for key in diag_keys if key in probe}
     if probe.get("ok"):
-        return {"kind": "windows-write-restricted", "reason": None,
-                "enforcement": "enforced", "abi": "write-restricted",
-                "tested": True, "min_abi": None,
-                "admin": bool(probe.get("admin")),
-                "restricting_sid": probe.get("restricting_sid")}
-    return {"kind": "none", "reason": probe.get("reason") or "windows_unavailable",
-            "enforcement": "none", "abi": None, "tested": False,
-            "min_abi": None}
+        status = {"kind": "windows-write-restricted", "reason": None,
+                  "enforcement": "enforced", "abi": "write-restricted",
+                  "tested": True, "min_abi": None}
+        status.update(diag)
+        status["admin"] = bool(probe.get("admin"))
+        return status
+    status = {"kind": "none",
+              "reason": probe.get("reason") or "windows_unavailable",
+              "enforcement": "none", "abi": None, "tested": False,
+              "min_abi": None}
+    status.update(diag)
+    return status
 
 
 def _status_for(system, cfg=None):
@@ -362,7 +370,10 @@ def sandbox_status(force=False, cfg=None, system=None):
                                      else "unverified")),
             "network": "unrestricted",
         }
-        for key in ("min_abi", "admin", "restricting_sid"):
+        for key in ("min_abi", "admin", "admin_elevated", "admin_member",
+                    "admin_source", "admin_error", "admin_member_error",
+                    "restricting_sid", "logon_sid", "write_restricted",
+                    "step", "error"):
             if key in detail:
                 status[key] = detail[key]
         status["sandbox_header"] = _sandbox_header(status)

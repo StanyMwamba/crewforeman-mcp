@@ -1,8 +1,8 @@
-# Known limitations and failure modes (3.13.2)
+# Known limitations and failure modes (3.13.3)
 
 Only limitations that remain in this version are listed here.
 
-## Platform boundaries (3.13.2)
+## Platform boundaries (3.13.3)
 
 Every sentence below is tied to the boundary evidence for that OS. If a gate is
 red, or a claim has not been run yet, the claim is narrowed, never widened.
@@ -21,18 +21,24 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
   not claim the truncate protection it cannot provide. Network access is not
   restricted.
 - **Windows:** CrewForeman runs builders with a write-restricted token and an
-  ACE for the restricting SID on the workspace and its temp directory. Windows
-  CI runs the unit suite and the real boundary suite on the GitHub-hosted
-  `windows-2025` x64 runner; the runner user is an Administrator, so the job
-  exercises the boundary under an elevated token, not a standard user. The suite
-  requires create, modify, append and truncate denials outside the workspace;
-  delete and rename outside are recorded and remain `delete_outside=unverified`
-  unless a run proves them. The standard-user path is not proven by this job:
-  the user's Windows 11 arm64 VM run (WINDOWS_TEST.md in the VM test package)
-  remains the only standard-user evidence, and it must be re-run after this
-  change. No no-admin
-  claim is made. Network and UNC writes are
-  not blocked.
+  ACE for the restricting SID on the workspace and its temp directory. The
+  first real `windows-2025` run (GitHub run 42629362611, 3.13.2) failed in the
+  sandbox probe with `AttributeError`, `logon_sid=None`, `admin=False` and
+  `usable=false`; CI stopped with "no enforced OS sandbox on this host" before
+  the suite or the boundary. 3.13.3 fixes the probe and makes its detail name
+  the failing step, exception class and message. The runner account
+  (`runneradmin`) is an Administrators member, but the failed probe's
+  `admin=False` was produced before a reliable elevation check and is not
+  evidence that the token is unelevated; 3.13.3 records `admin` (process-token
+  elevation) and `admin_member` (account group) separately. The next GitHub run
+  is the only Windows proof; until it is green no Windows boundary is claimed.
+  If that run reaches the boundary, the suite requires create, modify, append
+  and truncate denials outside the workspace; delete and rename outside are
+  recorded and stay `delete_outside=unverified` unless the run proves them. The
+  standard-user path is not proven by CI: the user's Windows 11 arm64 VM run
+  (WINDOWS_TEST.md in the VM test package) remains the only standard-user
+  evidence, and it must be re-run after this change. No no-admin claim is made.
+  Network and UNC writes are not blocked.
 - **When no boundary is available:** `os_sandbox=require` refuses to start the
   builder. `os_sandbox=auto` starts it only with `degraded=true`, and the run
   header prints `UNSANDBOXED`. A run record never reports `enforcement=enforced`
@@ -52,7 +58,7 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
 | --- | --- | --- |
 | Packaging | `pip install .` uses a small in-tree PEP 517 backend so it works offline; that backend does not implement editable installs (PEP 660). | Install into a venv with `pip install .`, or run `python -m deepseek_mcp` from the repository root for a source-linked development loop. |
 | Sandbox | The OS boundary is a file-write boundary only, and it differs per platform: macOS Seatbelt, Linux Landlock at ABI 3 or newer, Windows write-restricted token. ABI 1-2 Linux and hosts without a usable wrapper run degraded or `UNSANDBOXED`, never as an enforced boundary. | Read the run's `os_sandbox` object and header, and the per-OS limits below. Review the workspace before accepting output. |
-| Windows | Windows CI runs the unit suites and the real write-restricted boundary on the GitHub-hosted `windows-2025` x64 runner. That runner's user is an Administrator, so the job does not prove the standard-user path; that path remains established only by the user's Windows 11 VM run, which must be re-run after this change. The token blocks file writes only; network and UNC writes are not blocked. Create/modify/append/truncate denials are required by the boundary suite; delete/rename outside is recorded and stays `delete_outside=unverified` unless a run proves it. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
+| Windows | The first real `windows-2025` run (42629362611) failed in the sandbox probe before the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`); 3.13.3 fixes it and the next GitHub run is the only Windows proof. The runner account is an Administrators member, but the failed probe's elevation value is not evidence; `admin` (token elevation) and `admin_member` (account group) are recorded separately. Once the boundary runs, create/modify/append/truncate denials outside the workspace are required; delete/rename outside is recorded and stays `delete_outside=unverified` unless the run proves it. The token blocks file writes only; network and UNC writes are not blocked. The standard-user path is still established only by the user's Windows 11 VM run. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
 | Resume | Resume can only continue from a checkpoint boundary. Work done by a DSH process killed mid-tool-call is repeated. | Skeleton and checkpoints are written before each phase; finished revisions are reused. |
 | Live scaling | The candidate score is a deterministic heuristic, not a model review. It can misjudge unusually formatted output. | Threshold, max extra waves and the whole-job budget are configurable; set `live_scaling=false` to disable. |
 | Reviewer | The reviewer is a fresh Harness process; `reviewer_model`/`reviewers` can put it on another vendor, but a legacy `dsh_bin` wrapper that does not set a vendor label is fail-closed and pauses once. | Configure `reviewers` (see `docs/REVIEWER.md`); the same-vendor question is explicit and labelled. |

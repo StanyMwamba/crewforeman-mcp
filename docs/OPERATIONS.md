@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.13.2)
+# Operations: configuration, safety, budgets, traces and retention (v3.13.3)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -560,7 +560,7 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-### OS sandbox modes and config keys (3.13.2)
+### OS sandbox modes and config keys (3.13.3)
 
 `os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
 `true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
@@ -574,7 +574,7 @@ boundary. `off` records `enforcement=none` and does not claim a boundary.
 | `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
 | `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
 | `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
-| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.2 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.3 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
 | `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
 | `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
 | `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
@@ -594,18 +594,21 @@ Linux the launcher applies a Landlock ruleset to itself and then `exec`s `dsh`
 launcher creates a write-restricted token, grants an ACE for the restricting SID
 on the workspace and temp roots, and starts `dsh` in a kill-on-close Job Object;
 network and UNC writes are not blocked, and delete/rename outside is reported as
-`delete_outside=unverified` unless a Windows boundary run proves it. Windows CI
-runs the real boundary on the GitHub-hosted `windows-2025` runner, whose user is
-an Administrator; that exercises the elevated-token boundary, not the
-standard-user one. This is a file-write boundary, not a container, VM, network firewall or
-malware sandbox.
+`delete_outside=unverified` unless a Windows boundary run proves it. The first
+real `windows-2025` run (42629362611, 3.13.2) failed in the sandbox probe before
+the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`,
+`usable=false`). 3.13.3 fixes the wrong-DLL bindings, and the next GitHub run is
+the only Windows proof. The runner account is an Administrators member, but that
+is not the same as an elevated process token; the probe records `admin` (token
+elevation) and `admin_member` (account group) separately. This is a file-write
+boundary, not a container, VM, network firewall or malware sandbox.
 
 The child environment is scrubbed: only `DEEPSEEK_API_KEY` and the key
 variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
-### Restart per OS (3.13.2)
+### Restart per OS (3.13.3)
 
 Restart is best-effort and OS-specific; the status file records `state`,
 `verified_by`, `error` and the resolved opener. macOS closes/reopens with
@@ -915,9 +918,11 @@ translated and exit codes surface directly. It runs the same checks: hygiene,
 package install, the test-only fake `dsh`, the sandbox probe, the full suite
 with `unittest discover -s tests -q`, and `tests.test_sandbox_boundary` with
 `CF_REQUIRE_REAL_SANDBOX=1`, so a skipped real boundary is a failure. The
-GitHub-hosted `windows-2025` runner is x64 and UTC and runs as an
-Administrator; the boundary step therefore runs the write-restricted token
-under an elevated account, not a standard user.
+GitHub-hosted `windows-2025` runner is x64 and UTC. Its account is an
+Administrators member, but 3.13.2's first real run failed in the probe before
+it could establish elevation; the probe now records `admin` (token elevation)
+and `admin_member` (account group) separately, and the next run is the only
+Windows proof.
 
 The gate stays timezone-independent: authority timestamps are persisted as UTC
 ISO 8601 (`+00:00`), and the suite passes with `TZ=UTC` (what GitHub runners
@@ -925,12 +930,14 @@ use) and under any local zone. Both actions are pinned by commit SHA,
 permissions are `contents: read`, and the workflow uses no secrets and no
 `pull_request_target`.
 
-The admin-runner caveat is stated rather than hidden: the `windows-2025`
-boundary step requires create/modify/append/truncate denials under an
-Administrator token. The standard-user path is not proven by this job: the user's Windows 11
-arm64 VM run remains the only standard-user evidence and must be re-run after
-this change. Delete/rename outside remains `delete_outside=unverified` unless a
-run proves it, and CI makes no no-admin claim.
+The admin-runner caveat is stated rather than hidden: the first
+`windows-2025` run (42629362611) failed in the probe, so its `admin=False` was
+not a measured elevation result and no boundary evidence exists yet. 3.13.3
+records token elevation and Administrators-group membership separately; the
+next GitHub run is the only Windows proof. Until it is green, no
+create/modify/append/truncate denial is claimed, delete/rename outside stays
+`delete_outside=unverified`, and CI makes no no-admin claim. The standard-user
+path remains established only by the user's Windows 11 arm64 VM run.
 
 ## Retention and permissions
 

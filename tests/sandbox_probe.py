@@ -84,20 +84,39 @@ def _windows():
                 "abi": None, "usable": False, "detail": "not Windows"}
     try:
         from deepseek_mcp import sandbox_windows
-        status = sandbox_windows.probe_status()
-        return {
-            "os": "win32", "mechanism": "windows-write-restricted",
-            "abi": None, "usable": bool(status.get("ok")),
-            "detail": "write_restricted=%s;logon_sid=%s;admin=%s;%s"
-                      % (status.get("write_restricted"),
-                         status.get("logon_sid"),
-                         status.get("admin"),
-                         status.get("reason") or "ok"),
-        }
     except Exception as exc:  # noqa: BLE001 - probe reports, never raises
         return {"os": "win32", "mechanism": "windows-write-restricted",
                 "abi": None, "usable": False,
-                "detail": "token probe failed: %s" % exc}
+                "detail": "step=import;error=%s: %s;reason=importerror"
+                          % (exc.__class__.__name__, exc)}
+    try:
+        status = sandbox_windows.probe_status()
+        detail = sandbox_windows.format_probe_detail(status)
+        return {
+            "os": "win32", "mechanism": "windows-write-restricted",
+            "abi": None, "usable": bool(status.get("ok")),
+            "detail": detail,
+        }
+    except Exception as exc:  # noqa: BLE001 - probe reports, never raises
+        # probe_status advertises "never raises"; this is the last-resort
+        # path.  Keep the class, message and step so a CI failure is
+        # diagnosable from one run.
+        formatter = getattr(sandbox_windows, "format_probe_detail", None)
+        if formatter is not None:
+            detail = formatter({
+                "write_restricted": False, "logon_sid": None,
+                "admin": False, "admin_member": None,
+                "admin_source": "unavailable", "step": "probe_status",
+                "error": {"type": exc.__class__.__name__,
+                          "message": str(exc)},
+                "reason": exc.__class__.__name__.lower()})
+        else:
+            detail = ("step=probe_status;error=%s: %s;reason=%s"
+                      % (exc.__class__.__name__, exc,
+                         exc.__class__.__name__.lower()))
+        return {"os": "win32", "mechanism": "windows-write-restricted",
+                "abi": None, "usable": False, "detail": detail}
+
 
 def probe():
     if sys.platform == "darwin":

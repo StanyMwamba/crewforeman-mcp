@@ -1,4 +1,4 @@
-# Installing crewforeman-mcp 3.13.2
+# Installing crewforeman-mcp 3.13.3
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime dependencies**.
 It ships a local MCP stdio server and five skill checklists (`code`, `data`,
@@ -38,7 +38,7 @@ Run these from the repository root (the directory containing `pyproject.toml`).
 `uvx crewforeman-mcp` resolves the package from the configured index;
 `uvx --from . crewforeman-mcp` runs a local checkout before it is published.
 Pin this release for a reproducible install with
-`uvx crewforeman-mcp==3.13.2`. After a `pipx` or `pip` install, both
+`uvx crewforeman-mcp==3.13.3`. After a `pipx` or `pip` install, both
 `crewforeman-mcp` and the shorter alias `deepseek-mcp` are on `PATH`.
 
 ### macOS
@@ -115,13 +115,17 @@ compiler or Visual C++ build tools are needed.
 
 The Windows file-write boundary uses a write-restricted token with an ACE on
 the workspace and temp directory. Run the connector and builders as a standard
-user; this is the tested path. CI now runs the Windows unit suite and the real
-boundary on the GitHub-hosted `windows-2025` x64 runner, whose user is an
-Administrator, so CI exercises the boundary only under an elevated token. The
-standard-user path is not proven by CI; run the Windows 11 VM script
-(WINDOWS_TEST.md in the VM test package) as a standard user to prove it, and
-make no no-admin claim without that run, and delete/rename outside remains `delete_outside=unverified`
-unless a boundary run proves it. UNC workspaces are
+user; this is the tested path. CI targets the GitHub-hosted `windows-2025` x64
+runner, whose account is an Administrators member. The first real run
+(42629362611) failed in the sandbox probe before the suite
+(`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`), so 3.13.3
+makes no Windows CI boundary claim: the next GitHub run is the only Windows
+proof. The probe records `admin` (token elevation) and `admin_member` (account
+group) separately. The standard-user path is not proven by CI; run the Windows
+11 VM script (WINDOWS_TEST.md in the VM test package) as a standard user to
+prove it, and make no no-admin claim without that run. Delete/rename outside
+remains `delete_outside=unverified` unless a boundary run proves it. UNC
+workspaces are
 unsupported (the ACL boundary is local-path only), and network/UNC writes are
 not blocked. `os_sandbox=require` refuses to start when the token or ACL cannot
 be created.
@@ -145,7 +149,7 @@ python -m deepseek_mcp --help
 python -m pip show -f crewforeman-mcp | grep crewforeman-mcp/skills
 ```
 
-Expected: the version prints `3.13.2`, each `--help` exits 0, and the file
+Expected: the version prints `3.13.3`, each `--help` exits 0, and the file
 listing shows the five `.md` skill files. On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
 If the files exist but a run says skills are missing, set `DSH_SKILLS_DIR` to
@@ -165,7 +169,7 @@ under `share/crewforeman-mcp/skills`. A source checkout is untouched. Delete
 
 ## Keys
 
-3.13.2 looks a provider key up by its variable **name**: first the connector's
+3.13.3 looks a provider key up by its variable **name**: first the connector's
 process environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). `config.json` lists variable names,
 never values.

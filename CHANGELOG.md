@@ -5,9 +5,57 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.3
+
+3.13.3: Windows sandbox probe fix (first real windows-2025 run)
+
+- **Wrong-DLL root cause.** The first real `windows-2025` run (42629362611)
+  failed in `tests/sandbox_probe.py` before any test ran:
+  `{"abi": null, "detail": "write_restricted=False;logon_sid=None;admin=False;attributeerror",
+  "mechanism": "windows-write-restricted", "os": "win32", "usable": false}`.
+  `sandbox_windows.WindowsAPI._configure` had bound `OpenProcessToken`,
+  `GetTokenInformation` and `CreateProcessAsUserW` on `kernel32`, which does not
+  export them, and `LocalFree` on `advapi32`, which does not export it. ctypes
+  raised `AttributeError` while building the facade, so no token, ACL or Job
+  Object call was ever reached. The four functions are now bound on
+  `advapi32`/`kernel32` as appropriate, and a missing export is reported as
+  `dll_symbol_missing:<dll>!<name>` instead of a bare class name.
+- **Diagnosable failures.** `probe_status` now keeps a structured
+  `step` plus `error={type,message}` for the probe, the admin check and the
+  restricted-token fallback; the probe's `detail` line prints the step,
+  exception class and sanitized message, and the launcher emits the same shape
+  as JSON on stderr. Home paths and secret-shaped values are redacted and the
+  message is capped. `ok` depends on a restricted token actually being created,
+  not on the optional `TokenLogonSid` fallback.
+- **Admin is independent.** Elevation (`admin`, TokenElevation) and
+  Administrators-group membership (`admin_member`, CheckTokenMembership) are
+  measured through their own token before the write-restriction probe, so a
+  later restriction failure cannot overwrite them. The runner account
+  `runneradmin` is an Administrators member; the failed 3.13.2 probe's
+  `admin=False` was not a reliable elevation measurement, and 3.13.3 does not
+  treat it as one.
+- **Host-independent tests.** New tests load `sandbox_windows` with a fake
+  `ctypes.WinDLL` whose curated export table distinguishes `kernel32` from
+  `advapi32`, check every referenced `ctypes.wintypes` name against CPython's
+  real `ctypes.wintypes.__dict__`, and require a structured
+  class/message/step error from both the probe and the launcher. They run on
+  macOS and Linux, where no Windows DLL exists.
+- **No premature Windows claim.** The next `windows-2025` run is the only
+  Windows proof. The restricted-token launch, the workspace/temp ACE grant, the
+  MSVC-built fake `dsh` and the kill-on-close Job Object remain unproven until
+  that run. The docs and the workflow comment say so; the standard-user path is
+  still established only by the user's Windows 11 VM run.
+- **Version 3.13.3.** Version bumped in `pyproject.toml`, the package,
+  `config.SERVER_VERSION`, `observability.SERVICE_VERSION`, the smoke client and
+  the docs. README changes only its version line.
+
 ## 3.13.2
 
 3.13.2: Windows CI (windows-2025, Python 3.9 and 3.15)
+
+> Historical note: the first real `windows-2025` run (42629362611) never
+> reached the boundary described here; it failed in the sandbox probe. The
+> probe fix and the corrected account-vs-token wording are in 3.13.3.
 
 - **Windows CI lane.** The matrix is now three OSes — `macos-latest`,
   `ubuntu-24.04` and `windows-2025` — each on Python 3.9 (the supported floor)

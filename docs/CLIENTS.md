@@ -1,6 +1,6 @@
 # Connecting MCP clients
 
-`crewforeman-mcp` 3.13.2 is a local **stdio** MCP server. The client starts the
+`crewforeman-mcp` 3.13.3 is a local **stdio** MCP server. The client starts the
 process and speaks newline-delimited JSON-RPC 2.0 over stdin/stdout; there is no
 network listener.
 
@@ -13,7 +13,7 @@ Placeholders in the snippets:
 - `YOUR_ANTHROPIC_API_KEY`, `YOUR_MOONSHOT_API_KEY` (or `YOUR_KIMI_API_KEY`) -
   optional, only for those vendors.
 
-3.13.2 looks each key up by variable **name**: first the connector's process
+3.13.3 looks each key up by variable **name**: first the connector's process
 environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). If your jobs run through the Harness,
 its credentials file normally already holds the keys, so the `env` entries in
@@ -23,14 +23,14 @@ shared config file. Model selection is covered in [INSTALL.md](INSTALL.md).
 
 ## Native command
 
-3.13.2 installs the `crewforeman-mcp` console script and the shorter alias
+3.13.3 installs the `crewforeman-mcp` console script and the shorter alias
 `deepseek-mcp`. Check the command before configuring a client:
 
 ```bash
 /path/to/crewforeman-mcp --version
 ```
 
-It prints `crewforeman-mcp 3.13.2`. If that fails, fix the install first
+It prints `crewforeman-mcp 3.13.3`. If that fails, fix the install first
 (see [INSTALL.md](INSTALL.md)); a client snippet cannot repair a missing
 executable. A client that accepts the common `mcpServers` shape can use this
 minimal entry:
@@ -73,7 +73,7 @@ is required for a local server.
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
 `MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
-entries because 3.13.2 reads the names from the Harness credentials file.
+entries because 3.13.3 reads the names from the Harness credentials file.
 
 **Confirm.** Open **Customize** in the sidebar and check the `crewforeman-mcp`
 toggle; its tools appear under **Available Tools**. Startup errors are in
@@ -107,7 +107,7 @@ than constructing one. `type: "stdio"` is required.
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
 `MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
-entries because 3.13.2 reads the names from the Harness credentials file.
+entries because 3.13.3 reads the names from the Harness credentials file.
 
 **Confirm.** Run **MCP: List Servers**: the server appears with start, restart
 and **Show Output** actions. **MCP: Show Installed Servers** confirms it is
@@ -145,7 +145,7 @@ file if it does not exist. Use a top-level `mcpServers` object.
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
 `MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
-entries because 3.13.2 reads the names from the Harness credentials file.
+entries because 3.13.3 reads the names from the Harness credentials file.
 
 **Confirm.** Fully quit and reopen Claude Desktop, then click the **+** button
 at the bottom of the chat box and open **Connectors** (or **Manage
@@ -192,7 +192,7 @@ after it is passed to the server. Keep at least one other option between
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `env` object (or pass `--env`); add
 `ANTHROPIC_API_KEY` or `MOONSHOT_API_KEY` only if those vendors are used.
-Harness users can omit these entries because 3.13.2 reads the names from the
+Harness users can omit these entries because 3.13.3 reads the names from the
 Harness credentials file. Claude Code also expands `${VAR}` in `.mcp.json`, so
 `${DEEPSEEK_API_KEY}` is an alternative to the literal placeholder.
 
@@ -234,7 +234,7 @@ codex mcp add crewforeman-mcp \
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `.env` table (or pass `--env`); add
 `ANTHROPIC_API_KEY` or `MOONSHOT_API_KEY` only if those vendors are used.
-Harness users can omit these entries because 3.13.2 reads the names from the
+Harness users can omit these entries because 3.13.3 reads the names from the
 Harness credentials file. `env_vars = ["DEEPSEEK_API_KEY"]` forwards a variable
 from Codex's own environment instead of writing a literal value.
 

@@ -115,20 +115,27 @@ class WindowsBoundaryTests(unittest.TestCase):
         # is report-only: a 0 result is recorded and never turned into a claim.
         try:
             from deepseek_mcp import sandbox_windows
-            admin = bool(sandbox_windows.probe_status().get("admin"))
+            probe = sandbox_windows.probe_status()
+            # Elevation and account membership are different facts.  A
+            # success is report-only here either way: it is never turned into
+            # a protection claim.
+            report_only = bool(probe.get("admin")
+                               or probe.get("admin_member"))
         except Exception:
-            admin = False
+            report_only = False
         rename_target = os.path.join(self.outside, "rename-me.txt")
         _write(rename_target)
         rename = self._child("rename", rename_target)
         delete_target = os.path.join(self.outside, "delete-me.txt")
         _write(delete_target)
         delete = self._child("delete", delete_target)
-        allowed = (0, 3, 4) if admin else (3, 4)
+        allowed = (0, 3, 4) if report_only else (3, 4)
         self.assertIn(rename.returncode, allowed,
-                      "rename outside result recorded (admin=%s)" % admin)
+                      "rename outside result recorded (report_only=%s)"
+                      % report_only)
         self.assertIn(delete.returncode, allowed,
-                      "delete outside result recorded (admin=%s)" % admin)
+                      "delete outside result recorded (report_only=%s)"
+                      % report_only)
 
 
 if __name__ == "__main__":
@@ -154,9 +161,10 @@ def run_boundary(tc):
     from deepseek_mcp import safety
     try:
         from deepseek_mcp import sandbox_windows
-        admin = bool(sandbox_windows.probe_status().get("admin"))
+        probe = sandbox_windows.probe_status()
+        report_only = bool(probe.get("admin") or probe.get("admin_member"))
     except Exception:
-        admin = False
+        report_only = False
     policy = {
         "os_sandbox": True, "os_sandbox_mode": "require",
         "sandbox": "workspace-write", "sandbox_canary": "off",
@@ -210,16 +218,18 @@ def run_boundary(tc):
                 tc.assertEqual(proc.returncode, 3,
                                "outside %s denied: %s"
                                % (op, proc.stderr.decode("utf-8", "replace")))
-            elif admin:
+            elif report_only:
                 tc.assertIn(proc.returncode, (0, 3, 4),
                             "outside %s result recorded" % op)
                 if proc.returncode == 0:
-                    print("report-only (admin runner): outside %s was not "
-                          "denied; delete_outside stays unverified" % op)
+                    print("report-only (administrator account): outside %s "
+                          "was not denied; delete_outside stays unverified"
+                          % op)
             else:
                 tc.assertIn(proc.returncode, (3, 4),
                             "outside %s result recorded" % op)
-            if op in ("create", "modify", "append", "truncate") or not admin:
+            if (op in ("create", "modify", "append", "truncate")
+                    or not report_only):
                 after = (open(target, "rb").read()
                          if os.path.exists(target) else None)
                 tc.assertEqual(after, before, "outside %s changed bytes" % op)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -32,6 +33,8 @@ EXIT_TIMEOUT = 124
 TOKEN_ASSIGN_PRIMARY = 0x0001
 TOKEN_DUPLICATE = 0x0002
 TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_DEFAULT = 0x0080
+TOKEN_ADJUST_SESSIONID = 0x0100
 TOKEN_LOGON_SID = 19
 TOKEN_ELEVATION = 20
 
@@ -72,24 +75,45 @@ WAIT_FAILED = 0xFFFFFFFF
 INFINITE = 0xFFFFFFFF
 
 _LAST_RESULT = {}
+_STAGE = {"name": "launcher"}
+
+
+def _stage(name):
+    _STAGE["name"] = str(name or "launcher")
 
 
 # ---------------------------------------------------------------------------
 # errors / small helpers
 
 
-class SandboxError(Exception):
-    """Internal failure carrying the launcher exit code and a safe reason."""
+_DIAG_LIMIT = 300
+_SECRET_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)"
+    r"(\s*[:=]\s*)([^\s;,]+)")
+_FORBIDDEN_KEYS = frozenset({
+    "env", "environ", "environment", "cmdline", "command_line",
+    "password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
+    "authorization", "credential", "credentials",
+})
 
-    def __init__(self, exit_code, reason):
+
+class SandboxError(Exception):
+    """Internal failure carrying exit code, safe reason, step and cause."""
+
+    def __init__(self, exit_code, reason, step=None, cause=None,
+                 fallback_step=None, fallback_cause=None):
         super().__init__(reason)
         self.exit_code = int(exit_code)
         self.reason = str(reason)
+        self.step = str(step or "apply")
+        self.cause = cause
+        self.fallback_step = fallback_step
+        self.fallback_cause = fallback_cause
 
 
 class PolicyError(SandboxError):
-    def __init__(self, reason):
-        super().__init__(EXIT_APPLY_FAILED, reason)
+    def __init__(self, reason, step="policy"):
+        super().__init__(EXIT_APPLY_FAILED, reason, step=step)
 
 
 def _is_windows():
@@ -114,12 +138,26 @@ def _is_unc(path):
 
 
 def _win_error(rc, name):
-    try:
-        err = ctypes.get_last_error() or int(rc)
-    except Exception:
-        err = int(rc)
-    exc = OSError(int(rc), "%s failed" % name)
+    """Build an OSError carrying the real Win32 error code.
+
+    BOOL-returning APIs pass ``rc=0`` and the code comes from the thread's
+    LastError (all DLLs are opened with ``use_last_error=True``).  APIs such
+    as GetNamedSecurityInfoW, SetEntriesInAclW and SetNamedSecurityInfoW
+    return the error code and leave LastError undefined, so a non-zero ``rc``
+    always wins.
+    """
+    rc = int(rc or 0)
+    if rc:
+        err = rc
+    else:
+        getter = getattr(ctypes, "get_last_error", None)
+        try:
+            err = int(getter() or 0) if getter else 0
+        except Exception:
+            err = 0
+    exc = OSError(err or rc, "%s failed (winerror=%s)" % (name, err))
     exc.winerror = err
+    exc.function = name
     return exc
 
 
@@ -132,6 +170,62 @@ def _access_denied(exc):
     return "access is denied" in str(exc).lower()
 
 
+def _one_line(text, limit=_DIAG_LIMIT):
+    text = str(text or "").replace("\x00", "")
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:max(0, limit - 3)] + "..."
+
+
+def _home_prefixes():
+    roots = []
+    for raw in (os.path.expanduser("~"), os.environ.get("USERPROFILE"),
+                os.environ.get("HOME")):
+        if not raw:
+            continue
+        try:
+            real = os.path.realpath(raw)
+        except Exception:
+            real = raw
+        for prefix in (raw, real):
+            prefix = str(prefix or "").rstrip("\\/")
+            if len(prefix) >= 4 and prefix not in roots:
+                roots.append(prefix)
+    roots.sort(key=len, reverse=True)
+    return roots
+
+
+def _safe_text(text, limit=_DIAG_LIMIT):
+    """Single-line, home-redacted, secret-redacted, length-capped text."""
+    out = _one_line(text, limit=limit * 4)
+    for prefix in _home_prefixes():
+        out = out.replace(prefix, "~")
+        out = out.replace(prefix.replace("\\", "/"), "~")
+    out = _SECRET_RE.sub(r"\1\2<redacted>", out)
+    out = " ".join(out.split())
+    return out if len(out) <= limit else out[:max(0, limit - 3)] + "..."
+
+
+def _safe_message(exc, limit=_DIAG_LIMIT):
+    if exc is None:
+        return "unknown failure"
+    try:
+        text = str(exc)
+    except Exception:
+        text = ""
+    return _safe_text(text or exc.__class__.__name__, limit=limit)
+
+
+def _safe_value(value):
+    if isinstance(value, str):
+        return _safe_text(value)
+    if isinstance(value, dict):
+        return {str(key): _safe_value(item) for key, item in value.items()
+                if str(key).lower() not in _FORBIDDEN_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [_safe_value(item) for item in value]
+    return value
+
+
 def _reason(exc):
     if isinstance(exc, SandboxError):
         return exc.reason
@@ -142,14 +236,64 @@ def _reason(exc):
         return "access_denied"
     if winerror == 87:
         return "invalid_parameter"
+    if winerror == 122:
+        return "insufficient_buffer"
+    if winerror == 1326:
+        return "logon_failure"
     return exc.__class__.__name__.lower() or "windows_api_error"
 
 
-def _emit(code, reason, **extra):
-    payload = {"code": int(code), "reason": str(reason)}
-    payload.update(extra)
+def _error(exc):
+    """Public {type,message} shape, unwrapping a SandboxError cause."""
+    cause = exc
+    if isinstance(exc, SandboxError) and exc.cause is not None:
+        cause = exc.cause
+    if cause is None:
+        return {"type": "LauncherError", "message": "unknown failure"}
+    return {"type": cause.__class__.__name__,
+            "message": _safe_message(cause)}
+
+
+def _diag(step, exc=None, reason=None, message=None, **extra):
+    """Build {step, reason, error:{type,message}} without leaking detail."""
+    if reason is None:
+        reason = _reason(exc) if exc is not None else "unknown"
+    error = {"type": exc.__class__.__name__ if exc is not None
+             else "LauncherError",
+             "message": (_safe_message(exc) if exc is not None
+                         else _safe_text(message or reason))}
+    diag = {"step": _one_line(step) or "unknown",
+            "reason": _one_line(reason) or "unknown",
+            "error": error}
+    winerror = getattr(exc, "winerror", None) if exc is not None else None
+    if winerror is not None:
+        diag["winerror"] = int(winerror)
+    for key, value in extra.items():
+        if value is not None:
+            diag[key] = _safe_value(value)
+    return diag
+
+
+def _emit(code, reason, step=None, error=None, **extra):
+    """Write exactly one JSON diagnostic line; never a traceback or env dump."""
+    if isinstance(error, BaseException):
+        error = _error(error)
+    if not isinstance(error, dict) or not error.get("type"):
+        error = {"type": "LauncherError",
+                 "message": _safe_text(reason or "unknown failure")}
+    payload = {
+        "code": int(code),
+        "reason": _one_line(reason) or "unknown",
+        "step": _one_line(step) or "launcher",
+        "error": {"type": _one_line(error.get("type")) or "LauncherError",
+                  "message": _safe_text(error.get("message") or "")},
+    }
+    for key, value in extra.items():
+        if str(key).lower() in _FORBIDDEN_KEYS:
+            continue
+        payload[key] = _safe_value(value)
     try:
-        sys.stderr.write(json.dumps(payload, sort_keys=True) + "\n")
+        sys.stderr.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
         sys.stderr.flush()
     except Exception:
         pass
@@ -280,93 +424,113 @@ class WindowsAPI:
         C = self.ctypes
         k = self.kernel32
         a = self.advapi32
-        k.GetCurrentProcess.restype = C.c_void_p
-        k.CloseHandle.argtypes = [C.c_void_p]
-        k.CloseHandle.restype = C.c_int
-        k.OpenProcessToken.argtypes = [C.c_void_p, C.c_uint32,
-                                       C.POINTER(C.c_void_p)]
-        k.OpenProcessToken.restype = C.c_int
-        k.GetTokenInformation.argtypes = [C.c_void_p, C.c_int, C.c_void_p,
-                                          C.c_uint32,
-                                          C.POINTER(C.c_uint32)]
-        k.GetTokenInformation.restype = C.c_int
-        k.GetLongPathNameW.argtypes = [C.c_wchar_p, C.c_wchar_p, C.c_uint32]
-        k.GetLongPathNameW.restype = C.c_uint32
-        k.GetDriveTypeW.argtypes = [C.c_wchar_p]
-        k.GetDriveTypeW.restype = C.c_uint32
-        k.SetHandleInformation.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32]
-        k.SetHandleInformation.restype = C.c_int
-        k.CreateJobObjectW.argtypes = [C.c_void_p, C.c_wchar_p]
-        k.CreateJobObjectW.restype = C.c_void_p
-        k.SetInformationJobObject.argtypes = [C.c_void_p, C.c_int, C.c_void_p,
-                                              C.c_uint32]
-        k.SetInformationJobObject.restype = C.c_int
-        k.AssignProcessToJobObject.argtypes = [C.c_void_p, C.c_void_p]
-        k.AssignProcessToJobObject.restype = C.c_int
-        k.ResumeThread.argtypes = [C.c_void_p]
-        k.ResumeThread.restype = C.c_uint32
-        k.TerminateProcess.argtypes = [C.c_void_p, C.c_uint32]
-        k.TerminateProcess.restype = C.c_int
-        k.TerminateJobObject.argtypes = [C.c_void_p, C.c_uint32]
-        k.TerminateJobObject.restype = C.c_int
-        k.WaitForSingleObject.argtypes = [C.c_void_p, C.c_uint32]
-        k.WaitForSingleObject.restype = C.c_uint32
-        k.GetExitCodeProcess.argtypes = [C.c_void_p,
-                                         C.POINTER(C.c_uint32)]
-        k.GetExitCodeProcess.restype = C.c_int
-        k.InitializeProcThreadAttributeList.argtypes = [
-            C.c_void_p, C.c_uint32, C.c_uint32,
-            C.POINTER(C.c_size_t)]
-        k.InitializeProcThreadAttributeList.restype = C.c_int
-        k.UpdateProcThreadAttribute.argtypes = [
-            C.c_void_p, C.c_uint32, C.c_size_t, C.c_void_p, C.c_size_t,
-            C.c_void_p, C.c_void_p]
-        k.UpdateProcThreadAttribute.restype = C.c_int
-        k.CreateProcessAsUserW.argtypes = [
-            C.c_void_p, C.c_wchar_p, C.c_wchar_p, C.c_void_p, C.c_void_p,
-            C.c_int, C.c_uint32, C.c_void_p, C.c_wchar_p,
-            C.POINTER(_STARTUPINFOEX), C.POINTER(_PROCESS_INFORMATION)]
-        k.CreateProcessAsUserW.restype = C.c_int
-        a.ConvertStringSidToSidW.argtypes = [C.c_wchar_p,
-                                             C.POINTER(C.c_void_p)]
-        a.ConvertStringSidToSidW.restype = C.c_int
-        a.ConvertSidToStringSidW.argtypes = [C.c_void_p,
-                                             C.POINTER(C.c_wchar_p)]
-        a.ConvertSidToStringSidW.restype = C.c_int
-        a.CreateRestrictedToken.argtypes = [
-            C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_uint32,
-            C.c_void_p, C.c_uint32,
-            C.POINTER(_SID_AND_ATTRIBUTES), C.POINTER(C.c_void_p)]
-        a.CreateRestrictedToken.restype = C.c_int
-        a.GetLengthSid.argtypes = [C.c_void_p]
-        a.GetLengthSid.restype = C.c_uint32
-        a.CopySid.argtypes = [C.c_uint32, C.c_void_p, C.c_void_p]
-        a.CopySid.restype = C.c_int
-        a.GetNamedSecurityInfoW.argtypes = [
-            C.c_wchar_p, C.c_int, C.c_uint32, C.POINTER(C.c_void_p),
-            C.POINTER(C.c_void_p), C.POINTER(C.c_void_p),
-            C.POINTER(C.c_void_p), C.POINTER(C.c_void_p)]
-        a.GetNamedSecurityInfoW.restype = C.c_uint32
-        a.SetEntriesInAclW.argtypes = [
-            C.c_uint32, C.POINTER(_EXPLICIT_ACCESS_W), C.c_void_p,
-            C.POINTER(C.c_void_p)]
-        a.SetEntriesInAclW.restype = C.c_uint32
-        a.SetNamedSecurityInfoW.argtypes = [
-            C.c_wchar_p, C.c_int, C.c_uint32, C.c_void_p, C.c_void_p,
-            C.c_void_p, C.c_void_p]
-        a.SetNamedSecurityInfoW.restype = C.c_uint32
-        a.LocalFree.argtypes = [C.c_void_p]
-        a.LocalFree.restype = C.c_void_p
+        self.bound = []
+
+        def bind(lib, libname, name, argtypes, restype):
+            """Bind one export and name it if the DLL does not have it.
+
+            ``ctypes.WinDLL.__getattr__`` raises a bare AttributeError for a
+            missing export.  Converting that into a named SandboxError is how
+            a future CI run can tell which DLL/function broke.
+            """
+            fn = getattr(lib, name, None)
+            if fn is None:
+                raise SandboxError(
+                    EXIT_UNAVAILABLE,
+                    "dll_symbol_missing:%s!%s" % (libname, name),
+                    step="configure")
+            fn.argtypes = argtypes
+            fn.restype = restype
+            self.bound.append("%s!%s" % (libname, name))
+            return fn
+
+        # kernel32: process, handle, path, job and local-memory APIs.
+        bind(k, "kernel32", "GetCurrentProcess", [], C.c_void_p)
+        bind(k, "kernel32", "CloseHandle", [C.c_void_p], C.c_int)
+        bind(k, "kernel32", "GetLongPathNameW",
+             [C.c_wchar_p, C.c_wchar_p, C.c_uint32], C.c_uint32)
+        bind(k, "kernel32", "GetDriveTypeW", [C.c_wchar_p], C.c_uint32)
+        bind(k, "kernel32", "SetHandleInformation",
+             [C.c_void_p, C.c_uint32, C.c_uint32], C.c_int)
+        bind(k, "kernel32", "CreateJobObjectW",
+             [C.c_void_p, C.c_wchar_p], C.c_void_p)
+        bind(k, "kernel32", "SetInformationJobObject",
+             [C.c_void_p, C.c_int, C.c_void_p, C.c_uint32], C.c_int)
+        bind(k, "kernel32", "AssignProcessToJobObject",
+             [C.c_void_p, C.c_void_p], C.c_int)
+        bind(k, "kernel32", "ResumeThread", [C.c_void_p], C.c_uint32)
+        bind(k, "kernel32", "TerminateProcess",
+             [C.c_void_p, C.c_uint32], C.c_int)
+        bind(k, "kernel32", "TerminateJobObject",
+             [C.c_void_p, C.c_uint32], C.c_int)
+        bind(k, "kernel32", "WaitForSingleObject",
+             [C.c_void_p, C.c_uint32], C.c_uint32)
+        bind(k, "kernel32", "GetExitCodeProcess",
+             [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
+        bind(k, "kernel32", "InitializeProcThreadAttributeList",
+             [C.c_void_p, C.c_uint32, C.c_uint32, C.POINTER(C.c_size_t)],
+             C.c_int)
+        bind(k, "kernel32", "UpdateProcThreadAttribute",
+             [C.c_void_p, C.c_uint32, C.c_size_t, C.c_void_p, C.c_size_t,
+              C.c_void_p, C.c_void_p], C.c_int)
+        bind(k, "kernel32", "LocalFree", [C.c_void_p], C.c_void_p)
+
+        # advapi32: token, security and process-with-token APIs.  These were
+        # wrongly bound on kernel32 in 3.13.2 (the windows-2025 AttributeError).
+        bind(a, "advapi32", "OpenProcessToken",
+             [C.c_void_p, C.c_uint32, C.POINTER(C.c_void_p)], C.c_int)
+        bind(a, "advapi32", "GetTokenInformation",
+             [C.c_void_p, C.c_int, C.c_void_p, C.c_uint32,
+              C.POINTER(C.c_uint32)], C.c_int)
+        bind(a, "advapi32", "CreateProcessAsUserW",
+             [C.c_void_p, C.c_wchar_p, C.c_wchar_p, C.c_void_p, C.c_void_p,
+              C.c_int, C.c_uint32, C.c_void_p, C.c_wchar_p,
+              C.POINTER(_STARTUPINFOEX), C.POINTER(_PROCESS_INFORMATION)],
+             C.c_int)
+        bind(a, "advapi32", "ConvertStringSidToSidW",
+             [C.c_wchar_p, C.POINTER(C.c_void_p)], C.c_int)
+        bind(a, "advapi32", "ConvertSidToStringSidW",
+             [C.c_void_p, C.POINTER(C.c_wchar_p)], C.c_int)
+        bind(a, "advapi32", "CreateRestrictedToken",
+             [C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_uint32,
+              C.c_void_p, C.c_uint32,
+              C.POINTER(_SID_AND_ATTRIBUTES), C.POINTER(C.c_void_p)],
+             C.c_int)
+        bind(a, "advapi32", "GetLengthSid", [C.c_void_p], C.c_uint32)
+        bind(a, "advapi32", "CopySid",
+             [C.c_uint32, C.c_void_p, C.c_void_p], C.c_int)
+        bind(a, "advapi32", "GetNamedSecurityInfoW",
+             [C.c_wchar_p, C.c_int, C.c_uint32, C.POINTER(C.c_void_p),
+              C.POINTER(C.c_void_p), C.POINTER(C.c_void_p),
+              C.POINTER(C.c_void_p), C.POINTER(C.c_void_p)], C.c_uint32)
+        bind(a, "advapi32", "SetEntriesInAclW",
+             [C.c_uint32, C.POINTER(_EXPLICIT_ACCESS_W), C.c_void_p,
+              C.POINTER(C.c_void_p)], C.c_uint32)
+        bind(a, "advapi32", "SetNamedSecurityInfoW",
+             [C.c_wchar_p, C.c_int, C.c_uint32, C.c_void_p, C.c_void_p,
+              C.c_void_p, C.c_void_p], C.c_uint32)
+        bind(a, "advapi32", "CheckTokenMembership",
+             [C.c_void_p, C.c_void_p, C.POINTER(C.c_int)], C.c_int)
 
     # -- token ---------------------------------------------------------
     def open_process_token(self):
         token = ctypes.c_void_p()
-        flags = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY
-        if not self.kernel32.OpenProcessToken(
+        flags = (TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY
+                 | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID)
+        if self.advapi32.OpenProcessToken(
                 self.kernel32.GetCurrentProcess(), flags,
                 ctypes.byref(token)):
-            raise _win_error(0, "OpenProcessToken")
-        return token
+            return token
+        # A hardened host can deny the adjust rights.  The probe still needs
+        # the reduced token to prove write restriction; if the child launch
+        # later needs the missing rights, that failure is reported at spawn
+        # with its own winerror instead of making the host look unusable.
+        reduced = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY
+        if self.advapi32.OpenProcessToken(
+                self.kernel32.GetCurrentProcess(), reduced,
+                ctypes.byref(token)):
+            return token
+        raise _win_error(0, "OpenProcessToken")
 
     def close_handle(self, handle):
         if handle:
@@ -378,41 +542,103 @@ class WindowsAPI:
     def is_admin(self, token):
         value = _TOKEN_ELEVATION()
         size = ctypes.c_uint32(ctypes.sizeof(value))
-        if not self.kernel32.GetTokenInformation(
+        if not self.advapi32.GetTokenInformation(
                 token, TOKEN_ELEVATION, ctypes.byref(value), size.value,
                 ctypes.byref(size)):
             raise _win_error(0, "GetTokenInformation(TokenElevation)")
         return bool(value.TokenIsElevated)
 
+    def local_free(self, pointer):
+        if not pointer:
+            return
+        try:
+            if not isinstance(pointer, ctypes.c_void_p):
+                pointer = ctypes.cast(pointer, ctypes.c_void_p)
+            self.kernel32.LocalFree(pointer)
+        except Exception:
+            pass
+
+    def _sid_from_string(self, text):
+        sid = ctypes.c_void_p()
+        if not self.advapi32.ConvertStringSidToSidW(
+                str(text), ctypes.byref(sid)):
+            raise _win_error(0, "ConvertStringSidToSidW")
+        return sid
+
     def make_per_run_sid(self):
         import secrets
         text = "S-1-5-21-%d-%d-%d" % (
             secrets.randbits(31), secrets.randbits(31), secrets.randbits(31))
-        sid = ctypes.c_void_p()
-        if not self.advapi32.ConvertStringSidToSidW(
-                text, ctypes.byref(sid)):
-            raise _win_error(0, "ConvertStringSidToSidW")
-        return sid
+        return self._sid_from_string(text)
+
+    def is_admin_member(self, token):
+        """True when the token is in BUILTIN\\Administrators.
+
+        Separate from ``is_admin`` (TokenElevation): the GitHub runner account
+        is an Administrators member even when UAC filters the process token.
+        """
+        sid = self._sid_from_string("S-1-5-32-544")
+        try:
+            member = ctypes.c_int(0)
+            if not self.advapi32.CheckTokenMembership(
+                    token, sid, ctypes.byref(member)):
+                raise _win_error(0, "CheckTokenMembership")
+            return bool(member.value)
+        finally:
+            self.local_free(sid)
+
+    def admin_info(self, token=None):
+        """Measure elevation and group membership independently; never raise
+        just because one of the two queries failed."""
+        owns_token = token is None
+        if owns_token:
+            token = self.open_process_token()
+        try:
+            elevated = None
+            elevation_error = None
+            try:
+                elevated = bool(self.is_admin(token))
+            except Exception as exc:  # noqa: BLE001 - reported separately
+                elevation_error = exc
+            member = None
+            member_error = None
+            try:
+                member = bool(self.is_admin_member(token))
+            except Exception as exc:  # noqa: BLE001 - reported separately
+                member_error = exc
+            if elevated is None and member is None:
+                raise elevation_error or member_error or OSError(
+                    "admin query failed")
+            return {"elevated": elevated, "member": member,
+                    "source": "token", "elevation_error": elevation_error,
+                    "member_error": member_error}
+        finally:
+            if owns_token:
+                self.close_handle(token)
 
     def token_logon_sid(self, token):
         size = ctypes.c_uint32(0)
-        self.kernel32.GetTokenInformation(
+        self.advapi32.GetTokenInformation(
             token, TOKEN_LOGON_SID, None, 0, ctypes.byref(size))
         if not size.value:
             raise _win_error(0, "GetTokenInformation(TokenLogonSid)")
         buf = ctypes.create_string_buffer(size.value)
-        if not self.kernel32.GetTokenInformation(
+        if not self.advapi32.GetTokenInformation(
                 token, TOKEN_LOGON_SID, buf, size.value,
                 ctypes.byref(size)):
             raise _win_error(0, "GetTokenInformation(TokenLogonSid)")
-        count = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32)).contents.value
+        raw = bytes(buf.raw)
+        if len(raw) < ctypes.sizeof(ctypes.c_uint32):
+            raise OSError("TokenLogonSid buffer too small")
+        count = ctypes.c_uint32.from_buffer_copy(raw, 0).value
         if not count:
             raise OSError("TokenLogonSid is empty")
         align = ctypes.alignment(_SID_AND_ATTRIBUTES)
         offset = ctypes.sizeof(ctypes.c_uint32)
         offset = (offset + align - 1) // align * align
-        first = ctypes.cast(ctypes.byref(buf, offset),
-                            ctypes.POINTER(_SID_AND_ATTRIBUTES))[0]
+        if len(raw) < offset + ctypes.sizeof(_SID_AND_ATTRIBUTES):
+            raise OSError("TokenLogonSid buffer too small")
+        first = _SID_AND_ATTRIBUTES.from_buffer_copy(raw, offset)
         length = self.advapi32.GetLengthSid(first.Sid)
         if not length:
             raise _win_error(0, "GetLengthSid")
@@ -430,7 +656,7 @@ class WindowsAPI:
         try:
             return str(text.value)
         finally:
-            self.advapi32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+            self.local_free(text)
 
     def create_restricted_token(self, token, sid):
         attrs = _SID_AND_ATTRIBUTES(ctypes.cast(sid, ctypes.c_void_p), 0)
@@ -536,7 +762,8 @@ class WindowsAPI:
     def create_process(self, application, command_line, environment, cwd,
                        handles, token):
         if len(handles) != 3:
-            raise SandboxError(EXIT_APPLY_FAILED, "handle_list_not_three")
+            raise SandboxError(EXIT_APPLY_FAILED, "handle_list_not_three",
+                               step="create_process")
         handle_array = (ctypes.c_void_p * 3)(
             *[ctypes.c_void_p(int(h)) for h in handles])
         size = ctypes.c_size_t(0)
@@ -564,12 +791,12 @@ class WindowsAPI:
         items = ["%s=%s" % (key, value)
                  for key, value in environment.items()
                  if key and "=" not in key]
-        block = ctypes.create_unicode_buffer("\0".join(items) + "\0")
+        block = ctypes.create_unicode_buffer("\0".join(items) + "\0\0")
         cmd = ctypes.create_unicode_buffer(str(command_line))
         info = _PROCESS_INFORMATION()
         flags = (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
                  | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT)
-        ok = self.kernel32.CreateProcessAsUserW(
+        ok = self.advapi32.CreateProcessAsUserW(
             token, str(application), cmd, None, None, True, flags,
             ctypes.cast(block, ctypes.c_void_p), str(cwd),
             ctypes.byref(startup), ctypes.byref(info))
@@ -643,7 +870,7 @@ def _forbidden_root(path, policy):
     if path == dsh_root and policy.get("dsh_home"):
         return "dsh_home_root"
     drive, tail = os.path.splitdrive(path)
-    if tail in ("\\", "/") and not drive:
+    if tail in ("\\", "/"):
         return "filesystem_root"
     return None
 
@@ -725,7 +952,8 @@ def build_policy_acl(policy, api=None, sid=None):
         try:
             sid = api.make_per_run_sid()
         except Exception as exc:
-            raise SandboxError(EXIT_APPLY_FAILED, _reason(exc))
+            raise SandboxError(EXIT_APPLY_FAILED, _reason(exc),
+                               step="make_per_run_sid", cause=exc)
     granted = []
     skipped = []
     rollback = []
@@ -764,10 +992,12 @@ def build_policy_acl(policy, api=None, sid=None):
             _restore_acl(rollback, api)
             raise SandboxError(EXIT_APPLY_FAILED,
                                "acl_denied" if _access_denied(exc)
-                               else "acl_failed")
-        except Exception:
+                               else "acl_failed",
+                               step="acl_apply", cause=exc)
+        except Exception as exc:
             _restore_acl(rollback, api)
-            raise
+            raise SandboxError(EXIT_APPLY_FAILED, _reason(exc),
+                               step="acl_apply", cause=exc)
     return {"granted": granted, "skipped": skipped,
             "residue": bool(granted), "rollback": rollback}
 
@@ -777,64 +1007,210 @@ def build_policy_acl(policy, api=None, sid=None):
 
 
 def _restricted_from_token(api, token):
+    first = None
+    first_step = None
     try:
         sid = api.make_per_run_sid()
-        restricted = api.create_restricted_token(token, sid)
-        return restricted, sid, "per-run"
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - fallback is intentional
+        first, first_step = exc, "make_per_run_sid"
+    if first is None:
+        try:
+            restricted = api.create_restricted_token(token, sid)
+            return restricted, sid, "per-run"
+        except Exception as exc:  # noqa: BLE001 - fallback is intentional
+            first, first_step = exc, "create_restricted_token"
+    try:
         sid = api.token_logon_sid(token)
+    except Exception as second:
+        raise SandboxError(EXIT_UNAVAILABLE, _reason(first),
+                           step=first_step, cause=first,
+                           fallback_step="logon_sid",
+                           fallback_cause=second)
+    try:
         restricted = api.create_restricted_token(token, sid)
         return restricted, sid, "logon"
+    except Exception as second:
+        raise SandboxError(EXIT_UNAVAILABLE, _reason(second),
+                           step="create_restricted_token", cause=second,
+                           fallback_step=first_step,
+                           fallback_cause=first)
 
 
 def _acquire_restricted_token(api):
-    token = api.open_process_token()
+    try:
+        token = api.open_process_token()
+    except Exception as exc:
+        raise SandboxError(EXIT_UNAVAILABLE, _reason(exc),
+                           step="open_process_token", cause=exc)
     try:
         restricted, sid, kind = _restricted_from_token(api, token)
         return token, restricted, sid, kind
+    except SandboxError:
+        api.close_handle(token)
+        raise
     except Exception as exc:
         api.close_handle(token)
-        raise SandboxError(EXIT_UNAVAILABLE, _reason(exc))
+        raise SandboxError(EXIT_UNAVAILABLE, _reason(exc),
+                           step="acquire_token", cause=exc)
+
+
+def _probe_admin(api, result):
+    """Measure admin independently and before the write-restriction probe."""
+    try:
+        info_fn = getattr(api, "admin_info", None)
+        if callable(info_fn):
+            info = info_fn()
+        else:
+            # Compatibility for a simple test double that only has
+            # is_admin(token): open its own token instead of reusing the
+            # probe token, so a later write-restriction failure cannot change
+            # the admin result.
+            token = api.open_process_token()
+            try:
+                info = {"elevated": bool(api.is_admin(token)),
+                        "member": None, "source": "token"}
+            finally:
+                api.close_handle(token)
+    except Exception as exc:
+        result["admin_error"] = _diag("admin", exc)
+        result["admin_source"] = "unavailable"
+        return
+    result["admin_elevated"] = info.get("elevated")
+    result["admin_member"] = info.get("member")
+    result["admin_source"] = info.get("source") or "token"
+    if info.get("elevation_error") is not None:
+        result["admin_error"] = _diag("admin", info["elevation_error"])
+    if info.get("member_error") is not None:
+        result["admin_member_error"] = _diag("admin_membership",
+                                             info["member_error"])
+    elevated = info.get("elevated")
+    # Legacy ``admin`` stays a token-elevation boolean.  Group membership is
+    # exposed only as ``admin_member``; treating it as elevation would repeat
+    # the 3.13.2 account-vs-token confusion.
+    result["admin"] = bool(elevated) if elevated is not None else False
 
 
 def probe_status(api=None):
-    """Probe token support without spawning DSH. Never raises."""
+    """Probe token support without spawning DSH. Never raises.
+
+    Admin is measured first, through its own token.  A failure to create the
+    write-restricted token is recorded under ``step``/``error`` but never
+    overwrites ``admin`` or ``admin_elevated``.
+    """
     result = {"ok": False, "reason": None, "admin": False,
-              "restricting_sid": None, "write_restricted": False}
+              "admin_elevated": None, "admin_member": None,
+              "admin_source": "unavailable", "admin_error": None,
+              "restricting_sid": None, "write_restricted": False,
+              "logon_sid": None, "step": None, "error": None}
     if api is None and not _is_windows():
-        result["reason"] = "not_windows"
+        result.update(_diag("platform_check", None, reason="not_windows",
+                            message="not Windows"))
         return result
-    try:
-        api = api or WindowsAPI()
-        token = api.open_process_token()
+    if api is None:
         try:
-            try:
-                result["admin"] = bool(api.is_admin(token))
-            except Exception:
-                result["admin"] = False
-            try:
-                api.token_logon_sid(token)
-                result["logon_sid"] = True
-            except Exception:
-                result["logon_sid"] = False
+            api = WindowsAPI()
+        except Exception as exc:
+            result.update(_diag("init_api", exc))
+            result["write_restricted"] = False
+            return result
+
+    _probe_admin(api, result)
+
+    token = None
+    try:
+        try:
+            token = api.open_process_token()
+        except Exception as exc:
+            result.update(_diag("open_process_token", exc))
+            result["write_restricted"] = False
+            return result
+
+        # TokenLogonSid is the fallback SID source, not a success gate: a
+        # per-run SID restricted token is usable even when it is absent.
+        try:
+            api.token_logon_sid(token)
+            result["logon_sid"] = True
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            result["logon_sid"] = False
+            result["logon_sid_error"] = _diag("logon_sid", exc)
+
+        try:
             restricted, _sid, kind = _restricted_from_token(api, token)
+        except SandboxError as exc:
+            diag = _diag(exc.step, exc.cause, reason=exc.reason)
+            if exc.fallback_step:
+                diag["fallback_step"] = exc.fallback_step
+                if exc.fallback_cause is not None:
+                    diag["fallback_error"] = _error(exc.fallback_cause)
+            result.update(diag)
+            result["write_restricted"] = False
+            return result
+
+        result.update(ok=True, reason=None, restricting_sid=kind,
+                      write_restricted=True, step=None, error=None)
+        try:
             api.close_handle(restricted)
-            result.update(ok=bool(result["logon_sid"]), reason=None,
-                          restricting_sid=kind, write_restricted=True)
-            if not result["ok"]:
-                result["reason"] = "logon_sid_unavailable"
-        finally:
-            api.close_handle(token)
-    except Exception as exc:
-        result["reason"] = _reason(exc)
+        except Exception as exc:  # noqa: BLE001 - success already proven
+            result["close_error"] = _diag("close_handle", exc)
+        return result
+    except Exception as exc:  # defensive: probe_status never raises
+        result.update(_diag("probe", exc))
         result["write_restricted"] = False
-    return result
+        return result
+    finally:
+        if token is not None:
+            try:
+                api.close_handle(token)
+            except Exception:
+                pass
+
+
+def _flag(value):
+    return "None" if value is None else ("True" if value else "False")
+
+
+def format_probe_detail(status):
+    """One-line detail for tests/sandbox_probe.py; legacy fields first."""
+    status = status or {}
+    parts = [
+        "write_restricted=%s" % _flag(status.get("write_restricted")),
+        "logon_sid=%s" % _flag(status.get("logon_sid")),
+        "admin=%s" % _flag(status.get("admin")),
+        "admin_member=%s" % _flag(status.get("admin_member")),
+        "admin_source=%s" % (_one_line(status.get("admin_source"))
+                             or "unavailable"),
+    ]
+    admin_error = status.get("admin_error") or {}
+    if admin_error:
+        err = admin_error.get("error") or {}
+        parts.append("admin_step=%s" % (admin_error.get("step") or "admin"))
+        parts.append("admin_error=%s: %s" % (
+            err.get("type") or "LauncherError",
+            err.get("message") or ""))
+    member_error = status.get("admin_member_error") or {}
+    if member_error:
+        err = member_error.get("error") or {}
+        parts.append("admin_member_step=%s"
+                     % (member_error.get("step") or "admin_membership"))
+        parts.append("admin_member_error=%s: %s" % (
+            err.get("type") or "LauncherError",
+            err.get("message") or ""))
+    if status.get("step"):
+        err = status.get("error") or {}
+        parts.append("step=%s" % _one_line(status["step"]))
+        parts.append("error=%s: %s" % (
+            err.get("type") or "LauncherError",
+            err.get("message") or ""))
+    parts.append("reason=%s" % (_one_line(status.get("reason")) or "ok"))
+    return _safe_text(";".join(parts), limit=480)
 
 
 def _stdio_handles(api):
     handles = [api.get_osfhandle(fd) for fd in (0, 1, 2)]
-    if len(handles) != 3 or any(not handle for handle in handles):
-        raise SandboxError(EXIT_APPLY_FAILED, "stdio_handles_unavailable")
+    if len(handles) != 3 or any(handle is None or int(handle) <= 0
+                                for handle in handles):
+        raise SandboxError(EXIT_APPLY_FAILED, "stdio_handles_unavailable",
+                           step="stdio_handles")
     for handle in handles:
         api.set_handle_information(handle, HANDLE_FLAG_INHERIT,
                                    HANDLE_FLAG_INHERIT)
@@ -843,11 +1219,11 @@ def _stdio_handles(api):
 
 def _spawn(api, policy, dsh, token):
     if not dsh:
-        raise SandboxError(EXIT_DSH_FAILED, "missing_dsh")
+        raise SandboxError(EXIT_DSH_FAILED, "missing_dsh", step="spawn")
     application = os.path.realpath(os.path.abspath(os.path.expanduser(
         str(dsh[0]))))
     if not os.path.isfile(application):
-        raise SandboxError(EXIT_DSH_FAILED, "dsh_not_found")
+        raise SandboxError(EXIT_DSH_FAILED, "dsh_not_found", step="spawn")
     try:
         application = api.get_long_path_name(application) or application
     except Exception:
@@ -863,7 +1239,8 @@ def _spawn(api, policy, dsh, token):
     except SandboxError:
         raise
     except Exception as exc:
-        raise SandboxError(EXIT_DSH_FAILED, _reason(exc))
+        raise SandboxError(EXIT_DSH_FAILED, _reason(exc),
+                           step="create_process", cause=exc)
 
 
 def _timeout_ms(policy):
@@ -880,83 +1257,151 @@ def run(policy, dsh, api=None):
     """Apply the sandbox and run ``dsh``; returns the process exit code.
 
     ``api`` exists for the mocked unit suite; production passes ``None``.
+    Every failure records and emits the failing step plus the exception class
+    and a sanitized message.
     """
     global _LAST_RESULT
     result = {"code": None, "reason": None, "probe": None,
               "acl": {"granted": [], "skipped": [], "residue": False},
               "acl_residue": False, "restore_failures": 0,
-              "restricting_sid": None}
+              "restricting_sid": None, "step": None, "error": None}
+    _stage("run")
+
+    def fail(exit_code, diag):
+        result.update(code=exit_code, reason=diag.get("reason"),
+                      step=diag.get("step"), error=diag.get("error"))
+        for key in ("winerror", "fallback_step"):
+            if key in diag:
+                result[key] = diag[key]
+        extra = {}
+        if diag.get("winerror") is not None:
+            extra["winerror"] = diag["winerror"]
+        _emit(exit_code, diag.get("reason") or "unknown",
+              step=diag.get("step"), error=diag.get("error"), **extra)
+        return exit_code
+
     if api is None:
         if not _is_windows():
-            result.update(code=EXIT_UNAVAILABLE, reason="not_windows")
+            diag = _diag("platform_check", None, reason="not_windows",
+                         message="not Windows")
+            code = fail(EXIT_UNAVAILABLE, diag)
             _LAST_RESULT = result
-            _emit(EXIT_UNAVAILABLE, "not_windows")
-            return EXIT_UNAVAILABLE
+            return code
+        _stage("init_api")
         try:
             api = WindowsAPI()
         except Exception as exc:
-            result.update(code=EXIT_UNAVAILABLE, reason=_reason(exc))
+            diag = _diag("init_api", exc)
+            code = fail(EXIT_UNAVAILABLE, diag)
             _LAST_RESULT = result
-            _emit(EXIT_UNAVAILABLE, _reason(exc))
-            return EXIT_UNAVAILABLE
+            return code
+
     probe = probe_status(api=api)
     result["probe"] = probe
     if not probe.get("ok"):
-        result.update(code=EXIT_UNAVAILABLE,
-                      reason=probe.get("reason") or "sandbox_unavailable")
+        diag = {"step": probe.get("step") or "probe",
+                "reason": probe.get("reason") or "sandbox_unavailable",
+                "error": probe.get("error") or {
+                    "type": "LauncherError",
+                    "message": "probe returned ok=False"}}
+        code = fail(EXIT_UNAVAILABLE, diag)
         _LAST_RESULT = result
-        _emit(EXIT_UNAVAILABLE, result["reason"])
-        return EXIT_UNAVAILABLE
+        return code
 
     token = None
     restricted = None
     job = None
+    proc = None
     acl = {"granted": [], "skipped": [], "residue": False, "rollback": []}
     try:
+        _stage("acquire_token")
         token, restricted, sid, kind = _acquire_restricted_token(api)
         result["restricting_sid"] = kind
+
+        _stage("acl")
         acl = build_policy_acl(policy, api=api, sid=sid)
         result["acl"] = {"granted": list(acl.get("granted") or []),
                          "skipped": list(acl.get("skipped") or []),
                          "residue": bool(acl.get("residue"))}
+
+        _stage("spawn")
         proc = _spawn(api, policy, dsh, restricted)
-        job = api.create_job_object(JOB_FLAGS)
+
+        _stage("job_create")
+        try:
+            job = api.create_job_object(JOB_FLAGS)
+        except Exception:
+            try:
+                api.terminate_process(proc["process"], 1)
+            except Exception:
+                pass
+            raise
+
+        _stage("job_assign")
         if not api.assign_process_to_job(job, proc["process"]):
-            api.terminate_process(proc["process"], 1)
-            result.update(code=EXIT_APPLY_FAILED,
-                          reason="job_assignment_failed")
-            _emit(EXIT_APPLY_FAILED, "job_assignment_failed")
-            return EXIT_APPLY_FAILED
-        api.resume_thread(proc["thread"])
+            try:
+                api.terminate_process(proc["process"], 1)
+            except Exception:
+                pass
+            diag = _diag("job_assign", None, reason="job_assignment_failed",
+                         message="AssignProcessToJobObject returned false")
+            return fail(EXIT_APPLY_FAILED, diag)
+
+        _stage("resume")
+        resumed = api.resume_thread(proc["thread"])
+        if resumed is False or resumed == 0xFFFFFFFF:
+            try:
+                api.terminate_job(job, 1)
+            except Exception:
+                pass
+            diag = _diag("resume", None, reason="resume_failed",
+                         message="ResumeThread returned failure")
+            return fail(EXIT_APPLY_FAILED, diag)
+
+        _stage("wait")
         wait = api.wait_for_single_object(proc["process"],
                                           _timeout_ms(policy))
         if wait == WAIT_TIMEOUT:
-            api.terminate_job(job, 1)
-            result.update(code=EXIT_TIMEOUT, reason="timeout")
-            _emit(EXIT_TIMEOUT, "timeout")
-            return EXIT_TIMEOUT
+            try:
+                api.terminate_job(job, 1)
+            except Exception:
+                pass
+            diag = _diag("wait", None, reason="timeout",
+                         message="WaitForSingleObject timed out")
+            return fail(EXIT_TIMEOUT, diag)
         if wait == WAIT_FAILED:
-            api.terminate_job(job, 1)
-            result.update(code=EXIT_APPLY_FAILED, reason="wait_failed")
-            _emit(EXIT_APPLY_FAILED, "wait_failed")
-            return EXIT_APPLY_FAILED
+            try:
+                api.terminate_job(job, 1)
+            except Exception:
+                pass
+            diag = _diag("wait", None, reason="wait_failed",
+                         message="WaitForSingleObject returned WAIT_FAILED")
+            return fail(EXIT_APPLY_FAILED, diag)
+
+        _stage("get_exit_code")
         code = int(api.get_exit_code(proc["process"]))
         result.update(code=code, reason=None)
         return code
     except SandboxError as exc:
-        result.update(code=exc.exit_code, reason=exc.reason)
-        _emit(exc.exit_code, exc.reason)
-        return exc.exit_code
+        diag = _diag(exc.step, exc.cause, reason=exc.reason)
+        if exc.fallback_step:
+            diag["fallback_step"] = exc.fallback_step
+            if exc.fallback_cause is not None:
+                diag["fallback_error"] = _error(exc.fallback_cause)
+        return fail(exc.exit_code, diag)
     except Exception as exc:
-        result.update(code=EXIT_APPLY_FAILED, reason=_reason(exc))
-        _emit(EXIT_APPLY_FAILED, _reason(exc))
-        return EXIT_APPLY_FAILED
+        diag = _diag(_STAGE["name"], exc)
+        return fail(EXIT_APPLY_FAILED, diag)
     finally:
         result["restore_failures"] = _restore_acl(
             acl.get("rollback") or [], api)
         result["acl_residue"] = bool(acl.get("granted"))
         _LAST_RESULT = result
-        for handle in (restricted, token):
+        handles = []
+        if proc:
+            handles.extend([proc.get("thread"), proc.get("process")])
+        handles.extend([restricted, token])
+        for handle in handles:
             if handle:
                 try:
                     api.close_handle(handle)
@@ -975,22 +1420,27 @@ def run(policy, dsh, api=None):
 
 def _parse_invocation(argv):
     if "--policy" not in argv:
-        raise SandboxError(EXIT_APPLY_FAILED, "missing_policy")
+        raise SandboxError(EXIT_APPLY_FAILED, "missing_policy",
+                           step="parse_invocation")
     index = argv.index("--policy")
     if index + 1 >= len(argv):
-        raise SandboxError(EXIT_APPLY_FAILED, "missing_policy")
+        raise SandboxError(EXIT_APPLY_FAILED, "missing_policy",
+                           step="parse_invocation")
     raw = argv[index + 1]
     rest = argv[index + 2:]
     if rest and rest[0] == "--":
         rest = rest[1:]
     if not rest:
-        raise SandboxError(EXIT_DSH_FAILED, "missing_dsh")
+        raise SandboxError(EXIT_DSH_FAILED, "missing_dsh",
+                           step="parse_invocation")
     try:
         policy = json.loads(raw)
-    except Exception:
-        raise SandboxError(EXIT_APPLY_FAILED, "invalid_policy")
+    except Exception as exc:
+        raise SandboxError(EXIT_APPLY_FAILED, "invalid_policy",
+                           step="parse_invocation", cause=exc)
     if not isinstance(policy, dict):
-        raise SandboxError(EXIT_APPLY_FAILED, "invalid_policy")
+        raise SandboxError(EXIT_APPLY_FAILED, "invalid_policy",
+                           step="parse_invocation")
     return policy, rest
 
 
@@ -999,10 +1449,15 @@ def main(argv=None):
     try:
         policy, dsh = _parse_invocation(argv)
     except SandboxError as exc:
-        _emit(exc.exit_code, exc.reason)
+        diag = _diag(exc.step, exc.cause, reason=exc.reason)
+        _emit(exc.exit_code, exc.reason, step=diag["step"],
+              error=diag["error"])
         return exc.exit_code
     if not _is_windows():
-        _emit(EXIT_UNAVAILABLE, "not_windows")
+        diag = _diag("platform_check", None, reason="not_windows",
+                     message="not Windows")
+        _emit(EXIT_UNAVAILABLE, diag["reason"], step=diag["step"],
+              error=diag["error"])
         return EXIT_UNAVAILABLE
     return run(policy, dsh)
 

@@ -68,7 +68,7 @@ try {
     $probeOutput = & $Python tests/sandbox_probe.py --require --json
     $probeRc = $LASTEXITCODE
     $probeOutput | ForEach-Object { Write-Host $_ }
-    Write-Host "note: the probe JSON records whether this process is elevated (admin)."
+    Write-Host "note: the probe JSON records admin (process-token elevation) and admin_member (Administrators group)."
     if ($probeRc -ne 0) { Fail "no enforced OS sandbox on this host" }
 
     # Exact documented gate command (docs/OPERATIONS.md, "Running the full
