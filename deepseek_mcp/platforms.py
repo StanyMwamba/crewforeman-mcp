@@ -561,6 +561,11 @@ def _windows_acl_is_private(aces, names):
                 return False
             owner_full = True
             continue
+        if ("nt authority\\logonsessionid_" in folded
+                and folded.endswith(("(rx)", "(r)", "(f)"))):
+            # Same logon session, same user; not a foreign trustee.  The
+            # native SID check treats S-1-5-5-* the same way.
+            continue
         if not any(("%s:" % trusted) in folded
                    for trusted in _WINDOWS_TRUSTED_ACE_TRUSTEES):
             return False
@@ -581,6 +586,19 @@ _WINDOWS_TRUSTED_SIDS = {
 }
 _FILE_ALL_ACCESS = 0x001F01FF
 _INHERITED_ACE = 0x10
+
+
+def _windows_trusted_sid(sid):
+    """True for a well-known system SID or a logon-session SID.
+
+    A hosted Windows directory can carry an explicit
+    ``NT AUTHORITY\LogonSessionId_<n>`` ACE (SID prefix ``S-1-5-5-``) beside
+    the owner.  That SID is the current interactive logon session, not another
+    account: only processes in the same user session hold it, and the ACE is
+    read/execute, so accepting it does not widen read access beyond the owner.
+    """
+    text = str(sid or "")
+    return text in _WINDOWS_TRUSTED_SIDS or text.startswith("S-1-5-5-")
 
 
 def _windows_native_acl_private(path):
@@ -685,7 +703,7 @@ def _windows_native_acl_private(path):
                     trusted = ctypes.wstring_at(string_sid.value)
                 finally:
                     kernel32.LocalFree(string_sid)
-                if trusted not in _WINDOWS_TRUSTED_SIDS:
+                if not _windows_trusted_sid(trusted):
                     return False
             return owner_full
         finally:

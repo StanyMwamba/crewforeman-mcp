@@ -1,4 +1,4 @@
-# Run Status Vocabulary (v3.13.7)
+# Run Status Vocabulary (v3.13.8)
 
 `status.py` defines one flat vocabulary for terminal run status. A status is
 always a lowercase string; there is no enum and no `None`.

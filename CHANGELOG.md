@@ -5,6 +5,26 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.8
+
+3.13.8: accept the current logon-session ACE in Windows ACL read-back (proof pending the next windows-2025 run)
+
+- **Logon-session ACE.** A hosted Windows directory can carry an explicit
+  `NT AUTHORITY\LogonSessionId_<n>:(RX)` ACE (SID prefix `S-1-5-5-`) beside the
+  owner's full-control ACE.  `_windows_trusted_sid` now accepts that SID in the
+  native DACL check, and the `icacls` fallback accepts the matching trustee
+  name with RX, R or F.  This is the current user's logon session, not another
+  account: only processes in the same session hold the SID and the ACE is
+  read/execute.  `Everyone`, `Users`, a foreign account, an inherited ACE and a
+  non-full-control owner ACE still fail closed.
+- **Evidence.** Run 42688495013 (3.13.7) ran 1,743 tests on both Windows
+  Pythons: one failure and zero errors each.  The only failure was
+  `test_private_permissions_and_secure_tree` returning `(2, 1)` instead of
+  `(0, 0)`; `CF_ACL_DEBUG` shows `native=False` exactly for the directories
+  whose DACL had the logon-session ACE.  The boundary gate passed on both
+  Pythons (`sandbox boundary exit code: 0`).  The next `windows-2025` run is
+  the required evidence; no Windows suite claim is made before it.
+
 ## 3.13.7
 
 3.13.7: 64-bit Win32 token bindings and Windows temp-cleanup fixes (proof pending the next windows-2025 run)

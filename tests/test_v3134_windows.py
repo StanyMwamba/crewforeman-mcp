@@ -250,6 +250,29 @@ class StdoutPumpTests(unittest.TestCase):
             stream.close()
 
 
+class WindowsTrustedSidTests(unittest.TestCase):
+    def test_logon_session_sid_is_trusted(self):
+        # The hosted runner adds this ACE to directories it creates.  It is
+        # the current logon session, not a foreign account.
+        self.assertTrue(platforms._windows_trusted_sid("S-1-5-5-0-723947"))
+        self.assertTrue(platforms._windows_trusted_sid("S-1-5-18"))
+        self.assertFalse(platforms._windows_trusted_sid(
+            "S-1-5-21-111-222-333-1001"))
+        self.assertFalse(platforms._windows_trusted_sid(None))
+
+    def test_logon_session_ace_does_not_hide_a_foreign_trustee(self):
+        owner = r"DOMAIN\runneradmin".casefold()
+        aces = [r"<path> DOMAIN\runneradmin:(F)",
+                r"NT AUTHORITY\LogonSessionId_0_723947:(RX)"]
+        self.assertTrue(platforms._windows_acl_is_private(aces, {owner}))
+        self.assertFalse(platforms._windows_acl_is_private(
+            aces + [r"Everyone:(F)"], {owner}))
+        self.assertFalse(platforms._windows_acl_is_private(
+            [r"<path> DOMAIN\runneradmin:(F)",
+             r"NT AUTHORITY\LogonSessionId_0_723947:(F)"] + [r"Everyone:(F)"],
+            {owner}))
+
+
 class WindowsTokenApiBindingTests(unittest.TestCase):
     def test_pointer_sized_handles_and_sids_are_bound(self):
         # ctypes passes an untyped int as a 32-bit C int.  The 3.13.6 code left

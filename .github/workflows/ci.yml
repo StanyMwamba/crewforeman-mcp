@@ -8,7 +8,7 @@ name: ci
 # failing step with the exception class and message. The first real windows-2025
 # run (42629362611) failed in that probe before the suite; 3.13.3 fixed it and
 # run 42648360100 proved the probe (usable=true on both Pythons) but the suite
-# was red. 3.13.7 addresses the 3.13.3 suite failures, so the next windows-2025 run is
+# was red. 3.13.8 addresses the 3.13.3 suite failures, so the next windows-2025 run is
 # the required Windows evidence for the suite and the write-restricted boundary. The
 # standard-user path is still established only by the manual run on the user's
 # real Windows 11 arm64 VM. See docs/OPERATIONS.md ("Continuous integration")
