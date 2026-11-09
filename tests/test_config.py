@@ -15,6 +15,16 @@ class ConfigTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.config_path = self.root / "config.json"
 
+    def assertSamePath(self, actual, expected):
+        """Compare the path spelling after separator normalisation.
+
+        ``Path`` equality is case-insensitive on Windows, which would hide a
+        product regression that lower-cases a workspace path; ``normpath``
+        only repairs the separator spelling.
+        """
+        self.assertEqual(os.path.normpath(str(actual)),
+                         os.path.normpath(str(expected)))
+
     def test_generic_defaults(self):
         cfg = load_config(config_path=self.config_path, env={})
         self.assertEqual(cfg.model, "deepseek-flash")
@@ -23,11 +33,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.default_subagents, 16)
         self.assertIsNone(cfg.max_concurrent_children)
         self.assertTrue(cfg.independent_review)
-        self.assertTrue(str(cfg.state_dir).endswith("DeepSeek-MCP/state"))
+        self.assertEqual(Path(cfg.state_dir).parts[-2:],
+                         ("DeepSeek-MCP", "state"))
         self.assertEqual(cfg.quality_max_rounds, 3)
         self.assertIsNone(cfg.daily_alert_usd)
         self.assertIsNone(cfg.daily_limit_usd)
-        self.assertTrue(str(cfg.log_dir).endswith("DeepSeek-MCP/runs"))
+        self.assertEqual(Path(cfg.log_dir).parts[-2:],
+                         ("DeepSeek-MCP", "runs"))
 
     def test_file_overrides_defaults(self):
         self.config_path.write_text(json.dumps({
@@ -69,16 +81,17 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_paths_are_expanded(self):
         cfg = load_config(config_path=self.config_path, env={})
-        self.assertEqual(str(cfg.log_dir), os.path.expanduser("~/DeepSeek-MCP/runs"))
-        self.assertEqual(str(cfg.jobs_dir), os.path.expanduser("~/DeepSeek-MCP/jobs"))
-        self.assertEqual(str(cfg.harness_workspace),
-                         os.path.expanduser("~/DeepSeek-MCP/harness-workspace"))
-        self.assertEqual(str(cfg.state_dir), os.path.expanduser("~/DeepSeek-MCP/state"))
+        self.assertSamePath(cfg.log_dir, os.path.expanduser("~/DeepSeek-MCP/runs"))
+        self.assertSamePath(cfg.jobs_dir, os.path.expanduser("~/DeepSeek-MCP/jobs"))
+        self.assertSamePath(
+            cfg.harness_workspace,
+            os.path.expanduser("~/DeepSeek-MCP/harness-workspace"))
+        self.assertSamePath(cfg.state_dir, os.path.expanduser("~/DeepSeek-MCP/state"))
         self.assertFalse(str(cfg.log_dir).startswith("~"))
 
     def test_path_expansion(self):
         cfg = load_config(config_path=self.config_path, env={"DEEPSEEK_MCP_LOG_DIR": "~/my-runs"})
-        self.assertEqual(str(cfg.log_dir), os.path.expanduser("~/my-runs"))
+        self.assertSamePath(cfg.log_dir, os.path.expanduser("~/my-runs"))
 
     def test_explicit_tilde_config_path_is_expanded(self):
         home = self.root / "home"
@@ -105,7 +118,7 @@ class ConfigTests(unittest.TestCase):
         for key in ("state_dir", "log_dir", "jobs_dir", "pid_file"):
             self.assertEqual(str(getattr(cfg, key)),
                              os.path.expanduser(DEFAULTS[key]))
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_state_root_env_relocates_four_connector_roots(self):
@@ -118,7 +131,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
         self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
         # B1: the Harness session home is not derived from CrewForeman's root.
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_explicit_state_env_wins_for_state_only(self):
@@ -132,7 +145,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.log_dir), str(root / "runs"))
         self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
         self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_config_state_root_relocates_defaults(self):
@@ -145,7 +158,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.log_dir), str(root / "runs"))
         self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
         self.assertEqual(str(cfg.pid_file), str(root / "keep_awake.pid"))
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_env_state_root_beats_config_state_root(self):
@@ -159,7 +172,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.state_dir), str(env_root / "state"))
         self.assertEqual(str(cfg.log_dir), str(env_root / "runs"))
         self.assertEqual(str(cfg.jobs_dir), str(env_root / "jobs"))
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_config_file_explicit_path_beats_derived_root(self):
@@ -173,7 +186,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(cfg.log_dir), str(explicit))
         self.assertEqual(str(cfg.jobs_dir), str(root / "jobs"))
         self.assertEqual(str(cfg.state_dir), str(root / "state"))
-        self.assertEqual(str(cfg.dsh_sessions_dir),
+        self.assertSamePath(cfg.dsh_sessions_dir,
                          os.path.expanduser(DEFAULTS["dsh_sessions_dir"]))
 
     def test_state_root_tilde_is_expanded(self):

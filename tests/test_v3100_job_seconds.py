@@ -107,7 +107,8 @@ class JobMaxSecondsTests(unittest.TestCase):
             json.dumps({"backup_dsh_bin": "~/bin/backup-dsh"}), encoding="utf-8")
         cfg = self.cfg()
         self.assertFalse(cfg.backup_dsh_bin.startswith("~"))
-        self.assertTrue(cfg.backup_dsh_bin.endswith("bin/backup-dsh"))
+        self.assertEqual(Path(cfg.backup_dsh_bin).parts[-2:],
+                         ("bin", "backup-dsh"))
         self.assertTrue(cfg.is_explicit("backup_dsh_bin"))
 
         cfg = load_config(config_path=self.config_path, env={
@@ -115,13 +116,14 @@ class JobMaxSecondsTests(unittest.TestCase):
             "DEEPSEEK_BACKUP_REVIEWER_VENDOR": "examplevendor",
             "DSH_BACKUP_REVIEWER_MODEL": "examplevendor-large",
         })
-        self.assertTrue(cfg.backup_dsh_bin.endswith("bin/other-dsh"))
+        self.assertEqual(Path(cfg.backup_dsh_bin).parts[-2:],
+                         ("bin", "other-dsh"))
         self.assertEqual(cfg.backup_reviewer_vendor, "examplevendor")
         self.assertEqual(cfg.backup_reviewer_model, "examplevendor-large")
 
     def test_release_sanity(self):
         # This slice must not bump the version; the lead owns 3.12.0.
-        self.assertEqual(SERVER_VERSION, "3.13.3")
+        self.assertEqual(SERVER_VERSION, "3.13.4")
         self.assertEqual(DEFAULTS["job_max_seconds"], 7200.0)
 
 

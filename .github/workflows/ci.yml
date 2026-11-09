@@ -1,16 +1,18 @@
 name: ci
 
 # CI runs on macOS, Linux and Windows. The Windows job uses the pinned
-# windows-2025 GitHub-hosted runner (x64/UTC), whose account runneradmin is an
+# windows-2025 GitHub-hosted runner (x64/UTC), whose hosted account is an
 # Administrators member. Account membership is not token elevation: the 3.13.2
 # probe failed before it could establish either fact, so the probe now records
 # admin (elevation) and admin_member (account group) separately and logs the
 # failing step with the exception class and message. The first real windows-2025
-# run (42629362611) failed in that probe (AttributeError, logon_sid=None,
-# usable=false) before the suite and the write-restricted boundary ran; the next
-# run is the only Windows proof. The standard-user path is still established
-# only by the manual run on the user's real Windows 11 arm64 VM. See
-# docs/OPERATIONS.md ("Continuous integration") and the Windows VM test package.
+# run (42629362611) failed in that probe before the suite; 3.13.3 fixed it and
+# run 42648360100 proved the probe (usable=true on both Pythons) but the suite
+# was red. 3.13.4 addresses the 3.13.3 suite failures, so the next windows-2025 run is
+# the required Windows evidence for the suite and the write-restricted boundary. The
+# standard-user path is still established only by the manual run on the user's
+# real Windows 11 arm64 VM. See docs/OPERATIONS.md ("Continuous integration")
+# and the Windows VM test package.
 
 on:
   push:

@@ -20,7 +20,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(lines[0], "(version 1)")
         self.assertEqual(lines[1], "(allow default)")
         self.assertEqual(lines[2], "(deny file-write*)")
-        self.assertIn('(allow file-write* (subpath "%s"))' % ws, profile)
+        self.assertIn('(allow file-write* (subpath %s))'
+                      % safety._sbpl_quote(ws), profile)
         # The credential deny must come after every allow rule.
         last_allow = max(index for index, line in enumerate(lines)
                          if line.startswith("(allow file-write*"))
@@ -34,17 +35,24 @@ class ProfileTests(unittest.TestCase):
     def test_read_only_does_not_grant_workspace_root(self):
         ws = os.path.realpath("/tmp/ws")
         profile = safety.seatbelt_profile("/tmp/ws", mode="read-only")
-        self.assertNotIn('(allow file-write* (subpath "%s"))' % ws, profile)
-        self.assertIn('(literal "%s/REVIEW.md")' % ws, profile)
+        self.assertNotIn('(allow file-write* (subpath %s))'
+                         % safety._sbpl_quote(ws), profile)
+        self.assertIn('(literal %s)'
+                      % safety._sbpl_quote(os.path.join(ws, "REVIEW.md")),
+                      profile)
 
     def test_private_reviewer_home_does_not_grant_operator_runtime(self):
         home = os.path.realpath(os.path.expanduser("~"))
         private = os.path.join(home, ".dsh-review-home-test")
         profile = safety.seatbelt_profile(
             "/tmp/ws", mode="workspace-write", dsh_home=private)
-        self.assertIn('(subpath "%s/sessions")' % private, profile)
+        self.assertIn('(subpath %s)'
+                      % safety._sbpl_quote(os.path.join(private, "sessions")),
+                      profile)
         self.assertNotIn(
-            '(subpath "%s/profiles")' % os.path.join(home, ".dsh"), profile)
+            '(subpath %s)'
+            % safety._sbpl_quote(os.path.join(home, ".dsh", "profiles")),
+            profile)
 
     def test_dangerous_extra_writes_are_rejected(self):
         home = os.path.realpath(os.path.expanduser("~"))
@@ -53,10 +61,11 @@ class ProfileTests(unittest.TestCase):
             "/tmp/ws", mode="workspace-write",
             extra_writes=["/", home, os.path.join(home, ".dsh"), safe])
         self.assertNotIn('(subpath "/")', profile)
-        self.assertNotIn('(subpath "%s")' % home, profile)
-        self.assertNotIn('(subpath "%s")' % os.path.join(home, ".dsh"),
+        self.assertNotIn('(subpath %s)' % safety._sbpl_quote(home), profile)
+        self.assertNotIn('(subpath %s)'
+                         % safety._sbpl_quote(os.path.join(home, ".dsh")),
                          profile)
-        self.assertIn('(subpath "%s")' % safe, profile)
+        self.assertIn('(subpath %s)' % safety._sbpl_quote(safe), profile)
 
     def test_sbpl_quoting(self):
         profile = safety.seatbelt_profile('/tmp/weird"dir\\x', mode="read-only")
@@ -85,7 +94,7 @@ class WrapTests(unittest.TestCase):
         self.assertTrue(meta["wrapped"])
         self.assertEqual(argv[:2], ["sandbox-exec", "-p"])
         ws = os.path.realpath("/tmp/ws")
-        self.assertIn('(subpath "%s")' % ws, argv[2])
+        self.assertIn('(subpath %s)' % safety._sbpl_quote(ws), argv[2])
         self.assertIn("(regex ", argv[2])
         self.assertIn(".dsh-tmp-", argv[2])
         self.assertEqual(argv[-3:], ["dsh", "--json", "task"])

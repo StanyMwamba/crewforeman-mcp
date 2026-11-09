@@ -10,7 +10,7 @@ Layout under ``<state_dir>/work``::
 
     <work_id>/work.json       current lease snapshot (schema 1)
     <work_id>/attempts.jsonl  append-only attempt journal
-    <work_id>/.lock           short-lived O_CREAT|O_EXCL mutex
+    <work_id>/.lock           short-lived OS advisory mutex
 
 All mutating operations take the per-work ``.lock``; readers tolerate a
 truncated final JSONL line.  The module only depends on the standard library
@@ -56,10 +56,6 @@ WORK_FILE = "work.json"
 ATTEMPTS_FILE = "attempts.jsonl"
 LOCK_FILE = ".lock"
 
-#: A lock is considered abandoned after this many seconds.
-LOCK_MAX_AGE = 60.0
-#: Poll interval while waiting for a lock.
-LOCK_POLL = 0.01
 
 _TERMINAL_STATES = ("finished", "expired", "failed", "cancelled", "terminal")
 _MAX_IDEMPOTENCY_KEY = 200
@@ -293,79 +289,20 @@ class WorkStore:
 
     @contextlib.contextmanager
     def _lock(self, work_id, timeout=None):
-        """Hold the per-work ``.lock``; retry ~10 ms, break abandoned locks.
+        """Hold the per-work ``.lock`` with an OS advisory lock.
 
-        A lock is abandoned when it is older than 60 s or names a dead pid.
-        The lock file is always unlinked by the holder in ``finally``.
+        The old implementation used an ``O_CREAT|O_EXCL`` existence lock and
+        unlinked it in ``finally``.  On Windows a waiter reading the lock file
+        can make the holder's unlink fail (sharing violation); the file then
+        stays behind with a live pid, so every waiter times out.  The kernel
+        releases an advisory lock when the holder exits, and the file is
+        deliberately kept (unlinking a locked file is racy on POSIX too).
         """
         directory = self._ensure_dir(work_id)
         lock_path = directory / LOCK_FILE
         wait = self.lock_timeout if timeout is None else float(timeout)
-        deadline = time.monotonic() + max(0.0, wait)
-        fd = None
-        while True:
-            try:
-                fd = os.open(str(lock_path),
-                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                break
-            except FileExistsError:
-                if self._lock_abandoned(lock_path):
-                    try:
-                        os.unlink(str(lock_path))
-                    except OSError:
-                        pass
-                    continue
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "timed out waiting for work lock %s" % lock_path)
-                time.sleep(LOCK_POLL)
-        try:
-            try:
-                os.write(fd, json.dumps({
-                    "pid": os.getpid(),
-                    "at": _iso(self._now()),
-                }).encode("utf-8"))
-                os.fsync(fd)
-            except OSError:
-                pass
-            os.close(fd)
-            fd = None
+        with platforms.file_lock(lock_path, timeout=wait):
             yield
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            try:
-                os.unlink(str(lock_path))
-            except OSError:
-                pass
-
-    @staticmethod
-    def _lock_abandoned(lock_path):
-        """Heuristic: lock is old, or its recorded owner pid is dead."""
-        try:
-            age = time.time() - os.stat(str(lock_path)).st_mtime
-        except OSError:
-            return False
-        pid = None
-        try:
-            with open(str(lock_path), "r", encoding="utf-8") as handle:
-                raw = handle.read()
-            if raw.strip():
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    pid = data.get("pid")
-        except (OSError, ValueError):
-            pid = None
-        if pid is not None:
-            try:
-                if not platforms.pid_alive(pid):
-                    return True
-            except Exception:
-                pass
-        return age > LOCK_MAX_AGE
 
     # -- reads ------------------------------------------------------------
 

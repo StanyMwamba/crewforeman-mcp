@@ -64,6 +64,10 @@ def _read_map(workspace):
     except (OSError, ValueError, TypeError):
         return None
     text = raw.decode("utf-8", "replace")
+    # The map is text.  Normalise CRLF/CR so digests, prompts and byte counts
+    # do not depend on the platform that wrote the file (Windows text mode
+    # expands every newline to CRLF).
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text[:MAX_MAP_CHARS]
 
 
@@ -287,7 +291,14 @@ def _store(workspace, state_dir, current, map_text):
     try:
         fd, tmp_path = tempfile.mkstemp(prefix=".project-map-", suffix=".tmp", dir=directory)
         try:
-            os.fchmod(fd, 0o600)
+            # os.fchmod is Unix-only; on Windows (notably 3.9) it does not
+            # exist, and the existing os.chmod(path) below is the fallback.
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                try:
+                    fchmod(fd, 0o600)
+                except (AttributeError, OSError):
+                    pass
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()

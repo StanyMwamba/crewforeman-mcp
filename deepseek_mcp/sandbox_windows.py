@@ -60,6 +60,8 @@ STARTF_USESTDHANDLES = 0x00000100
 CREATE_SUSPENDED = 0x00000004
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NO_WINDOW = 0x08000000
+STARTF_USESHOWWINDOW = 0x00000001
+SW_HIDE = 0
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 
@@ -302,6 +304,20 @@ def _emit(code, reason, step=None, error=None, **extra):
 def last_result():
     """Return the most recent run metadata (tests/run-record integration)."""
     return dict(_LAST_RESULT)
+
+
+def _process_flags():
+    """Creation flags for the restricted child.
+
+    ``CREATE_NO_WINDOW`` is deliberately absent.  Every 3.13.3 boundary child
+    exited with STATUS_DLL_INIT_FAILED (0xC0000142) before Python ran; the log
+    does not identify the cause.  ``CREATE_NO_WINDOW`` under the
+    write-restricted token is the believed cause, to be confirmed by the next
+    windows-2025 run.  The console is hidden through
+    STARTF_USESHOWWINDOW/SW_HIDE on the STARTUPINFO instead.
+    """
+    return (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+            | EXTENDED_STARTUPINFO_PRESENT)
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +799,14 @@ class WindowsAPI:
             raise _win_error(0, "UpdateProcThreadAttribute")
         startup = _STARTUPINFOEX()
         startup.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEX)
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        # Hide the console with STARTF_USESHOWWINDOW/SW_HIDE rather than
+        # CREATE_NO_WINDOW.  The 3.13.3 children all died at DLL init with
+        # 0xC0000142; CREATE_NO_WINDOW under the write-restricted token is the
+        # believed cause (to be confirmed by the next windows-2025 run), and
+        # SW_HIDE is the smallest change that still hides the console.
+        startup.StartupInfo.dwFlags = (STARTF_USESTDHANDLES
+                                       | STARTF_USESHOWWINDOW)
+        startup.StartupInfo.wShowWindow = SW_HIDE
         startup.StartupInfo.hStdInput = ctypes.c_void_p(int(handles[0]))
         startup.StartupInfo.hStdOutput = ctypes.c_void_p(int(handles[1]))
         startup.StartupInfo.hStdError = ctypes.c_void_p(int(handles[2]))
@@ -794,8 +817,7 @@ class WindowsAPI:
         block = ctypes.create_unicode_buffer("\0".join(items) + "\0\0")
         cmd = ctypes.create_unicode_buffer(str(command_line))
         info = _PROCESS_INFORMATION()
-        flags = (CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
-                 | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT)
+        flags = _process_flags()
         ok = self.advapi32.CreateProcessAsUserW(
             token, str(application), cmd, None, None, True, flags,
             ctypes.cast(block, ctypes.c_void_p), str(cwd),
@@ -844,7 +866,10 @@ def canonical_root(path, api=None):
             pass
     real = os.path.normcase(_strip_extended(long_path))
     parent = os.path.dirname(lexical) or lexical
-    parent_real = os.path.realpath(parent)
+    # Compare like with like: ``real`` is normcased above, so the parent must
+    # be normcased too.  On Windows the old comparison mixed ``d:\\...`` with
+    # ``D:\\...`` and rejected every root as a reparse escape.
+    parent_real = os.path.normcase(os.path.realpath(parent))
     try:
         if os.path.commonpath([real, parent_real]) != parent_real:
             raise PolicyError("reparse_escape")

@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.13.3)
+# Operations: configuration, safety, budgets, traces and retention (v3.13.4)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -560,7 +560,7 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-### OS sandbox modes and config keys (3.13.3)
+### OS sandbox modes and config keys (3.13.4)
 
 `os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
 `true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
@@ -574,7 +574,7 @@ boundary. `off` records `enforcement=none` and does not claim a boundary.
 | `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
 | `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
 | `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
-| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.3 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.4 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
 | `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
 | `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
 | `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
@@ -597,18 +597,22 @@ network and UNC writes are not blocked, and delete/rename outside is reported as
 `delete_outside=unverified` unless a Windows boundary run proves it. The first
 real `windows-2025` run (42629362611, 3.13.2) failed in the sandbox probe before
 the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`,
-`usable=false`). 3.13.3 fixes the wrong-DLL bindings, and the next GitHub run is
-the only Windows proof. The runner account is an Administrators member, but that
-is not the same as an elevated process token; the probe records `admin` (token
-elevation) and `admin_member` (account group) separately. This is a file-write
-boundary, not a container, VM, network firewall or malware sandbox.
+`usable=false`). 3.13.3 fixed the wrong-DLL bindings; run 42648360100 then
+proved the probe (`usable=true`, `write_restricted=true` on py3.9 and py3.15)
+but the suite was red and `admin_member` could not be measured (`WinError
+1309`). 3.13.4 contains the suite fixes; the next GitHub run is the required Windows evidence
+of the suite and the boundary. The runner account is an Administrators member,
+but that is not the same as an elevated process token; the probe records
+`admin` (token elevation) and `admin_member` (account group) separately. This
+is a file-write boundary, not a container, VM, network firewall or malware
+sandbox.
 
 The child environment is scrubbed: only `DEEPSEEK_API_KEY` and the key
 variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
-### Restart per OS (3.13.3)
+### Restart per OS (3.13.4)
 
 Restart is best-effort and OS-specific; the status file records `state`,
 `verified_by`, `error` and the resolved opener. macOS closes/reopens with
@@ -909,6 +913,14 @@ resolves to Ubuntu 26.04, where `actions/setup-python` has no Python 3.9 build
 Linux Landlock boundary remains proven on `ubuntu-24.04`; do not move the
 Linux leg back to `ubuntu-latest` until that image provides Python 3.9.
 
+A macOS job can be cancelled while still queued. In run 42648360100 the
+`macos-latest` py3.9 job waited 901 s with `steps: []` and `runner_name: ""`,
+then finished `cancelled`: it never reached the 25-minute `timeout-minutes`,
+and no newer run existed to trigger `concurrency.cancel-in-progress`. That is
+hosted-runner capacity, not this workflow's matrix or timeout. Re-run that job
+(`gh run rerun <run-id> --job <job-id>`); do not raise the timeout or serialise
+the matrix for it.
+
 `scripts/ci.sh` is the single source of the checks on macOS and Linux and is
 runnable locally with the same command CI uses (`bash scripts/ci.sh`, with
 `PYTHON` overriding the interpreter). The Windows job is one step,
@@ -932,9 +944,11 @@ permissions are `contents: read`, and the workflow uses no secrets and no
 
 The admin-runner caveat is stated rather than hidden: the first
 `windows-2025` run (42629362611) failed in the probe, so its `admin=False` was
-not a measured elevation result and no boundary evidence exists yet. 3.13.3
-records token elevation and Administrators-group membership separately; the
-next GitHub run is the only Windows proof. Until it is green, no
+not a measured elevation result. Run 42648360100 proved the probe on both
+Pythons but was red in the suite, and its Administrators-membership query
+failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.4
+records token elevation and group membership separately; the next GitHub run
+is the only Windows proof of the suite and the boundary. Until it is green, no
 create/modify/append/truncate denial is claimed, delete/rename outside stays
 `delete_outside=unverified`, and CI makes no no-admin claim. The standard-user
 path remains established only by the user's Windows 11 arm64 VM run.

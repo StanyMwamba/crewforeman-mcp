@@ -38,8 +38,10 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(name.endswith("-py3-none-any.whl"))
             with zipfile.ZipFile(str(wheel)) as archive:
                 names = archive.namelist()
-
-            archive = zipfile.ZipFile(str(wheel))
+                # Read once inside the context: a second, unclosed ZipFile
+                # keeps the .whl open and Windows tempdir cleanup fails with
+                # WinError 32.
+                contents = {name: archive.read(name) for name in names}
             self.assertIn(DIST_INFO + "/METADATA", names)
             self.assertIn(DIST_INFO + "/WHEEL", names)
             self.assertIn(DIST_INFO + "/entry_points.txt", names)
@@ -47,20 +49,20 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("deepseek_mcp/__init__.py", names)
             self.assertIn("deepseek_mcp/server.py", names)
 
-            metadata = archive.read(DIST_INFO + "/METADATA").decode("utf-8")
+            metadata = contents[DIST_INFO + "/METADATA"].decode("utf-8")
             self.assertIn("Metadata-Version: 2.1", metadata)
             self.assertIn("Name: crewforeman-mcp", metadata)
             self.assertIn("Version: %s" % VERSION, metadata)
             self.assertIn("Requires-Python: >=3.9", metadata)
 
-            wheel_meta = archive.read(DIST_INFO + "/WHEEL").decode("utf-8")
+            wheel_meta = contents[DIST_INFO + "/WHEEL"].decode("utf-8")
             self.assertIn("Wheel-Version: 1.0", wheel_meta)
             self.assertIn("Root-Is-Purelib: true", wheel_meta)
             self.assertIn("Tag: py3-none-any", wheel_meta)
 
-            entry_points = archive.read(
+            entry_points = contents[
                 DIST_INFO + "/entry_points.txt"
-            ).decode("utf-8")
+            ].decode("utf-8")
             self.assertIn("[console_scripts]", entry_points)
             self.assertIn(
                 "crewforeman-mcp = deepseek_mcp.server:main",
@@ -94,7 +96,7 @@ class PackagingTests(unittest.TestCase):
                 self.assertNotIn("__pycache__", parts, item)
                 self.assertFalse(item.endswith((".pyc", ".log", ".egg-info")), item)
 
-            record = archive.read(DIST_INFO + "/RECORD").decode("utf-8")
+            record = contents[DIST_INFO + "/RECORD"].decode("utf-8")
             record_lines = record.splitlines()
             self.assertTrue(
                 record_lines[-1].startswith(DIST_INFO + "/RECORD,"),
@@ -107,11 +109,11 @@ class PackagingTests(unittest.TestCase):
             _, digest_part, size_part = metadata_line.split(",")
             expected = base64.urlsafe_b64encode(
                 hashlib.sha256(
-                    archive.read(DIST_INFO + "/METADATA")
+                    contents[DIST_INFO + "/METADATA"]
                 ).digest()
             ).rstrip(b"=").decode("ascii")
             self.assertEqual(digest_part, "sha256=" + expected)
-            self.assertEqual(int(size_part), len(archive.read(DIST_INFO + "/METADATA")))
+            self.assertEqual(int(size_part), len(contents[DIST_INFO + "/METADATA"]))
 
     def test_sdist_contents(self):
         with tempfile.TemporaryDirectory() as tmp:

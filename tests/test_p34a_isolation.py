@@ -53,7 +53,8 @@ class PerTestIsolationTests(unittest.TestCase):
         for name, expected in isolation.HOME_AT_IMPORT.items():
             self.assertEqual(os.environ.get(name), expected,
                              "%s must not be redirected per test" % name)
-        home = os.environ.get("HOME")
+        # windows-2025 exposes USERPROFILE; HOME is not guaranteed there.
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
         self.assertIsNotNone(home)
         self.assertFalse(str(Path(home)).startswith(str(case)))
         self.assertEqual(Path.home(), Path(home))

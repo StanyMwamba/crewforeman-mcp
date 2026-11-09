@@ -5,6 +5,54 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.4
+
+3.13.4: Windows test-suite portability fixes (proof pending the next windows-2025 run)
+
+- **Windows child output.** `harness._execute_once_impl` polled the child's
+  stdout pipe with Winsock `select`, which raises `WinError 10038` on Windows;
+  the exception was swallowed and no `--json` event was ever parsed. A bounded
+  daemon reader thread (`_StdoutPump`) is now used on Windows, with the POSIX
+  `select` path unchanged. This was the largest single failure cluster (the
+  `Harness run failed (exit 0): None` family).
+- **Windows sandbox.** `canonical_root` compared a normcased real path with a
+  non-normcased parent, so ACL roots were rejected and no grant was applied;
+  both sides are normcased. The restricted child no longer uses
+  `CREATE_NO_WINDOW`. Every 3.13.3 boundary child exited `0xC0000142`
+  (`STATUS_DLL_INIT_FAILED`) before Python ran; the log does not identify the
+  cause. `CREATE_NO_WINDOW` under the write-restricted token is the *believed*
+  cause, to be confirmed by the next `windows-2025` run — a hidden console
+  under the same token could fail the same way with `SW_HIDE`. The console is
+  now hidden with `STARTF_USESHOWWINDOW`/`SW_HIDE`; the real boundary test is
+  unchanged and no Windows boundary is claimed until the next run proves it.
+- **Paths and records.** Plan paths stay POSIX and case-preserving; case
+  folding is limited to comparison on Windows. macOS is matched
+  case-sensitively because APFS may be formatted case-sensitive, so no
+  host-wide assumption is made. Workspace roots
+  keep their on-disk case. `PROJECT_MAP.md` is normalised to LF before hashing
+  and `os.fchmod` is guarded on Windows. Work/event locks use a
+  kernel-released advisory lock instead of an `O_EXCL` file that could be
+  orphaned by a Windows sharing violation.
+- **Credentials and packaging.** The Windows owner-only ACL read-back accepts
+  `icacls`' `DOMAIN\user:(F)` rendering and verifies that the single explicit
+  full-control ACE names the current account (a foreign or inherited ACE is
+  rejected), instead of requiring a literal SID; the sdist derives executable
+  intent from a shebang when a Windows checkout has no POSIX x-bit.
+- **Test portability (explicit skips, no silent passes).** Config comparisons use `Path`
+  identity; the log-dir test accepts Windows' `FileExistsError [WinError 183]`
+  for the same not-a-directory condition; fake HOME also patches
+  USERPROFILE; the fake Chrome sidecar follows the script path; the selective
+  fake is compiled on Windows; the fake launcher quotes argv (multi-line tasks
+  were split); packaging closes its wheel handle; bash detection skips the WSL
+  stub; Seatbelt expectations use `_sbpl_quote` and inject the target system;
+  Landlock-only tests are skipped on win32 with an explicit reason; the
+  builder-backup test sets an observable mtime.
+- **Evidence.** The 3.13.3 `windows-2025` run (42648360100) was red: 1,718
+  tests, 82 failures + 141 errors (py3.9) and 83 + 139 (py3.15), plus the
+  boundary failure. The next `windows-2025` run is the required evidence for this entry;
+  local macOS 3.9/3.15 and Linux 3.9/3.15 runs are recorded in
+  `CI-LOCAL-3134-*.log`. README changes only its version line.
+
 ## 3.13.3
 
 3.13.3: Windows sandbox probe fix (first real windows-2025 run)
@@ -30,8 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Admin is independent.** Elevation (`admin`, TokenElevation) and
   Administrators-group membership (`admin_member`, CheckTokenMembership) are
   measured through their own token before the write-restriction probe, so a
-  later restriction failure cannot overwrite them. The runner account
-  `runneradmin` is an Administrators member; the failed 3.13.2 probe's
+  later restriction failure cannot overwrite them. The hosted runner account is an
+  Administrators member; the failed 3.13.2 probe's
   `admin=False` was not a reliable elevation measurement, and 3.13.3 does not
   treat it as one.
 - **Host-independent tests.** New tests load `sandbox_windows` with a fake

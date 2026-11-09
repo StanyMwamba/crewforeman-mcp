@@ -268,6 +268,38 @@ class CiWorkflowContractTest(unittest.TestCase):
         self.assertIn("eol=crlf", rules["*.ps1"])
 
 
+def _usable_bash():
+    r"""Return a bash that can parse POSIX shell, not the Windows WSL stub.
+
+    On windows-2025 ``shutil.which("bash")`` can resolve
+    ``C:\Windows\System32\bash.exe``, which exits 1 with "Windows
+    Subsystem for Linux has no installed distributions".  Git for Windows
+    ships a real bash; prefer it on nt and validate every candidate.
+    """
+    candidates = []
+    found = shutil.which("bash")
+    if found:
+        candidates.append(found)
+    if os.name == "nt":
+        candidates.extend([
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ])
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and "GNU bash" in (probe.stdout + probe.stderr):
+            return candidate
+    return None
+
+
 class CiScriptContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -322,16 +354,21 @@ class CiScriptContractTest(unittest.TestCase):
             self.assertNotIn("secrets[", text, label)
 
     def test_bash_script_passes_bash_syntax(self):
-        if shutil.which("bash") is None:
-            self.skipTest("bash is not installed on this host; "
+        bash = _usable_bash()
+        if bash is None:
+            self.skipTest("no usable bash is installed on this host; "
                           "scripts/ci.sh syntax is unverified here")
-        completed = subprocess.run(
-            ["bash", "-n", str(CI_SCRIPT)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=30,
-        )
+        # Feed the file on stdin: a native D:\... path is mangled by MSYS
+        # bash's backslash and drive-prefix handling.
+        with open(str(CI_SCRIPT), "rb") as handle:
+            completed = subprocess.run(
+                [bash, "-n"],
+                stdin=handle,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=30,
+            )
         self.assertEqual(
             completed.returncode, 0,
             "bash -n failed for %s\nstdout:\n%s\nstderr:\n%s"

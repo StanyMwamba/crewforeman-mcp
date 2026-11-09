@@ -30,6 +30,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import platforms
+
 try:  # pragma: no cover - the normal package import path
     from .api import redact_secrets as _redact
 except Exception:  # pragma: no cover - standalone import
@@ -213,65 +215,32 @@ class EventLog(object):
     # -- locking -------------------------------------------------------
     @contextlib.contextmanager
     def _lock(self):
-        """Acquire the per-directory lock; always remove it in ``finally``."""
+        """Acquire the per-directory advisory lock.
+
+        An O_CREAT|O_EXCL existence lock cannot be shared with WorkStore's
+        lock file: on Windows a reader can block the holder's unlink, and a
+        lock left behind by a crashed writer blocks every later append for
+        the stale timeout.  The kernel releases an advisory lock on exit.
+        """
         try:
             self.work_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        deadline = time.time() + _LOCK_TIMEOUT
-        fd = None
-        owned = False
-        while True:
-            try:
-                fd = os.open(str(self.lock_path),
-                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                owned = True
-                break
-            except FileExistsError:
-                stale = False
-                try:
-                    stale = (time.time() - self.lock_path.stat().st_mtime
-                             > _LOCK_STALE_AFTER)
-                except OSError:
-                    stale = False
-                if stale:
-                    try:
-                        self.lock_path.unlink()
-                    except OSError:
-                        pass
-                    continue
-                if time.time() >= deadline:
-                    raise TimeoutError("Timed out locking %s" % self.work_dir)
-                time.sleep(0.01)
-            except OSError:
-                # A filesystem that cannot create the lock must not prevent
-                # journal writes; the append itself is still O_APPEND.
-                break
+        lock = platforms.file_lock(self.lock_path, timeout=_LOCK_TIMEOUT)
         try:
-            if fd is not None:
-                try:
-                    os.write(fd, json.dumps({
-                        "pid": os.getpid(), "at": time.time(),
-                    }).encode("utf-8"))
-                except OSError:
-                    pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                fd = None
+            lock.__enter__()
+        except TimeoutError as exc:
+            # A filesystem that cannot create the lock must not prevent
+            # journal writes (the append itself is still O_APPEND).  A real
+            # contention timeout must still surface.
+            if "cannot open lock" not in str(exc):
+                raise
+            yield
+            return
+        try:
             yield
         finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if owned:
-                try:
-                    self.lock_path.unlink()
-                except OSError:
-                    pass
+            lock.__exit__(None, None, None)
 
     # -- reading -------------------------------------------------------
     @staticmethod

@@ -263,6 +263,20 @@ def _sdist_paths():
     return sorted(paths, key=lambda item: item.relative_to(ROOT).as_posix())
 
 
+def _sdist_mode(path, data):
+    """Canonical tar mode for one source file.
+
+    A Windows checkout has no POSIX execute bits, so ``st_mode`` alone would
+    publish ``scripts/clean_install.sh`` as 0644 and break the sdist contract.
+    A shebang is the portable executable intent; keep the stat bit as the
+    primary signal on POSIX.
+    """
+    executable = bool(path.stat().st_mode & 0o111)
+    if not executable and data.startswith(b"#!"):
+        executable = True
+    return 0o755 if executable else 0o644
+
+
 def build_sdist(sdist_directory, config_settings=None):
     target = Path(sdist_directory) / SDIST_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -272,8 +286,8 @@ def build_sdist(sdist_directory, config_settings=None):
     entries = []
     for path in _sdist_paths():
         relative = path.relative_to(ROOT).as_posix()
-        mode = 0o755 if (path.stat().st_mode & 0o111) else 0o644
-        entries.append((relative, path.read_bytes(), mode))
+        data = path.read_bytes()
+        entries.append((relative, data, _sdist_mode(path, data)))
     # A source distribution carries PKG-INFO at its root; pip and older
     # setuptools read it directly before building the wheel.
     entries.append(("PKG-INFO", _metadata_text().encode("utf-8"), 0o644))

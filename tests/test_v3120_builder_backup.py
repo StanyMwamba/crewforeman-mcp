@@ -191,6 +191,12 @@ class SideEffectGuardTests(unittest.TestCase):
             )
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("two\n")
+            # The guard is documented as mtime+size best-effort.  Windows
+            # temp volumes can expose coarse timestamps, so make the change
+            # observable instead of assuming POSIX mtime granularity.
+            stat = os.stat(path)
+            os.utime(path, ns=(stat.st_atime_ns,
+                               stat.st_mtime_ns + 2_000_000_000))
             self.assertEqual(
                 bb.side_effect_guard_result(before, workspace),
                 {"clean": False, "reason": "side_effects"},

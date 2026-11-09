@@ -10,6 +10,7 @@ and otherwise reports cost as unknown (never guesses when nothing is readable).
 import datetime as dt
 import json
 import os
+import queue
 import re
 import select
 import shutil
@@ -73,6 +74,62 @@ STOP_GRACE_SECONDS = 2.0
 # long: a grandchild may flush one last event, but a silent or flooding
 # grandchild must never hold the reader open indefinitely.
 EXIT_DRAIN_SECONDS = 1.0
+# Windows ``select`` only accepts sockets, so a child stdout pipe cannot be
+# polled with it (WSAENOTSOCK 10038).  On Windows a daemon reader thread pumps
+# raw chunks into this bounded queue instead; POSIX keeps the select loop.
+STDOUT_QUEUE_CHUNKS = 64
+USE_STDOUT_PUMP = (os.name == "nt")
+
+
+class _StdoutPump:
+    """Read a child stdout pipe from a daemon thread (Windows).
+
+    ``select.select`` is Winsock-only on Windows and raises WinError 10038 for
+    an anonymous pipe.  The pump reproduces the POSIX reader: raw reads, an
+    EOF sentinel, and a bounded queue so a flooding child applies backpressure
+    instead of growing memory without limit.  ``close`` can be called while
+    the reader is blocked; the thread is a daemon and the caller terminates
+    the process tree before abandoning it.
+    """
+
+    def __init__(self, stream, max_chunks=STDOUT_QUEUE_CHUNKS):
+        self._stream = stream
+        self._queue = queue.Queue(maxsize=max_chunks)
+        self._closed = threading.Event()
+        self._eof = threading.Event()
+        self._thread = threading.Thread(
+            target=self._pump, name="dsh-stdout-reader", daemon=True)
+        self._thread.start()
+
+    def _pump(self):
+        try:
+            while not self._closed.is_set():
+                try:
+                    chunk = os.read(self._stream.fileno(), 65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+                while not self._closed.is_set():
+                    try:
+                        self._queue.put(chunk, timeout=STALL_POLL_SECONDS)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            self._eof.set()
+
+    def read(self, timeout):
+        """Return bytes, ``b""`` at EOF, or ``None`` when idle."""
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return b"" if self._eof.is_set() else None
+
+    def close(self):
+        self._closed.set()
+
+
 # A reviewer's background child may still be writing its session log when the
 # direct child exits, so its final activity scan is delayed by one short
 # settle window.  Product runs keep the proven 1 s window; the unit suite
@@ -2898,6 +2955,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
             watch.touch("event", parsed.get("type") or "event")
 
     drain_deadline = None
+    pump = _StdoutPump(proc.stdout) if USE_STDOUT_PUMP else None
     try:
         while True:
             if stop["reason"] is not None:
@@ -2920,18 +2978,29 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                     break
                 timeout = min(0.1 if exited else STALL_POLL_SECONDS, remaining)
             try:
-                ready, _writable, _errors = select.select(
-                    [proc.stdout], [], [], timeout)
-            except (OSError, ValueError):
+                if pump is not None:
+                    chunk = pump.read(timeout)
+                    if chunk is None:
+                        continue
+                else:
+                    ready, _writable, _errors = select.select(
+                        [proc.stdout], [], [], timeout)
+                    if not ready:
+                        # Keep draining until EOF, a stop reason, or the
+                        # post-exit deadline. Do not break on the first idle
+                        # select after exit: a grandchild may flush the final
+                        # event shortly afterwards.
+                        continue
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+            except OSError as exc:
+                # Defence in depth: a host whose select() cannot poll this
+                # pipe (Windows WSAENOTSOCK, 10038) must not silently disable
+                # the event stream. Switch to the reader thread and retry.
+                if pump is None and getattr(exc, "winerror", None) == 10038:
+                    pump = _StdoutPump(proc.stdout)
+                    continue
                 break
-            if not ready:
-                # Keep draining until EOF, a stop reason, or the post-exit
-                # deadline. Do not break on the first idle select after exit:
-                # a grandchild may flush the final event shortly afterwards.
-                continue
-            try:
-                chunk = os.read(proc.stdout.fileno(), 65536)
-            except OSError:
+            except ValueError:
                 break
             if not chunk:
                 break
@@ -2978,6 +3047,8 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                     code = proc.poll()
         except Exception:
             code = proc.poll()
+        if pump is not None:
+            pump.close()
         try:
             proc.stdout.close()
         except Exception:

@@ -74,7 +74,13 @@ class RenderProbeTests(unittest.TestCase):
         })
 
     def _chrome_config(self, **values):
-        Path(str(self.chrome) + ".config.json").write_text(
+        # On Windows write_fake_script returns <name>.exe while the Python
+        # body (and therefore __file__) is the suffix-less script.  Write the
+        # sidecar beside the script, not beside the launcher.
+        target = Path(str(self.chrome))
+        if target.suffix == ".exe":
+            target = target.with_suffix("")
+        Path(str(target) + ".config.json").write_text(
             json.dumps(values), encoding="utf-8")
 
     def _invocations(self):

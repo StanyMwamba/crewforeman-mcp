@@ -131,7 +131,11 @@ class TransportTests(unittest.TestCase):
 
             argv = json.loads((self.tmp / "argv.json").read_text(encoding="utf-8"))
             self.assertEqual(argv[1:3], ["--profile", "sdk"])
-            self.assertEqual(argv[0], str(self.script))
+            # On Windows write_fake_script returns <name>.exe while the child
+            # Python body still sees the suffix-less script as argv[0].
+            expected_script = (
+                self.script.with_suffix("") if os.name == "nt" else self.script)
+            self.assertEqual(argv[0], str(expected_script))
 
             params = json.loads((self.tmp / "params.json").read_text(encoding="utf-8"))
             self.assertEqual(params["provider"], "deepseek-official")
@@ -304,7 +308,11 @@ class HarnessSdkWiringTests(unittest.TestCase):
         cancel = lambda: True
         with TemporaryDirectory() as ws:
             cfg = load_config(config_path=Path(ws) / "missing.json", env={})
+            seatbelt = {"kind": "seatbelt", "enforcement": "enforced",
+                        "abi": "seatbelt", "tested": True}
             with mock.patch.object(harness.safety.sys, "platform", "darwin"), \
+                    mock.patch.object(harness.safety, "sandbox_status",
+                                      return_value=seatbelt), \
                     mock.patch.object(harness.safety, "seatbelt_usable",
                                       return_value=True), \
                     mock.patch.object(harness.transport_mod, "SdkClient",

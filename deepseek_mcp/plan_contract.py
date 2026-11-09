@@ -23,6 +23,7 @@ import datetime as _dt
 import json
 import os
 import re
+import sys
 
 try:  # pragma: no cover - api is import-safe in practice
     from .api import redact_secrets
@@ -180,18 +181,40 @@ def normalize_path(value):
         parts.append(segment)
     if not parts:
         return None
-    path = "/".join(parts)
-    if os.name == "nt":  # pragma: no cover - exercised on Windows only
-        path = os.path.normcase(path)
-    return path
+    # Always POSIX form.  os.path.normcase is a comparison primitive on
+    # Windows (it lowercases and rewrites "/" as "\\"); applying it here
+    # corrupted the persisted/reported spelling of every path.
+    return "/".join(parts)
+
+
+#: Windows file APIs compare names case-insensitively, so plan matching folds
+#: case there.  macOS is deliberately *not* folded host-wide: APFS can be
+#: formatted case-sensitive, and this module cannot know which volume holds the
+#: workspace without depending on the current directory.  Treating every Mac as
+#: case-insensitive would merge ``A.py`` and ``a.py`` on a case-sensitive
+#: volume; matching exactly is the conservative choice.  The flag only affects
+#: comparisons and glob compilation; stored/reported paths stay case-preserving
+#: POSIX everywhere.
+_CASE_INSENSITIVE_FS = sys.platform == "win32"
+
+
+def match_key(value):
+    """Case-fold a normalised relative path for comparison only."""
+    normal = normalize_path(value)
+    if normal is None:
+        return None
+    return normal.casefold() if _CASE_INSENSITIVE_FS else normal
+
+
+def same_path(left, right):
+    """True when two declared paths name the same file on this platform."""
+    left_key = match_key(left)
+    return left_key is not None and left_key == match_key(right)
 
 
 def is_plan_path(path, cfg):
-    """True when ``path`` is the configured plan file (POSIX case-sensitive)."""
-    normal = normalize_path(path)
-    if normal is None:
-        return False
-    return normal == plan_path(cfg)
+    """True when ``path`` names the configured plan file on this platform."""
+    return same_path(path, plan_path(cfg))
 
 
 def _is_bookkeeping(path, cfg):
@@ -200,6 +223,7 @@ def _is_bookkeeping(path, cfg):
 
 
 def _glob_regex(pattern):
+    flags = re.IGNORECASE if _CASE_INSENSITIVE_FS else 0
     out = []
     index = 0
     while index < len(pattern):
@@ -221,7 +245,7 @@ def _glob_regex(pattern):
         else:
             out.append(re.escape(char))
             index += 1
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile("^" + "".join(out) + "$", flags)
 
 
 def _has_glob(entry):
@@ -233,7 +257,7 @@ def _entry_matches(entry, path):
         return False
     if _has_glob(entry):
         return bool(_glob_regex(entry).match(path))
-    return entry == path
+    return same_path(entry, path)
 
 
 def _prefix_matches(entry, path):
@@ -251,7 +275,12 @@ def _prefix_matches(entry, path):
             return True
         parts = path.split("/")
         return any(regex.match("/".join(parts[:index])) for index in range(1, len(parts)))
-    return path == entry or path.startswith(entry + "/")
+    if _CASE_INSENSITIVE_FS:
+        folded_path = path.casefold()
+        folded_entry = entry.casefold()
+        return (same_path(path, entry)
+                or folded_path.startswith(folded_entry + "/"))
+    return same_path(path, entry) or path.startswith(entry + "/")
 
 
 def _is_test_path(path):
@@ -293,8 +322,9 @@ def _path_list(data, key, errors, allow_root=False):
             if path is None:
                 errors.append("%s: invalid path" % key)
                 continue
-        if path not in seen:
-            seen.add(path)
+        dedupe_key = match_key(path) if _CASE_INSENSITIVE_FS else path
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
             result.append(path)
     return result
 
@@ -539,7 +569,7 @@ def actual_changes(workspace, before, after, cfg):
     plan_rel = plan_path(cfg)
     created, modified, deleted, ignored = [], [], [], []
     for path in sorted(set(before_map) | set(after_map)):
-        if path == plan_rel:
+        if same_path(path, plan_rel):
             ignored.append(path)
             continue
         if path_scope.is_artifact(path, cfg):

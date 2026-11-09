@@ -1,4 +1,4 @@
-"""Contract tests for the crewforeman-mcp 3.13.3 INSTALL and CLIENTS docs.
+"""Contract tests for the crewforeman-mcp 3.13.4 INSTALL and CLIENTS docs.
 
 Standard library only and Python 3.9 compatible.  Intended to live at
 ``repo/tests/test_v3121_install_docs.py`` and run with::
@@ -71,7 +71,7 @@ CLIENT_LAUNCH_TERMS = (
 )
 
 INSTALL_TERMS = (
-    ("3.13.3", "3.13.3"),
+    ("3.13.4", "3.13.4"),
     ("~/.dsh/.credentials.yaml", "~/.dsh/.credentials.yaml"),
     ("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"),
     ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
@@ -185,7 +185,7 @@ def _matches(headings, aliases):
 
 
 def _mentions(text, term):
-    if term == "3.13.3":
+    if term == "3.13.4":
         return re.search(r"(?<![\d.])3\.13\.3(?![\d.])", text) is not None
     if term.startswith("~"):
         return term in text

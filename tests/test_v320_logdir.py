@@ -80,7 +80,11 @@ class LogDirTests(unittest.TestCase):
         self.assertIn("not writable", reason)
         self.assertIn("fallback", reason)
         self.assertIn(str(primary), reason)
-        self.assertIn("NotADirectoryError", reason)
+        # POSIX reports ENOTDIR.  Windows CreateDirectory reports
+        # ERROR_ALREADY_EXISTS (WinError 183) when a parent component is a
+        # file; both are the same "not a directory" condition.
+        self.assertRegex(
+            reason, r"NotADirectoryError|FileExistsError: \[WinError 183\]")
 
         md_text = md_path.read_text(encoding="utf-8")
         self.assertIn("Log fallback:", md_text)
@@ -199,7 +203,8 @@ class LogDirTests(unittest.TestCase):
         self.assertIn("Cannot write runs to", message)
         self.assertIn(str(primary), message)
         self.assertIn(str(fallback), message)
-        self.assertIn("NotADirectoryError", message)
+        self.assertRegex(
+            message, r"NotADirectoryError|FileExistsError: \[WinError 183\]")
 
     def test_result_text_warns_about_log_fallback(self):
         reason = (

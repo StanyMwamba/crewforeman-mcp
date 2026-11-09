@@ -96,9 +96,21 @@ class ResolveTests(unittest.TestCase):
 
     def test_os_sandbox_flag(self):
         cfg = {}
+        seatbelt = {
+            "schema": 1, "kind": "seatbelt", "enforcement": "enforced",
+            "abi": "seatbelt", "probe": {"ok": True, "at": 0, "ttl": 300,
+                                         "reason": None},
+            "canary": {"ok": None, "at": None, "reason": "not_run"},
+            "tested": True, "degraded": False, "blocked": False,
+            "reason": None, "temp_roots": [], "profile_sha256": None,
+            "requested": "auto", "platform": "Darwin",
+            "writes_outside": "denied", "delete_outside": "denied",
+            "network": "unrestricted", "sandbox_header": "fixture",
+        }
         with mock.patch.object(safety.sys, "platform", "darwin"), mock.patch.object(
             safety, "seatbelt_usable", return_value=True
-        ):
+        ), mock.patch.object(safety, "sandbox_status",
+                            return_value=dict(seatbelt)):
             self.assertIs(safety.resolve({}, cfg=cfg)["os_sandbox"], True)
             self.assertIs(
                 safety.resolve({}, cfg={"os_sandbox": "off"})["os_sandbox"], False
@@ -121,9 +133,13 @@ class ResolveTests(unittest.TestCase):
                 mock.patch.object(safety, "sandbox_status",
                                   return_value=linux_status):
             self.assertIs(safety.resolve({}, cfg=cfg)["os_sandbox"], True)
+        unavailable = dict(seatbelt, kind="none", enforcement="none",
+                           abi=None, tested=False, degraded=True,
+                           reason="sandbox-exec not available")
         with mock.patch.object(safety.sys, "platform", "darwin"), mock.patch.object(
             safety, "seatbelt_usable", return_value=False
-        ):
+        ), mock.patch.object(safety, "sandbox_status",
+                            return_value=unavailable):
             self.assertIs(safety.resolve({}, cfg=cfg)["os_sandbox"], False)
 
 
@@ -208,14 +224,15 @@ class SeatbeltTests(unittest.TestCase):
                         profile)
         self.assertIn("/dev/null", profile)
         # no broad workspace write allowance in read-only mode
-        self.assertNotIn('(subpath "%s")' % os.path.realpath(ws), profile)
+        self.assertNotIn('(subpath %s)'
+                         % safety._sbpl_quote(os.path.realpath(ws)), profile)
 
     def test_profile_workspace_write_and_extra(self):
         ws = os.path.realpath("/tmp/dsh-ws")
         extra = os.path.realpath("/tmp/extra")
         profile = safety.seatbelt_profile(ws, mode="workspace-write", extra_writes=[extra])
-        self.assertIn('(subpath "%s")' % ws, profile)
-        self.assertIn('(subpath "%s")' % extra, profile)
+        self.assertIn('(subpath %s)' % safety._sbpl_quote(ws), profile)
+        self.assertIn('(subpath %s)' % safety._sbpl_quote(extra), profile)
 
     def test_profile_escapes_quotes_and_backslashes(self):
         profile = safety.seatbelt_profile('/tmp/weird"dir\\x', mode="read-only")
@@ -233,7 +250,11 @@ class WrapTests(unittest.TestCase):
         self.assertIn("reason", meta)
 
     def test_missing_binary_falls_back(self):
+        seatbelt = {"kind": "seatbelt", "enforcement": "enforced",
+                    "abi": "seatbelt", "tested": True}
         with mock.patch.object(safety.sys, "platform", "darwin"), \
+                mock.patch.object(safety, "sandbox_status",
+                                 return_value=seatbelt), \
                 mock.patch.object(safety, "seatbelt_usable", return_value=False), \
                 mock.patch.object(safety, "_SEATBELT_PROBE",
                                   {"done": True, "usable": False,
@@ -246,7 +267,11 @@ class WrapTests(unittest.TestCase):
         self.assertIn("not available", meta["reason"])
 
     def test_wraps_when_available(self):
+        seatbelt = {"kind": "seatbelt", "enforcement": "enforced",
+                    "abi": "seatbelt", "tested": True}
         with mock.patch.object(safety.sys, "platform", "darwin"), \
+                mock.patch.object(safety, "sandbox_status",
+                                 return_value=seatbelt), \
                 mock.patch.object(safety, "seatbelt_usable", return_value=True):
             argv, meta = safety.wrap_command(
                 ["dsh", "--profile", "sdk"],
@@ -339,12 +364,14 @@ class SnapshotDiffTests(unittest.TestCase):
             ws, mode="read-only", extra_writes=[reviewer_home],
             dsh_home=reviewer_home)
         dsh_home = os.path.realpath(os.path.expanduser("~/.dsh"))
-        self.assertNotIn('(subpath "%s")' % dsh_home, profile)
+        self.assertNotIn('(subpath %s)' % safety._sbpl_quote(dsh_home),
+                         profile)
         self.assertIn(".credentials.yaml", profile)
         self.assertNotIn(os.path.join(dsh_home, "sessions"), profile)
         # The read-only run gets only its private DSH home, never the
         # operator's session/profile store.
-        self.assertIn(os.path.realpath(reviewer_home), profile)
+        self.assertIn(safety._sbpl_quote(os.path.realpath(reviewer_home)),
+                      profile)
         # Even without an explicit private home a read-only profile must never
         # grant the operator's writable DSH directories.
         bare = safety.seatbelt_profile(ws, mode="read-only")

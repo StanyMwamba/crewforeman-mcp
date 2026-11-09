@@ -438,6 +438,19 @@ def write_fake_script(path, body):
     ``DSH_CHROME_BIN``.
     """
     path = Path(path)
+    if os.name == "nt":
+        # MSVCRT os.execv does not quote argv: a multi-line task arrives split
+        # into words.  Replace it in the child wrapper with subprocess.run,
+        # which builds a correctly quoted command line, so fake wrappers that
+        # branch on the task text see the same arguments on Windows.
+        body = (
+            "import os as _cf_os, subprocess as _cf_subprocess, "
+            "sys as _cf_sys\n"
+            "def _cf_execv(_path, _args):\n"
+            "    _cf_sys.exit(_cf_subprocess.run("
+            "[_path] + list(_args[1:])).returncode)\n"
+            "_cf_os.execv = _cf_execv\n"
+        ) + body
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     if os.name == "nt":

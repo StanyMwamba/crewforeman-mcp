@@ -17,7 +17,7 @@ from unittest import mock
 
 from deepseek_mcp import authority, harness, health, work
 from deepseek_mcp.config import load_config
-from tests.fakes import base_env, write_fake_dsh
+from tests.fakes import base_env, write_fake_dsh, write_fake_script
 import tests
 
 os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
@@ -375,10 +375,10 @@ os.execv(REAL, [REAL] + sys.argv[1:])
         "preflight_model": preflight_model or "",
         "review_model": review_model or "",
     }
-    path = Path(path)
-    path.write_text(source, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    # Windows CreateProcess cannot execute a shebang script.  write_fake_script
+    # compiles the same test-only launcher used by the rest of the suite and
+    # returns the executable path on nt.
+    return write_fake_script(Path(path), source)
 
 
 @unittest.skipIf(

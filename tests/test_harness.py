@@ -107,6 +107,18 @@ class HarnessRunTests(unittest.TestCase):
         self.assertTrue(Path(path).is_file())
         self.assertIn("deliverable.md", run["output_files"])
 
+    def test_windows_stdout_pump_reads_events(self):
+        # Windows cannot select() a pipe.  Force the pump on every host so the
+        # fallback path is exercised by the normal macOS/Linux CI suite too.
+        with mock.patch.object(harness, "USE_STDOUT_PUMP", True):
+            text, run, _path = harness.run_harness({
+                "prompt": "Do a small task", "subagents": 0, "quality": False,
+                "workspace": str(self.workspace),
+            }, self.cfg())
+        self.assertEqual(run["status"], "ok")
+        self.assertEqual(run["tools_used"], {"bash": 1, "read": 1})
+        self.assertIn("Deliverable written", run.get("answer") or "")
+
     def test_quality_loop_and_score_are_recorded(self):
         write_session_log(self.sessions, self.workspace)
         with mock.patch.dict(os.environ, {"FAKE_DSH_SCORE": "9.1",

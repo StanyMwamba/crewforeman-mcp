@@ -362,15 +362,20 @@ def sandbox_support(system=None):
 
 
 def canonical_path(path, system=None):
-    """Return a canonical absolute path (Windows: normcase, no \\\\?\\ prefix)."""
+    r"""Return a canonical absolute path (Windows: no extended prefix).
+
+    Case is deliberately preserved: NTFS is case-insensitive, but records,
+    workspace roots and run journals must report the spelling the caller used
+    (``D:\a\...``, not ``d:\a\...``).  Containment comparisons
+    apply ``normcase`` themselves.
+    """
     text = os.path.expanduser(os.path.expandvars(str(path)))
     text = os.path.realpath(os.path.abspath(text))
     if normalize_system(system) == WINDOWS:
-        if text.startswith("\\\\?\\UNC\\"):
+        if text.lower().startswith("\\\\?\\unc\\"):
             text = "\\\\" + text[8:]
         elif text.startswith("\\\\?\\"):
             text = text[4:]
-        text = os.path.normcase(text)
     return text
 
 
@@ -394,6 +399,9 @@ def inside_path(path, root, system=None):
     try:
         path = canonical_path(path, system)
         root = canonical_path(root, system)
+        if normalize_system(system) == WINDOWS:
+            path = os.path.normcase(path)
+            root = os.path.normcase(root)
         return os.path.commonpath([path, root]) == root
     except (OSError, ValueError, TypeError):
         return False
@@ -460,6 +468,43 @@ def _windows_user_sid():
         return None
 
 
+def _windows_trustees(sid):
+    """Return the casefolded trustee spellings icacls may print for this user.
+
+    ``icacls`` renders an ACE trustee as ``DOMAIN\\user`` (or
+    ``COMPUTER\\user`` for a local account), never as the literal SID that
+    ``/grant:r *SID:F`` accepted.  The environment spelling is the normal case;
+    the caller asks ``whoami`` only when this set does not match.
+    """
+    names = set()
+    if sid:
+        names.add(str(sid).casefold())
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if user:
+        for domain in (os.environ.get("USERDOMAIN"),
+                       os.environ.get("COMPUTERNAME")):
+            if domain:
+                names.add(("%s\\%s" % (domain, user)).casefold())
+    return names
+
+
+def _windows_whoami_trustees():
+    """Return ``domain\\user`` names from whoami; never raises."""
+    binary = os.path.join(_windows_systemroot(), "System32", "whoami.exe")
+    try:
+        result = subprocess.run(
+            [binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=5.0)
+        if int(getattr(result, "returncode", 1)) != 0:
+            return set()
+        output = (getattr(result, "stdout", b"") or b"").decode(
+            "utf-8", "replace")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return set()
+    return {line.strip().casefold() for line in output.splitlines()
+            if "\\" in line.strip()}
+
+
 def _windows_private_acl(path, is_dir):
     sid = _windows_user_sid()
     binary = _icacls_binary()
@@ -477,8 +522,40 @@ def _windows_private_acl(path, is_dir):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0)
         output = (getattr(check, "stdout", b"") or b"").decode(
             "utf-8", "replace")
-        return (int(getattr(check, "returncode", 1)) == 0
-                and sid in output and "(F)" in output)
+        if int(getattr(check, "returncode", 1)) != 0:
+            return False
+        # icacls renders a trustee as DOMAIN\user, not as S-1-5-...; the old
+        # ``sid in output`` test therefore always failed on a normal runner.
+        # Accept exactly one explicit full-control ACE and verify its trustee
+        # is this user: the grant above used ``*SID:F``, so any other trustee
+        # (including a foreign account that somehow inherited in) is a failed
+        # read-back.  Parsing the display path is safe because we pass the
+        # exact path to icacls and only strip that known prefix.
+        aces = [line.strip() for line in output.splitlines()
+                if line.strip().endswith(")")]
+        if len(aces) != 1 or "(I)" in aces[0] or not aces[0].endswith("(F)"):
+            return False
+        line = aces[0]
+        marker = line.rfind(":(")
+        if marker <= 0:
+            return False
+        left = line[:marker].strip()
+        path_text = str(path)
+        if left.casefold().startswith(path_text.casefold()):
+            trustee = left[len(path_text):].strip()
+        else:
+            # icacls may normalise the displayed path (short 8.3 name, a
+            # trailing separator).  In that case keep the whole left side and
+            # require it to be exactly a known trustee; any leftover path text
+            # makes the check fail closed.
+            trustee = left
+        if not trustee:
+            return False
+        folded = trustee.casefold()
+        expected = _windows_trustees(sid)
+        if folded in expected:
+            return True
+        return folded in _windows_whoami_trustees()
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
@@ -519,9 +596,15 @@ def file_lock(path, timeout=10.0, system=None):
     system = normalize_system(system)
     deadline = time.time() + max(0.0, float(timeout))
     handle = None
-    mode = "a+b"
     try:
-        handle = open(str(path), mode)
+        # 0600: a lock file is private state and must not be group/other
+        # readable just because the process umask is 022.
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "a+b")
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
     except OSError as exc:
         raise TimeoutError("cannot open lock %s: %s" % (path, exc))
     acquired = False

@@ -1,4 +1,4 @@
-# Installing crewforeman-mcp 3.13.3
+# Installing crewforeman-mcp 3.13.4
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime dependencies**.
 It ships a local MCP stdio server and five skill checklists (`code`, `data`,
@@ -38,7 +38,7 @@ Run these from the repository root (the directory containing `pyproject.toml`).
 `uvx crewforeman-mcp` resolves the package from the configured index;
 `uvx --from . crewforeman-mcp` runs a local checkout before it is published.
 Pin this release for a reproducible install with
-`uvx crewforeman-mcp==3.13.3`. After a `pipx` or `pip` install, both
+`uvx crewforeman-mcp==3.13.4`. After a `pipx` or `pip` install, both
 `crewforeman-mcp` and the shorter alias `deepseek-mcp` are on `PATH`.
 
 ### macOS
@@ -118,7 +118,10 @@ the workspace and temp directory. Run the connector and builders as a standard
 user; this is the tested path. CI targets the GitHub-hosted `windows-2025` x64
 runner, whose account is an Administrators member. The first real run
 (42629362611) failed in the sandbox probe before the suite
-(`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`), so 3.13.3
+(`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`); 3.13.3
+fixed the probe and run 42648360100 proved it (`usable=true`,
+`write_restricted=true` on both Pythons), but that run's suite was red and its
+membership query failed (`WinError 1309`). 3.13.4 addresses the 3.13.3 suite failures, so 3.13.4
 makes no Windows CI boundary claim: the next GitHub run is the only Windows
 proof. The probe records `admin` (token elevation) and `admin_member` (account
 group) separately. The standard-user path is not proven by CI; run the Windows
@@ -149,7 +152,7 @@ python -m deepseek_mcp --help
 python -m pip show -f crewforeman-mcp | grep crewforeman-mcp/skills
 ```
 
-Expected: the version prints `3.13.3`, each `--help` exits 0, and the file
+Expected: the version prints `3.13.4`, each `--help` exits 0, and the file
 listing shows the five `.md` skill files. On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
 If the files exist but a run says skills are missing, set `DSH_SKILLS_DIR` to
@@ -169,7 +172,7 @@ under `share/crewforeman-mcp/skills`. A source checkout is untouched. Delete
 
 ## Keys
 
-3.13.3 looks a provider key up by its variable **name**: first the connector's
+3.13.4 looks a provider key up by its variable **name**: first the connector's
 process environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). `config.json` lists variable names,
 never values.

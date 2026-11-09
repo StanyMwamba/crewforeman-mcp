@@ -17,7 +17,12 @@ class CanonicalWorkspaceTest(unittest.TestCase):
     def setUp(self):
         self.fake_home = tempfile.mkdtemp(prefix="dsh-fake-home-")
         self.addCleanup(shutil.rmtree, self.fake_home, True)
-        env_patch = mock.patch.dict(os.environ, {"HOME": self.fake_home})
+        # ntpath.expanduser/Path.home() prefer USERPROFILE on Windows, so a
+        # fake HOME alone is not hermetic there.
+        env_patch = mock.patch.dict(os.environ, {
+            "HOME": self.fake_home,
+            "USERPROFILE": self.fake_home,
+        })
         env_patch.start()
         self.addCleanup(env_patch.stop)
         self.old_cwd = os.getcwd()

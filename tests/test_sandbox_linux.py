@@ -108,6 +108,10 @@ class StructTests(unittest.TestCase):
         self.assertEqual(parent, 7)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Landlock is Linux-only; Windows enforces writes with the restricted-token "
+    "launcher (deepseek_mcp.sandbox_windows)")
 class ApplyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
