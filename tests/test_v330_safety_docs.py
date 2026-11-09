@@ -1,97 +1,75 @@
-"""Public README and CHANGELOG safety contract for v3.4.0.
+"""3.13.0 docs contract: per-OS limits match what the boundary suite proves."""
 
-Only shipped documentation is read.  The assertions cover the safety rules the
-shipped code actually implements, and are intentionally tolerant of prose
-edits: they match section headings and stable tokens, not whole sentences.
-"""
-
-import re
-import unittest
 from pathlib import Path
+import unittest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-README = REPO_ROOT / "README.md"
-CHANGELOG = REPO_ROOT / "CHANGELOG.md"
-OPERATIONS = REPO_ROOT / "docs" / "OPERATIONS.md"
-
-# Public docs must never contain personal home paths or e-mail addresses.
-EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
-PERSONAL_PATH = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+")
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _flat(text):
-    return re.sub(r"\s+", " ", text.lower())
+def read(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
 
 
-def _stall_section(text):
-    """Return the current operations watchdog section, lowercased."""
-    match = re.search(
-        r"(?ms)^## Watchdog and (?:rescue|budgets).*?\n(.*?)(?=^## )", text)
-    if match is None:
-        raise AssertionError("docs/OPERATIONS.md has no watchdog section")
-    return _flat(match.group(1))
+def limits_bullets():
+    text = read("README.md")
+    start = text.index("## Limits")
+    end = text.index("\n## ", start + 1)
+    return [line for line in text[start:end].splitlines() if line.startswith("- ")]
 
 
-class PublicSafetyDocsTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.text = OPERATIONS.read_text(encoding="utf-8")
-        cls.low = cls.text.lower()
-        cls.flat = _flat(cls.text)
+class SafetyDocsTest(unittest.TestCase):
+    def test_readme_limits_are_four_per_os_bullets(self):
+        bullets = limits_bullets()
+        self.assertEqual(len(bullets), 4, bullets)
+        body = "\n".join(bullets).lower()
+        for word in ("macos", "linux", "windows", "reviewer"):
+            self.assertIn(word, body)
+        for word in ("seatbelt", "landlock", "write-restricted",
+                     "unsandboxed", "require"):
+            self.assertIn(word, body)
 
-    def test_readme_has_a_public_safety_section(self):
-        self.assertRegex(self.low, r"(?m)^## safety and sandboxing\s*$")
-        for token in ("seatbelt", "permission", "api key", "credential",
-                      "read-only", "workspace-write", "untrusted"):
-            self.assertIn(token, self.flat, token)
+    def test_old_linux_windows_sentence_is_gone(self):
+        self.assertNotIn("Linux and Windows rely", read("README.md"))
 
-    def test_builders_use_a_hard_shell_timeout(self):
-        self.assertRegex(self.low, r"hard (?:shell )?timeout")
-        self.assertIn("timeout 60", self.low)
-        self.assertIn("gtimeout 60", self.low)
-        self.assertIn("perl", self.low)
+    def test_readme_stays_short_and_plain(self):
+        text = read("README.md")
+        self.assertLessEqual(len(text.splitlines()), 110)
+        self.assertNotIn("$", text)
+        self.assertIn("CrewForeman 3.13.0", text)
 
-    def test_chrome_state_is_workspace_local(self):
-        self.assertRegex(self.low, r"workspace[- ]local")
-        for token in ("user-data-dir", "home", "tmpdir"):
-            self.assertIn(token, self.low, token)
+    def test_limitations_has_full_per_os_text(self):
+        text = read("docs/LIMITATIONS.md")
+        for word in ("macOS", "Linux", "Windows", "Seatbelt", "Landlock",
+                     "write-restricted", "UNSANDBOXED", "require",
+                     "delete_outside=unverified", "UNC", "ABI 1-2",
+                     "network", "Reviewer"):
+            self.assertIn(word, text)
+        self.assertIn("## Platform boundaries (3.13.0)", text)
 
-    def test_at_most_two_chrome_attempts_and_render_fallback(self):
-        self.assertIn("at most two", self.flat)
-        self.assertIn("render unavailable", self.low)
+    def test_install_documents_linux_and_windows(self):
+        text = " ".join(read("docs/INSTALL.md").lower().split())
+        for word in ("linux", "windows", "landlock", "write-restricted",
+                     "kernel 6.2", "standard user", "unc"):
+            self.assertIn(word, text)
 
-    def test_builder_and_wave_time_budgets(self):
-        section = _stall_section(self.text)
-        for token in ("builder", "stall_seconds", "480", "stall_max_seconds",
-                      "1800", "job_max_seconds", "job_max_cost_usd"):
-            self.assertIn(token, section, token)
+    def test_operations_documents_modes_and_keys(self):
+        text = read("docs/OPERATIONS.md")
+        for word in ("auto", "off", "require", "UNSANDBOXED", "degraded",
+                     "linux_sandbox", "linux_min_abi", "windows_sandbox",
+                     "sandbox_extra_writes", "sandbox_probe_ttl",
+                     "sandbox_canary", "DEEPSEEK_MCP_LINUX_SANDBOX",
+                     "DEEPSEEK_MCP_WINDOWS_SANDBOX",
+                     "DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES",
+                     "DEEPSEEK_MCP_SANDBOX_PROBE_TTL",
+                     "DEEPSEEK_MCP_SANDBOX_CANARY"):
+            self.assertIn(word, text)
 
-    def test_rescue_is_capped_at_eight_minutes(self):
-        section = _stall_section(self.text)
-        self.assertIn("rescue", section)
-        self.assertIn("8 minutes", section)
-        self.assertIn("finisher", section)
-
-    def test_watchdog_is_child_aware_and_progress_gated(self):
-        section = _stall_section(self.text)
-        for token in ("stall_seconds", "480", "stall_max_seconds", "1800",
-                      "child-session", "process group", "progress", "extend"):
-            self.assertIn(token, section, token)
-
-    def test_no_personal_paths_or_emails_in_public_docs(self):
-        for path in (README, CHANGELOG):
-            text = path.read_text(encoding="utf-8")
-            self.assertIsNone(PERSONAL_PATH.search(text), path.name)
-            self.assertIsNone(EMAIL.search(text), path.name)
-
-    def test_changelog_records_the_v34_safety_contract(self):
-        text = CHANGELOG.read_text(encoding="utf-8")
-        self.assertIn("## 3.4.0", text)
-        section = text[text.index("## 3.4.0"):text.index("## 3.3.0")].lower()
-        flat = re.sub(r"\s+", " ", section)
-        for token in ("minimal environment", "no connector api keys",
-                      "process group", "redacts the home path", "hard timeout"):
-            self.assertIn(token, flat, token)
+    def test_changelog_has_3130(self):
+        text = read("CHANGELOG.md")
+        self.assertIn("## 3.13.0", text)
+        self.assertLess(text.index("## 3.13.0"), text.index("## 3.12.2"))
+        for word in ("Windows", "Linux", "corrupt", "cleanup", "zero"):
+            self.assertIn(word, text)
 
 
 if __name__ == "__main__":

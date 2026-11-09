@@ -14,6 +14,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from . import platforms
+
 try:
     from . import concurrency
 except Exception:  # pragma: no cover - defensive
@@ -117,15 +119,7 @@ def _default_pid_alive(pid):
         return False
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
-    return True
+    return platforms.pid_alive(pid)
 
 
 class AdmissionStore:

@@ -745,7 +745,8 @@ class SdkClient:
         try:
             if os.name == "posix" and hasattr(os, "killpg"):
                 os.killpg(os.getpgid(pid), sig)
-            else:  # pragma: no cover - non-posix fallback
-                proc.send_signal(sig)
+            else:  # pragma: no cover - Windows: taskkill the whole tree
+                from . import platforms
+                platforms.terminate_tree(pid, timeout=2.0)
         except (OSError, ValueError):
             pass

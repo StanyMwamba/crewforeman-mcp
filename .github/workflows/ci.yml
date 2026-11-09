@@ -1,0 +1,41 @@
+name: ci
+
+# CI is macOS + Linux only for now. Windows is intentionally absent: the
+# stdlib suite and the Windows sandbox unit tests run on every host, but the
+# real Windows boundary must first pass on the user's non-admin Windows VM.
+# See docs/OPERATIONS.md ("Continuous integration") and WINDOWS_TEST.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        # 3.9 is the supported floor. 3.15 is the newest stable CPython line
+        # (3.15.2, released 2026-10-25); actions/setup-python resolves the newest
+        # 3.15.x from the live actions/python-versions manifest.
+        python: ["3.9", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "${{ matrix.python }}"
+      - name: Run CI
+        run: bash scripts/ci.sh

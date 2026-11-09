@@ -121,8 +121,9 @@ def resolve_commands(family, app_name, overrides=None, which=None):
             "process_check": macos_process_check(name),
         }
     elif family == "windows":
+        exe = name if name.lower().endswith(".exe") else name + ".exe"
         commands = {
-            "close": ["taskkill", "/IM", name + ".exe", "/F"],
+            "close": ["taskkill", "/IM", exe, "/F"],
             "open": ["cmd", "/c", "start", "", name],
             "verify": ["tasklist", "/FI", "IMAGENAME eq %s.exe" % name],
         }
@@ -148,7 +149,9 @@ def resolve_commands(family, app_name, overrides=None, which=None):
         # the application.
         process_name = process_name[:15]
         if opener is None:
-            opener = ["xdg-open", name]
+            # No desktop entry resolved: gtk-launch is the documented first
+            # fallback; xdg-open remains available through an override.
+            opener = ["gtk-launch", _linux_candidates(name)[0]]
             expected = None
         commands = {
             "close": ["pkill", "-x", process_name],
@@ -241,9 +244,17 @@ def _same_executable(actual, expected):
     try:
         if not (os.path.exists(actual) and os.path.exists(expected)):
             return False
-        if os.path.realpath(actual) == os.path.realpath(expected):
+        actual_real = os.path.realpath(actual)
+        expected_real = os.path.realpath(expected)
+        if actual_real == expected_real:
             return True
-        # Different real paths can still be the same inode (hard links).
+        # Hard links share an inode.  On multicall distributions (Ubuntu
+        # 26.04 cargo coreutils) every applet is a hard link to one binary,
+        # so inode equality alone would confuse ``sleep`` with ``cat``.
+        # Require the same basename as well; that keeps genuine hard-link
+        # aliases working without collapsing distinct applets.
+        if os.path.basename(actual_real) != os.path.basename(expected_real):
+            return False
         return os.path.samefile(actual, expected)
     except (OSError, ValueError):
         return False

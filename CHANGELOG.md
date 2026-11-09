@@ -5,6 +5,77 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.13.0
+
+One OS file-write boundary per host, an honest degraded mode, and docs that
+match what the boundary suite actually proves.
+
+### Added
+
+- **`os_sandbox` modes.** `auto` (default), `off` and `require`
+  (`DSH_OS_SANDBOX`); legacy booleans normalize. `require` refuses to start a
+  builder when no enforced wrapper is available; `auto` starts degraded with
+  `degraded=true` and an `UNSANDBOXED` header line.
+- **Linux Landlock boundary.** An unprivileged `sandbox_linux` launcher applies
+  a Landlock ruleset (workspace and temp write grants, `REFER` at ABI 2,
+  `TRUNCATE` at ABI 3), preserves the PID, and `exec`s `dsh`. ABI 1-2 is
+  degraded; `bwrap` is an optional probed fallback; network is not restricted.
+- **Windows write-restricted boundary.** A `sandbox_windows` launcher creates a
+  write-restricted token, adds a per-run restricting-SID ACE to the workspace
+  and temp roots, starts `dsh` in a kill-on-close Job Object, and records
+  `restricting_sid` and `acl_residue`. Delete/rename outside is reported as
+  `delete_outside=unverified` unless a Windows boundary run proves it.
+- **Status, probe and canary schema.** Run records and phase results carry the
+  full `os_sandbox` object and one-line `sandbox_header`; `enforcement=enforced`
+  requires both the probe and the canary to pass. New keys: `linux_sandbox`,
+  `linux_min_abi`, `windows_sandbox`, `sandbox_extra_writes`,
+  `sandbox_probe_ttl`, `sandbox_canary`, with `DEEPSEEK_MCP_*` aliases.
+- **CI boundary jobs.** macOS + Linux only: one thin matrix (`macos-latest`,
+  `ubuntu-latest`; Python 3.9 and 3.15) runs `scripts/ci.sh`, which installs the
+  package, builds the fake `dsh`, runs the suite, the required sandbox probe and
+  the real boundary with `CF_REQUIRE_REAL_SANDBOX=1`. Windows CI is PENDING the
+  user's non-admin Windows VM run; the Windows sandbox code stays.
+
+### Changed
+
+- macOS probes now run a real deny canary instead of trusting the binary; a
+  present-but-nonfunctional wrapper can no longer claim `enforced`.
+- The README Limits section is four per-OS bullets tied to the boundary suite;
+  full caveats moved to `docs/LIMITATIONS.md`. INSTALL documents the Linux
+  kernel/Landlock and Windows token/standard-user requirements, and OPERATIONS
+  documents modes, keys, the header and per-OS restart.
+- Version 3.13.0.
+
+### Fixed
+
+- **Windows liveness.** `admission`, `mac` and `skill_registry` no longer call
+  `os.kill(pid, 0)` on Windows, where it can raise or misreport; `platforms.pid_alive`
+  uses `GetExitCodeProcess`/`STILL_ACTIVE` and POSIX keeps `os.kill`.
+- **Windows test cleanup.** `tests/isolation.py` now removes case directories
+  with a bounded `onexc`/`onerror` handler: read-only bits are cleared, files
+  still open are retried briefly, and a stuck file never blocks the suite for
+  minutes.
+- **Linux transient retry.** `_transient_failure_reason` no longer rejects a
+  fast child whose computed duration is zero (rounded to `0.0`); the
+  partial-write guard now runs
+  and records `builder_retry.status=skipped` on Linux as it does on macOS.
+- **Docs username scan.** The INSTALL/CLIENTS privacy test now flags real
+  macOS, Linux and Windows home paths instead of the bare current username, so
+  `root` in "repository root" is not a false hit.
+- **Corrupt run record.** `store.load_runs` skips a corrupt or truncated
+  `runs/*.json` and logs at most one warning per path, so a bad record no
+  longer spams every test run while valid records still load.
+
+### Tests
+
+- New sandbox unit suites (`test_sandbox_policy`, `test_sandbox_macos`,
+  `test_sandbox_linux`, `test_sandbox_windows`, `test_platform_primitives`,
+  `test_sandbox_contract`) and per-OS boundary modules, plus
+  `tests/test_v330_safety_docs.py` for the README/doc claims.
+- CI runs the stdlib suite on Ubuntu and macOS at 3.9 and 3.15 through
+  `scripts/ci.sh`, with the real boundary gated by `CF_REQUIRE_REAL_SANDBOX=1`.
+  Windows jobs are PENDING a non-admin Windows VM run.
+
 ## 3.12.2
 
 PLAN bookkeeping on both declared and actual sides, one generic per-model

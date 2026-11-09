@@ -14,10 +14,14 @@ active-child count.  Missing directories and permission errors degrade to "no
 child activity" instead of failing the run.
 """
 
+import json
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+from . import platforms
 
 DEFAULT_ACTIVE_WINDOW = 180.0
 LOG_PATTERNS = ("*.jsonl.zstd", "*.jsonl.zst", "*.jsonl")
@@ -27,6 +31,68 @@ _SAFE_KEY_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 SEPARATOR_CHARS = frozenset("/\\:")
 MAX_KEY_CHARS = 251
+
+
+class ProgressPathError(ValueError):
+    """A progress write would leave the workspace or follow a reparse point."""
+
+
+def _call_platform(name, *args, system=None, default=False):
+    helper = getattr(platforms, name, None)
+    if helper is None:
+        return default
+    try:
+        return helper(*args, system=system)
+    except TypeError:
+        try:
+            return helper(*args)
+        except Exception:
+            return default
+    except Exception:
+        return default
+
+
+def _resolved(path, system=None):
+    resolved = _call_platform("canonical_path", str(path), system=system,
+                              default=None)
+    if resolved is None:
+        return os.path.realpath(os.path.expanduser(str(path)))
+    return str(resolved)
+
+
+def write_json(path, data, root=None, system=None):
+    """Atomically write UTF-8/LF JSON after refusing reparse/symlink escapes.
+
+    ``root`` bounds the write (normally the workspace).  The check runs before
+    the temporary file is created, so an escape writes nothing outside it.
+    """
+    target = Path(os.path.expanduser(str(path)))
+    base = _resolved(root if root is not None else target.parent, system)
+    if _call_platform("reparse_point", str(target), system=system,
+                      default=False):
+        raise ProgressPathError(
+            "refusing to write through a reparse point (private=false)")
+    resolved = _resolved(target, system)
+    base_norm = os.path.normcase(base)
+    target_norm = os.path.normcase(resolved)
+    if (target_norm != base_norm
+            and not target_norm.startswith(base_norm.rstrip(os.sep) + os.sep)):
+        raise ProgressPathError("refusing to write outside the workspace")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".progress-", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, str(target))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return str(target)
 
 
 def project_key(cwd):

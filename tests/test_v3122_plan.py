@@ -1,4 +1,4 @@
-"""Focused tests for the 3.12.2 plan bookkeeping and root write-set fixes."""
+"""Focused tests for the 3.13.0 plan bookkeeping and root write-set fixes."""
 
 import json
 import os

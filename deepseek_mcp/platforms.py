@@ -7,11 +7,15 @@ macOS, Linux and Windows behaviour on any host. Callers pass an explicit
 Python 3.9 compatible; standard library only.
 """
 
+import contextlib
+import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -55,7 +59,8 @@ def default_paths(system=None, home=None, env=None):
         return {
             "config_dir": os.path.join(config_root, "deepseek-harness-mcp"),
             "data_dir": os.path.join(local_root, "DeepSeek-MCP"),
-            "temp_dir": env.get("TEMP") or os.path.join(local_root, "Temp"),
+            "temp_dir": (env.get("TEMP") or env.get("TMP")
+                         or os.path.join(local_root, "Temp")),
         }
     if system == LINUX:
         config_root = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
@@ -65,13 +70,13 @@ def default_paths(system=None, home=None, env=None):
             "config_dir": os.path.join(config_root, "deepseek-harness-mcp"),
             "data_dir": os.path.join(data_root, "DeepSeek-MCP"),
             "state_dir": os.path.join(state_root, "DeepSeek-MCP"),
-            "temp_dir": env.get("TMPDIR") or "/tmp",
+            "temp_dir": env.get("TMPDIR") or tempfile.gettempdir(),
         }
     # macOS keeps the historical locations for backward compatibility.
     return {
         "config_dir": os.path.join(home, ".config", "deepseek-harness-mcp"),
         "data_dir": os.path.join(home, "DeepSeek-MCP"),
-        "temp_dir": env.get("TMPDIR") or "/tmp",
+        "temp_dir": env.get("TMPDIR") or tempfile.gettempdir(),
     }
 
 
@@ -167,15 +172,27 @@ def pid_alive(pid, system=None):
     if pid <= 0:
         return False
     if normalize_system(system) == WINDOWS:
+        handle = None
         try:
             import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION; signal 0 on Windows is
+            # CTRL_C_EVENT and must never be used as a liveness probe.
+            handle = kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
                 return False
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
+            code = ctypes.c_ulong(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
         except Exception:
             return False
+        finally:
+            if handle:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
     try:
         os.kill(pid, 0)
         return True
@@ -287,53 +304,301 @@ def screenshot_command(system=None, path="", env=None):
 def restart_client_command(system=None, app_name="Claude"):
     """Return a platform command that restarts ``app_name``, or ``None``.
 
-    The caller runs quit, waits, then runs open. Keeping the pieces separate
-    makes the helper testable and avoids a shell string with the app name.
+    This is the single resolver: it delegates to
+    :func:`restart_helper.resolve_commands` instead of keeping a second
+    Linux opener list.  The returned mapping still has the historical
+    ``quit``/``open`` keys and adds ``verify``.
     """
     system = normalize_system(system)
     name = str(app_name or "").strip()
     if not name:
         return None
-    if system == MACOS:
-        return {"quit": ["osascript", "-e", 'tell application "%s" to quit' % name],
-                "open": ["open", "-a", name]}
-    if system == WINDOWS:
-        exe = name if name.lower().endswith(".exe") else name + ".exe"
-        return {"quit": ["taskkill", "/IM", exe, "/F"],
-                "open": ["cmd", "/c", "start", "", name]}
-    # Match the exact process name, never the full command line: the
-    # detached restart helper's own argv contains the app name and a
-    # ``-f`` match would terminate the helper instead of the app.
-    process_name = name.lower().replace(" ", "-")[:15]
-    return {"quit": ["pkill", "-x", process_name],
-            "open": ["gtk-launch", name.lower().replace(" ", "-")]}
+    try:
+        from . import restart_helper
+    except Exception:
+        try:
+            import restart_helper  # type: ignore
+        except Exception:
+            return None
+    family = {"Darwin": "macos", "Windows": "windows",
+              "Linux": "linux"}.get(system)
+    if not family:
+        return None
+    try:
+        commands = restart_helper.resolve_commands(family, name)
+    except Exception:
+        return None
+    return {
+        "quit": list(commands.get("close") or []),
+        "open": list(commands.get("open") or []),
+        "verify": list(commands.get("verify") or []),
+        "expected_executable": commands.get("expected_executable"),
+    }
 
 
 def sandbox_support(system=None):
-    """Describe the OS sandbox layer available to this connector."""
+    """Deprecated shim: describe the OS sandbox layer via ``safety``.
+
+    The single authority is :func:`deepseek_mcp.safety.sandbox_status`; this
+    function exists for one minor so older callers keep a mapping with
+    ``kind``/``available``/``reason``.
+    """
     system = normalize_system(system)
-    if system == MACOS:
-        usable = Path("/usr/bin/sandbox-exec").is_file()
-        return {"kind": "seatbelt", "available": usable,
-                "reason": None if usable else "sandbox-exec not found"}
-    if system == WINDOWS:
+    try:
+        from . import safety
+        status = safety.sandbox_status(system=system)
+    except Exception as exc:  # pragma: no cover - defensive
         return {"kind": "none", "available": False,
-                "reason": "no built-in file-write wrapper; use a container/VM "
-                          "or Windows Sandbox for untrusted work"}
-    return {"kind": "none", "available": False,
-            "reason": "no built-in file-write wrapper; use a container/VM "
-                      "(bubblewrap/nsjail) for untrusted work"}
+                "reason": "sandbox status unavailable: %s" % exc.__class__.__name__}
+    kind = status.get("kind") or "none"
+    enforcement = status.get("enforcement") or "none"
+    return {
+        "kind": kind,
+        "available": kind not in ("none", "") and enforcement != "none",
+        "enforcement": enforcement,
+        "abi": status.get("abi"),
+        "reason": status.get("reason"),
+    }
+
+
+def canonical_path(path, system=None):
+    """Return a canonical absolute path (Windows: normcase, no \\\\?\\ prefix)."""
+    text = os.path.expanduser(os.path.expandvars(str(path)))
+    text = os.path.realpath(os.path.abspath(text))
+    if normalize_system(system) == WINDOWS:
+        if text.startswith("\\\\?\\UNC\\"):
+            text = "\\\\" + text[8:]
+        elif text.startswith("\\\\?\\"):
+            text = text[4:]
+        text = os.path.normcase(text)
+    return text
+
+
+def reparse_point(path, system=None):
+    """True for a symlink or a Windows reparse point/junction.
+
+    Python 3.9 has no ``os.path.isjunction``; ``st_file_attributes`` is the
+    supported check on Windows and ``lstat`` never follows the link.
+    """
+    try:
+        if normalize_system(system) == WINDOWS:
+            attrs = getattr(os.lstat(str(path)), "st_file_attributes", 0)
+            return bool(attrs & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+        return os.path.islink(str(path))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def inside_path(path, root, system=None):
+    """True when *path* is *root* or below it after canonicalization."""
+    try:
+        path = canonical_path(path, system)
+        root = canonical_path(root, system)
+        return os.path.commonpath([path, root]) == root
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def split_command(text, system=None):
+    """Split a command string: JSON argv wins, else shlex with OS quoting."""
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        return [str(item) for item in text]
+    raw = str(text).strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("command must be a JSON list")
+        return [str(item) for item in parsed]
+    return shlex.split(raw, posix=normalize_system(system) != WINDOWS)
+
+
+def _windows_systemroot():
+    return os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+
+
+def _icacls_binary():
+    return os.path.join(_windows_systemroot(), "System32", "icacls.exe")
+
+
+def _windows_user_sid():
+    """Return the current user SID string, or ``None``; never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        access_handle = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(access_handle)):
+            return None
+        try:
+            needed = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(access_handle, 1, None, 0,
+                                         ctypes.byref(needed))
+            if not needed.value:
+                return None
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not advapi32.GetTokenInformation(
+                    access_handle, 1, buffer, needed.value, ctypes.byref(needed)):
+                return None
+            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+            string_sid = ctypes.c_wchar_p()
+            if not advapi32.ConvertSidToStringSidW(
+                    sid, ctypes.byref(string_sid)):
+                return None
+            try:
+                return str(string_sid.value)
+            finally:
+                kernel32.LocalFree(string_sid)
+        finally:
+            kernel32.CloseHandle(access_handle)
+    except Exception:
+        return None
+
+
+def _windows_private_acl(path, is_dir):
+    sid = _windows_user_sid()
+    binary = _icacls_binary()
+    if not sid or not os.path.isfile(binary):
+        return False
+    try:
+        result = subprocess.run(
+            [binary, str(path), "/inheritance:r", "/grant:r", "*%s:F" % sid],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10.0)
+        if int(getattr(result, "returncode", 1)) != 0:
+            return False
+        check = subprocess.run(
+            [binary, str(path)], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0)
+        output = (getattr(check, "stdout", b"") or b"").decode(
+            "utf-8", "replace")
+        return (int(getattr(check, "returncode", 1)) == 0
+                and sid in output and "(F)" in output)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
 
 
 def private_permissions(path, system=None, is_dir=False):
-    """0700 for directories, 0600 for files on POSIX; no-op on Windows."""
+    """Owner-only permissions: 0700/0600 POSIX, owner-only ACL on Windows."""
     if normalize_system(system) == WINDOWS:
-        return False
+        return _windows_private_acl(path, is_dir)
+    mode = 0o700 if is_dir else 0o600
     try:
-        os.chmod(str(path), 0o700 if is_dir else 0o600)
+        os.chmod(str(path), mode, follow_symlinks=False)
         return True
+    except (TypeError, NotImplementedError):
+        try:
+            if os.path.islink(str(path)):
+                return False
+            os.chmod(str(path), mode)
+            return True
+        except OSError:
+            return False
     except OSError:
         return False
+
+
+@contextlib.contextmanager
+def file_lock(path, timeout=10.0, system=None):
+    """Bounded exclusive lock: fcntl.flock or msvcrt.locking.
+
+    Raises the built-in ``TimeoutError`` after *timeout* seconds.  The lock
+    file itself is kept (unlinking a locked file is racy); callers own the
+    parent directory.
+    """
+    path = Path(os.path.expanduser(str(path)))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    system = normalize_system(system)
+    deadline = time.time() + max(0.0, float(timeout))
+    handle = None
+    mode = "a+b"
+    try:
+        handle = open(str(path), mode)
+    except OSError as exc:
+        raise TimeoutError("cannot open lock %s: %s" % (path, exc))
+    acquired = False
+    try:
+        if system == WINDOWS:
+            try:
+                import msvcrt
+            except ImportError:
+                msvcrt = None
+            if msvcrt is not None:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.time() >= deadline:
+                            raise TimeoutError("lock timeout: %s" % path)
+                        time.sleep(0.02)
+        if not acquired:
+            try:
+                import fcntl
+            except ImportError:
+                fcntl = None
+            if fcntl is not None:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(),
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.time() >= deadline:
+                            raise TimeoutError("lock timeout: %s" % path)
+                        time.sleep(0.02)
+        if not acquired:
+            # Last resort: an O_EXCL sibling file with bounded retries.
+            fallback = str(path) + ".excl"
+            while True:
+                try:
+                    fd = os.open(fallback, os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                                 0o600)
+                    os.close(fd)
+                    acquired = True
+                    break
+                except FileExistsError:
+                    if time.time() >= deadline:
+                        raise TimeoutError("lock timeout: %s" % path)
+                    time.sleep(0.02)
+        yield handle
+    finally:
+        if acquired:
+            try:
+                if system == WINDOWS:
+                    try:
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 def secure_tree(root, system=None):

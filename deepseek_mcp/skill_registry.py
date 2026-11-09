@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from . import platforms
+
 try:  # package import
     from .config import PACKAGE_DIR, ROOT_DIR
 except Exception:  # pragma: no cover - direct script / partial checkout
@@ -1660,15 +1662,7 @@ def _lock_is_stale(lock_path) -> bool:
         return False
     if pid <= 0 or pid == os.getpid():
         return pid == os.getpid()
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    except OSError:
-        return False
-    return False
+    return not platforms.pid_alive(pid)
 
 
 def _take_over_lock(lock_path) -> None:

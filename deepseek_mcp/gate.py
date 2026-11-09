@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from . import path_scope, review_context, safety
+from . import path_scope, platforms, review_context, safety
 from .api import redact_secrets
 
 ALGORITHM = "sha256"
@@ -33,6 +33,25 @@ DEFAULT_MAX_OUTPUT_CHARS = 4000
 MAX_SCAN_BYTES = 1024 * 1024
 MAX_FINDINGS = 100
 MAX_MUTATION_PATHS = 20
+
+
+def _terminate_tree(pid, system=None, timeout=0.5):
+    """Kill a whole process tree through the shared platform primitive."""
+    terminate = getattr(platforms, "terminate_tree", None)
+    if terminate is None:
+        return False
+    try:
+        result = terminate(pid, system=system, timeout=timeout)
+    except TypeError:
+        try:
+            result = terminate(pid)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    if isinstance(result, dict):
+        return bool(result.get("terminated"))
+    return bool(result)
 MAX_ERROR_CHARS = 600
 
 _ALLOWLIST_MARKERS = ("# gitleaks:allow", "pragma: allowlist secret")
@@ -349,12 +368,7 @@ def _local_run(command, workspace, timeout):
         code = proc.returncode
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            if os.name != "nt":
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                proc.kill()
-        except Exception:
+        if not _terminate_tree(proc.pid):
             try:
                 proc.kill()
             except Exception:

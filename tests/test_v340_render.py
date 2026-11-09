@@ -157,9 +157,9 @@ class RenderProbeTests(unittest.TestCase):
     def test_probe_does_not_inherit_connector_secrets(self):
         env_out = self.root / "chrome-env.json"
         self._chrome_config(log=str(self.log), env_out=str(env_out))
-        secret = "connector-secret-should-not-reach-the-browser"
+        leaked_value = "connector-secret-should-not-reach-the-browser"
         with mock.patch.dict(os.environ, {
-                "DEEPSEEK_API_KEY": secret,
+                "DEEPSEEK_API_KEY": leaked_value,
                 "DSH_BIN": "/operator/secret-adjacent-value"}, clear=False):
             result = render.probe(self.cfg, self.workspace, timeout=5, force=True)
         self.assertTrue(result["available"])

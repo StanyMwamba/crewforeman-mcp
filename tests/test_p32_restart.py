@@ -341,9 +341,40 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         self.status = self.root / "restart-status.json"
         if os.name != "posix":
             self.skipTest("Linux restart defaults are POSIX-only")
-        source = shutil.which("sleep") or "/bin/sleep"
+        # Ubuntu 26.04 ships a multicall coreutils whose applets are hard
+        # links: executing a symlink named ``cfp32fakeapp`` fails with
+        # "Requested utility does not match executable name".  Build a tiny
+        # real executable with the app name instead; fall back to the old
+        # symlink only when no C compiler exists.
         self.fake_app = self.root / "cfp32fakeapp"
-        os.symlink(os.path.realpath(source), str(self.fake_app))
+        self.expected_exe = self.fake_app
+        compiler = (shutil.which("cc") or shutil.which("gcc")
+                    or shutil.which("clang"))
+        if compiler:
+            source_file = self.root / "cfp32fakeapp.c"
+            source_file.write_text(
+                "#include <stdlib.h>\n#include <unistd.h>\n"
+                "int main(int argc, char **argv) {\n"
+                "  sleep(argc > 1 ? atoi(argv[1]) : 60);\n"
+                "  return 0;\n}\n", encoding="utf-8")
+            subprocess.run([compiler, "-O0", "-o", str(self.fake_app),
+                            str(source_file)], check=True,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
+        elif sys.platform.startswith("linux"):
+            # No compiler in a minimal VM.  A script cannot own the process
+            # name, so set the task comm explicitly; identity is the
+            # interpreter that /proc/<pid>/exe really points at.
+            self.fake_app.write_text(
+                "#!%s\nimport ctypes, sys, time\n"
+                "ctypes.CDLL(None).prctl(15, b'cfp32fakeapp', 0, 0, 0)\n"
+                "time.sleep(int(sys.argv[1]) if len(sys.argv) > 1 else 60)\n"
+                % sys.executable, encoding="utf-8")
+            self.fake_app.chmod(0o755)
+            self.expected_exe = Path(sys.executable)
+        else:
+            source = shutil.which("sleep") or "/bin/sleep"
+            os.symlink(os.path.realpath(source), str(self.fake_app))
         self.decoys = []
         self.addCleanup(self._cleanup)
 
@@ -401,7 +432,8 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         record = restart_helper.run_once({
             "app_name": "cfp32fakeapp", "system": "linux", "attempts": 2,
             "retry_seconds": 0.2, "status_path": str(self.status),
-            "expected_exe": str(self.fake_app), "open": self._launch_open(),
+            "expected_exe": str(self.expected_exe),
+            "open": self._launch_open(),
             "which": self._which,
         })
         self.assertEqual(record["state"], "reopened", record)
@@ -411,14 +443,14 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         self.assertEqual(data["state"], "reopened")
         self.assertTrue(data["attempts_detail"][0]["verified"])
         self.assertEqual(data["attempts_detail"][0]["executable"],
-                         str(self.fake_app))
+                         str(self.expected_exe))
 
         # Now the failure path: the default close kills the running fake app,
         # the opener does nothing, and default verify must report failure.
         failed = restart_helper.run_once({
             "app_name": "cfp32fakeapp", "system": "linux", "attempts": 1,
             "retry_seconds": 0.2, "status_path": str(self.status),
-            "expected_exe": str(self.fake_app),
+            "expected_exe": str(self.expected_exe),
             "open": _py("pass"), "which": self._which,
         })
         self.assertEqual(failed["state"], "failed", failed)

@@ -106,10 +106,21 @@ class ResolveTests(unittest.TestCase):
             self.assertIs(
                 safety.resolve({}, cfg={"os_sandbox": False})["os_sandbox"], False
             )
-        with mock.patch.object(safety.sys, "platform", "linux"), mock.patch.object(
-            safety, "seatbelt_usable", return_value=True
-        ):
-            self.assertIs(safety.resolve({}, cfg=cfg)["os_sandbox"], False)
+        linux_status = {
+            "schema": 1, "kind": "landlock", "enforcement": "enforced",
+            "abi": "landlock-8", "probe": {"ok": True, "at": 0, "ttl": 300,
+                                           "reason": None},
+            "canary": {"ok": None, "at": None, "reason": "not_run"},
+            "tested": True, "degraded": False, "blocked": False,
+            "reason": None, "temp_roots": [], "profile_sha256": None,
+            "requested": "auto", "platform": "Linux",
+            "writes_outside": "denied", "delete_outside": "denied",
+            "network": "unrestricted", "sandbox_header": "fixture",
+        }
+        with mock.patch.object(safety.sys, "platform", "linux"), \
+                mock.patch.object(safety, "sandbox_status",
+                                  return_value=linux_status):
+            self.assertIs(safety.resolve({}, cfg=cfg)["os_sandbox"], True)
         with mock.patch.object(safety.sys, "platform", "darwin"), mock.patch.object(
             safety, "seatbelt_usable", return_value=False
         ):
@@ -222,7 +233,8 @@ class WrapTests(unittest.TestCase):
         self.assertIn("reason", meta)
 
     def test_missing_binary_falls_back(self):
-        with mock.patch.object(safety, "seatbelt_usable", return_value=False), \
+        with mock.patch.object(safety.sys, "platform", "darwin"), \
+                mock.patch.object(safety, "seatbelt_usable", return_value=False), \
                 mock.patch.object(safety, "_SEATBELT_PROBE",
                                   {"done": True, "usable": False,
                                    "reason": "sandbox-exec not available"}):
@@ -234,7 +246,8 @@ class WrapTests(unittest.TestCase):
         self.assertIn("not available", meta["reason"])
 
     def test_wraps_when_available(self):
-        with mock.patch.object(safety, "seatbelt_usable", return_value=True):
+        with mock.patch.object(safety.sys, "platform", "darwin"), \
+                mock.patch.object(safety, "seatbelt_usable", return_value=True):
             argv, meta = safety.wrap_command(
                 ["dsh", "--profile", "sdk"],
                 {"os_sandbox": True, "sandbox": "read-only"},

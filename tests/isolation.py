@@ -33,7 +33,10 @@ import contextlib
 import errno
 import os
 import shutil
+import stat
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -118,6 +121,45 @@ def is_active():
     return bool(os.environ.get(CASE_ENV_VAR))
 
 
+def _rmtree_robust(path):
+    """Best-effort rmtree that survives Windows read-only and open files.
+
+    ``shutil.rmtree`` fails on a read-only file and on a file another process
+    still has open (common when a child process is winding down).  Clear the
+    read-only bit, retry the failing operation, and retry the whole tree a few
+    times with a short sleep; missing paths are success.  Never raises and
+    never waits for minutes.  POSIX behaviour is unchanged apart from ignoring
+    an already-missing tree.
+    """
+    def _handle(func, target, error):
+        exc = error[1] if isinstance(error, tuple) else error
+        if isinstance(exc, PermissionError):
+            try:
+                os.chmod(target, stat.S_IWRITE)
+            except OSError:
+                pass
+        try:
+            func(target)
+        except OSError:
+            pass
+
+    for attempt in range(3):
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(str(path), onexc=_handle)
+            else:
+                shutil.rmtree(str(path), onerror=_handle)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 2:
+                return
+            time.sleep(0.05)
+        except Exception:
+            return
+
+
 @contextlib.contextmanager
 def isolated_case():
     """Create one case dir, point the env at it, then restore and delete it.
@@ -161,7 +203,7 @@ def isolated_case():
             else:
                 os.environ[name] = value
         tempfile.tempdir = previous_tempdir
-        shutil.rmtree(str(case), ignore_errors=True)
+        _rmtree_robust(case)
 
 
 def _record_environment_skip(result, test, reason):

@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -18,6 +19,11 @@ PROBE_SUFFIX = ".tmp"
 def log(message):
     import sys
     print("[deepseek-mcp] %s" % message, file=sys.stderr, flush=True)
+
+
+# Paths already reported as corrupt.  One warning per path per process, not
+# one per call/test run; the set holds only local paths, never file contents.
+_WARNED_CORRUPT_RUNS = set()
 
 
 def _normalise_log_dir(raw):
@@ -404,7 +410,12 @@ def load_runs(cfg):
             try:
                 data = json.loads((directory / name).read_text(encoding="utf-8"))
             except Exception as exc:
-                log("cannot read run %s: %s" % (directory / name, exc))
+                path = directory / name
+                key = os.path.normcase(os.path.abspath(str(path)))
+                if key not in _WARNED_CORRUPT_RUNS:
+                    _WARNED_CORRUPT_RUNS.add(key)
+                    logging.warning("skipping corrupt run %s: %s",
+                                    path, type(exc).__name__)
                 continue
             if isinstance(data, dict) and data.get("id"):
                 runs.append(data)

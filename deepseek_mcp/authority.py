@@ -24,7 +24,7 @@ import math
 import os
 import re
 
-from . import safety
+from . import platforms, safety
 
 
 def _cfg_explicit(cfg, name):
@@ -192,8 +192,62 @@ def _reviewer_mode(value, allow_writing=False, override=False):
     return mode
 
 
-def _canonical_path(value):
+def _canonical_path(value, system=None):
+    canonical = getattr(platforms, "canonical_path", None)
+    if canonical is not None:
+        try:
+            return str(canonical(str(value), system=system))
+        except TypeError:
+            try:
+                return str(canonical(str(value)))
+            except Exception:
+                pass
+        except Exception:
+            pass
     return os.path.realpath(os.path.expanduser(str(value)))
+
+
+def split_command(text, system=None):
+    """Split a shell-like command using the platform primitive.
+
+    Windows uses ``posix=False`` inside ``platforms.split_command``; callers
+    must pass the argv list to ``Popen`` and never enable shell mode.
+    """
+    helper = getattr(platforms, "split_command", None)
+    if helper is not None:
+        try:
+            return list(helper(text, system=system))
+        except TypeError:
+            return list(helper(text))
+    import shlex
+    if str(system or "").strip().lower().startswith("win"):
+        return shlex.split(text, posix=False)
+    return shlex.split(text)
+
+
+def require_safe_path(path, root, system=None):
+    """Refuse a reparse point or a resolved path outside *root*.
+
+    Called before a caller writes state derived from an untrusted path; the
+    reason is a fixed string, never a file body.
+    """
+    raw = str(path)
+    reparse = getattr(platforms, "reparse_point", None)
+    if reparse is not None:
+        try:
+            if reparse(raw, system=system):
+                raise WorkspaceRootError(
+                    "refusing a reparse-point path (safe reason: escape)")
+        except WorkspaceRootError:
+            raise
+        except Exception:
+            pass
+    resolved = os.path.normcase(_canonical_path(raw, system))
+    base = os.path.normcase(_canonical_path(root, system))
+    if (resolved != base
+            and not resolved.startswith(base.rstrip(os.sep) + os.sep)):
+        raise WorkspaceRootError("path escapes the workspace")
+    return resolved
 
 
 def _normalise_roots(roots):
@@ -255,8 +309,13 @@ def resolve_workspace(args, cfg):
     raw = args.get("workspace") or _cfg(cfg, "harness_workspace", "")
     if not isinstance(raw, str) or not raw.strip():
         raise WorkspaceRootError("a workspace path is required")
-    workspace = _canonical_path(raw.strip())
+    raw_workspace = raw.strip()
+    workspace = _canonical_path(raw_workspace)
     roots = _normalise_roots(_cfg(cfg, "allowed_workspace_roots", []))
+    # Check the caller-supplied value for a reparse escape before using the
+    # resolved path; allowed-root containment is checked below against *all*
+    # roots, never just the first one.
+    require_safe_path(raw_workspace, workspace)
     if roots and not any(inside_root(workspace, root) for root in roots):
         raise WorkspaceRootError(
             "workspace %s is outside allowed_workspace_roots" % workspace)

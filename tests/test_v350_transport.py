@@ -304,8 +304,9 @@ class HarnessSdkWiringTests(unittest.TestCase):
         cancel = lambda: True
         with TemporaryDirectory() as ws:
             cfg = load_config(config_path=Path(ws) / "missing.json", env={})
-            with mock.patch.object(harness.safety, "seatbelt_usable",
-                                   return_value=True), \
+            with mock.patch.object(harness.safety.sys, "platform", "darwin"), \
+                    mock.patch.object(harness.safety, "seatbelt_usable",
+                                      return_value=True), \
                     mock.patch.object(harness.transport_mod, "SdkClient",
                                       FakeClient):
                 result = harness._sdk_execution(

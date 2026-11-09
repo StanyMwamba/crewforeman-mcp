@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.12.2 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.13.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -52,7 +52,6 @@ flowchart LR
 A run passes only at 8.5/10 or higher with no blocking defect. `quality_rounds` sets how many tries it gets. If the team stalls, a rescue team finishes the work. Time limits can stop a run. Accepted and returned outcomes update the journal and `result.json`. The MCP task completes only at a final state. See [docs/STATUS.md](docs/STATUS.md) for the status vocabulary.
 
 **Skills that learn:** CrewForeman saves tasks that fit no existing skill. When a task recurs, it drafts a new checklist and has the reviewer check it against the 8.5/10 bar. A new skill is promoted only after five uses and at least three scored runs. Its median score must stay within 0.3 of the baseline. Its blocking-defect rate may rise by at most 0.05. It may lose at most one comparison against the baseline. `auto_skills` = `auto` | `propose` | `off` (see [docs/skills.md](docs/skills.md)).
-
 ## Convergence
 Recorded runs, not a benchmark. One representative job (P3.2), round by round in its accepted run. Round 1 is a full review; round 2 re-checks what was flagged and the new changes.
 
@@ -76,7 +75,6 @@ Add the server to the client's MCP configuration:
   "DSH_BIN": "/absolute/path/to/dsh"}}}}
 ```
 Call `harness_deepseek` with a prompt and a workspace. A long run may return a job id to poll with `deepseek_job_status`.
-
 ## Guarantees
 - It runs locally over standard input/output (stdio) using JSON-RPC; there is no hosted service or network listener.
 - Team size and exact waves follow the Harness child limit. One whole-job budget covers time and estimated cost for every phase.
@@ -92,8 +90,10 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 - Cost and score are tracked per model for team sizing and failure notes; a backup builder may take over under its own cost ceiling after credit, auth, 5xx or repeated stream-drop failures.
 - A reviewer must come from a different vendor than every builder; if none is available the job asks once and labels a user-chosen same-vendor review, and the gate skips lint and tests when no product code changed while tiny single-file jobs may omit PLAN.json.
 ## Limits
-- macOS gets a best-effort file-write boundary. Linux and Windows rely on the Harness permission mode and the workspace convention.
-- The reviewer is a model. Its score is judgement, not proof of correctness. Run records are plaintext.
+- **macOS:** Seatbelt; the boundary suite proves create, modify, truncate, rename and delete outside the workspace, plus symlink and `..` escapes, are refused; reads and network are unrestricted.
+- **Linux:** Landlock ABI 3+; the same file-write claim is proven on `ubuntu-24.04`, ABI 1-2 is degraded, `os_sandbox=require` refuses with no boundary and `auto` prints `UNSANDBOXED`; network is unrestricted.
+- **Windows:** write-restricted token plus workspace/temp ACE; the suite proves create, modify and truncate denial; delete/rename is claimed only if the boundary job proves it, else `delete_outside=unverified`; network/UNC writes are not blocked and no no-admin claim is made.
+- **Reviewer:** the reviewer is a model; its score is judgement, not proof of correctness.
 ## Documentation
 | Page | Contents |
 |---|---|

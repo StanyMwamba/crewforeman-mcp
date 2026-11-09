@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.12.2)
+# Operations: configuration, safety, budgets, traces and retention (v3.13.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -560,13 +560,62 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-On Linux and Windows the operating-system sandbox layer is not available;
-the Harness permission preset and the workspace boundary still apply, and the
-run record says which layer was used. Treat untrusted work as a container/VM
-job. The child environment is scrubbed: only `DEEPSEEK_API_KEY` and the key
+### OS sandbox modes and config keys (3.13.0)
+
+`os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
+`true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
+boundary and records `degraded=true` plus an `UNSANDBOXED` header line when none
+is usable. `require` refuses to start a builder with
+`stop_reason="sandbox_unavailable"`; it never falls back to a prompt-only
+boundary. `off` records `enforcement=none` and does not claim a boundary.
+
+| Key | Default | Values / meaning | Env alias |
+| --- | --- | --- | --- |
+| `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
+| `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
+| `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.0 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
+| `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
+| `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
+
+The run record carries `os_sandbox` (`schema`, `kind`, `enforcement`, `abi`,
+`probe`, `canary`, `tested`, `degraded`, `blocked`, `reason`, `temp_roots`,
+`profile_sha256`, `requested`, `platform`, `writes_outside`, `delete_outside`,
+`network`) and a one-line `sandbox_header`, for example
+`boundary=landlock(abi=8) enforced; writes=deny-outside; delete=deny-outside;
+network=unrestricted`. `writes_outside` and `delete_outside` are suite claims
+(`denied`, `unverified`, `not_claimed`), never guesses. `enforcement=enforced`
+requires both `probe.ok` and `canary.ok`; `require` blocks when either fails.
+
+On macOS the wrapper is `sandbox-exec` with the generated Seatbelt profile. On
+Linux the launcher applies a Landlock ruleset to itself and then `exec`s `dsh`
+(ABI 3+ handles truncate; reads and network stay unrestricted). On Windows the
+launcher creates a write-restricted token, grants an ACE for the restricting SID
+on the workspace and temp roots, and starts `dsh` in a kill-on-close Job Object;
+network and UNC writes are not blocked, and delete/rename outside is reported as
+`delete_outside=unverified` unless a Windows boundary run proves it. Windows CI
+is PENDING the user's non-admin VM run, so CI covers macOS and Linux only. This
+is a file-write boundary, not a container, VM, network firewall or malware
+sandbox.
+
+The child environment is scrubbed: only `DEEPSEEK_API_KEY` and the key
 variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
+
+### Restart per OS (3.13.0)
+
+Restart is best-effort and OS-specific; the status file records `state`,
+`verified_by`, `error` and the resolved opener. macOS closes/reopens with
+`osascript`/`open -a` and verifies with `osascript` (pgrep corroborates only;
+Automation denial `-1743` is classified). Windows uses `taskkill`/`start` and
+verifies with `tasklist`/`QueryFullProcessImageNameW`; `DETACHED_PROCESS` with
+`CREATE_BREAKAWAY_FROM_JOB` is best-effort. Linux uses exact `pkill -x`/
+`pgrep -x` plus `/proc/<pid>/exe`, tries the beta client's varying desktop names
+(`claude`, `claude-desktop`, `claude-app`) and falls back to
+`gtk-launch`/`xdg-open`; use the explicit command override when resolution
+fails. The restart helper is deliberately unsandboxed and is recorded as such.
 
 ### Provider key lookup
 
@@ -837,11 +886,35 @@ the trace summary and the local files remain.
 | Temp | `TMPDIR` | `TMPDIR` or `/tmp` | `%TEMP%` |
 | Permissions | `0600`/`0700` | `0600`/`0700` | inherited ACLs (no POSIX mode) |
 | Keep awake | `caffeinate` | `systemd-inhibit` | `SetThreadExecutionState` |
-| OS sandbox | Seatbelt | Harness preset only | Harness preset only |
+| OS sandbox | Seatbelt | Landlock (ABI 3+) or bwrap | write-restricted token |
 | Restart helper | `osascript` verify (authoritative) + executed `pgrep -a -x <App>` process check + `open -a` | exact `pkill -x`/`pgrep -x` + command/`xdg-open` | `taskkill` + `start` |
 
 Every helper returns a clear `unsupported: ...` sentence instead of raising
 when the platform or the application cannot be handled.
+
+## Continuous integration (macOS + Linux)
+
+`.github/workflows/ci.yml` is a thin wrapper: it checks out, installs one matrix
+Python and runs `scripts/ci.sh`. The matrix is `macos-latest` and
+`ubuntu-latest` on Python 3.9 (the supported floor) and 3.15 (the newest stable
+CPython line, 3.15.2, released 2026-10-25; `actions/setup-python` resolves the
+newest 3.15.x patch).
+Both actions are pinned by commit SHA, permissions are `contents: read`, and
+the workflow uses no secrets and no `pull_request_target`.
+
+`scripts/ci.sh` is the single source of the checks and is runnable locally with
+the same command CI uses (`bash scripts/ci.sh`, with `PYTHON` overriding the
+interpreter). It runs `tools/ci_hygiene.py`, installs the package, builds the
+test-only fake `dsh`, runs `tests/sandbox_probe.py --require --json`, runs the
+full suite with the documented gate command
+(`python3 -m unittest discover -s tests -q`) and then runs
+`tests.test_sandbox_boundary` with `CF_REQUIRE_REAL_SANDBOX=1`, so a skipped
+real boundary is a failure. No CI step needs a secret.
+
+Windows CI is PENDING the user's non-admin Windows VM run. The Windows sandbox
+code and its unit suites are still shipped and run on every host, but no
+`windows-*` job is present: re-add one only after the real boundary has passed
+on that VM (`WINDOWS_TEST.md`), then verify the job locally before pushing.
 
 ## Retention and permissions
 

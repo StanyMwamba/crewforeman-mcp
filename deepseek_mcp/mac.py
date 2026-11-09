@@ -29,11 +29,7 @@ def _pid_file(cfg):
 
 
 def _pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except Exception:
-        return False
+    return platforms.pid_alive(pid)
 
 
 def _process_name(pid):

@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.12.2"
+SERVER_VERSION = "3.13.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -195,9 +195,21 @@ DEFAULTS = {
     # P2-3: reservations left by a dead worker are reclaimed after this lease.
     "cost_reservation_ttl_seconds": 900,
     # macOS Seatbelt wrapper. "auto" uses sandbox-exec when it is present;
-    # "off"/false disables it. It is an extra boundary around DSH, not a
-    # container and not a network sandbox.
+    # "off"/false disables it; "require" refuses to start a builder when no
+    # enforced boundary is available. It is a file-write boundary around DSH,
+    # not a container and not a network sandbox.
     "os_sandbox": "auto",
+    # Linux: auto = Landlock ABI >= linux_min_abi, then bwrap, then none.
+    "linux_sandbox": "auto",
+    "linux_min_abi": 3,
+    # Windows: auto = write-restricted token (W1); appcontainer is opt-in.
+    "windows_sandbox": "auto",
+    # Absolute extra write roots; canonicalized, deduped, capped at 32.
+    "sandbox_extra_writes": [],
+    # Probe cache lifetime; 0 re-probes every policy.
+    "sandbox_probe_ttl": 300.0,
+    # auto runs a deny canary once per policy hash; off is recorded.
+    "sandbox_canary": "auto",
     # Documented DSH transport: headless (stable default), sdk (JSON-RPC), or
     # auto (SDK first, then headless fallback; the fallback is recorded).
     "dsh_transport": "headless",
@@ -507,6 +519,12 @@ ENV_MAP = {
     "DEEPSEEK_COST_RESERVATION_TTL_SECONDS": "cost_reservation_ttl_seconds",
     "DSH_OS_SANDBOX": "os_sandbox",
     "DEEPSEEK_OS_SANDBOX": "os_sandbox",
+    "DEEPSEEK_MCP_LINUX_SANDBOX": "linux_sandbox",
+    "DEEPSEEK_MCP_LINUX_MIN_ABI": "linux_min_abi",
+    "DEEPSEEK_MCP_WINDOWS_SANDBOX": "windows_sandbox",
+    "DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES": "sandbox_extra_writes",
+    "DEEPSEEK_MCP_SANDBOX_PROBE_TTL": "sandbox_probe_ttl",
+    "DEEPSEEK_MCP_SANDBOX_CANARY": "sandbox_canary",
     "DSH_TRANSPORT": "dsh_transport",
     "DEEPSEEK_DSH_TRANSPORT": "dsh_transport",
     "DSH_PROVIDER": "dsh_provider",
@@ -664,7 +682,8 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "model_usage_max_models", "history_model_min_runs",
             "history_model_max", "failure_notes_max_models",
             "failure_notes_model_min_runs", "backup_builder_min_attempts",
-            "reviewer_max_preflights", "plan_optional_max_files"}
+            "reviewer_max_preflights", "plan_optional_max_files",
+            "linux_min_abi"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request"),
              "quality_convergence": ("observe", "auto"),
@@ -675,7 +694,10 @@ ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "model_plan_enforcement": ("warn", "strict"),
              "failure_notes_models": ("on", "off"),
              "reviewer_same_vendor_policy": ("ask", "never"),
-             "gate_no_product_mode": ("skip", "off")}
+             "gate_no_product_mode": ("skip", "off"),
+             "linux_sandbox": ("auto", "landlock", "bwrap", "off"),
+             "windows_sandbox": ("auto", "restricted", "appcontainer", "off"),
+             "sandbox_canary": ("auto", "off")}
 # New v3.12.0 enums never raise on an invalid value: they fall back to the
 # documented default so a bad env/config value cannot break startup.
 ENUM_FALLBACKS = {
@@ -686,7 +708,8 @@ ENUM_FALLBACKS = {
 }
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "allowed_workspace_roots", "gate_secret_patterns",
-             "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths"}
+             "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths",
+             "sandbox_extra_writes"}
 # Dict-valued keys keep JSON objects intact (never comma-split the text).
 DICT_KEYS = {"slice_models", "model_prices"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
@@ -710,7 +733,7 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds",
               "gate_timeout_seconds", "pipeline_min_remaining_usd",
-              "backup_builder_max_cost_usd"}
+              "backup_builder_max_cost_usd", "sandbox_probe_ttl"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path",

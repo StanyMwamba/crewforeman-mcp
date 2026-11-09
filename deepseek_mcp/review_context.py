@@ -21,9 +21,14 @@ import sys
 import tempfile
 import time
 
+from . import platforms
+
 from .api import redact_secrets
 
 ALGORITHM = "sha256"
+# Every path where owner-only permissions could not be verified.  The entry
+# records the safe reason, never file contents.
+PRIVATE_FAILURES = []
 IGNORED_DIRS = {".git", "__pycache__", ".pycache", ".mypy_cache",
                 ".pytest_cache", ".ruff_cache", ".tmp"}
 IGNORED_NAMES = {"REVIEW.md", "REVIEW.partial.json", "REVIEW.partial.md",
@@ -32,6 +37,44 @@ IGNORED_PREFIXES = (".dsh-tmp-",)
 STATE_DIRS = {"state", ".state", "state_dir"}
 _TEXT_LIMIT_DEFAULT = 60000
 _TEST_OUTPUT_TAIL = 4000
+
+
+def _private(path, is_dir=False, system=None):
+    """Apply owner-only permissions and record ``private=false`` on failure."""
+    checker = getattr(platforms, "private_permissions", None)
+    ok = False
+    if checker is not None:
+        try:
+            ok = bool(checker(str(path), system=system, is_dir=is_dir))
+        except TypeError:
+            try:
+                ok = bool(checker(str(path), is_dir=is_dir))
+            except Exception:
+                ok = False
+        except Exception:
+            ok = False
+    if not ok:
+        PRIVATE_FAILURES.append({"path": str(path), "private": False})
+    return ok
+
+
+def _terminate_tree(pid, system=None, timeout=0.5):
+    """Kill a process tree through ``platforms.terminate_tree``."""
+    terminate = getattr(platforms, "terminate_tree", None)
+    if terminate is None:
+        return False
+    try:
+        result = terminate(pid, system=system, timeout=timeout)
+    except TypeError:
+        try:
+            result = terminate(pid)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    if isinstance(result, dict):
+        return bool(result.get("terminated"))
+    return bool(result)
 
 
 def _ignored(rel_path, ignore=None):
@@ -177,10 +220,7 @@ def ensure_evidence_key(state_dir):
                 os.unlink(tmp)
             except OSError:
                 pass
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        _private(path, is_dir=False)
     with open(path, "rb") as handle:
         return "connector", handle.read()
 
@@ -330,12 +370,7 @@ def run_command(command, cwd=None, timeout=300.0, env=None):
             code = proc.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                if os.name != "nt":
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                else:
-                    proc.kill()
-            except Exception:
+            if not _terminate_tree(proc.pid):
                 try:
                     proc.kill()
                 except Exception:
@@ -500,10 +535,18 @@ def capture_baseline(workspace, root, max_file_bytes=262144, max_files=400):
             "files": manifest_files,
         }
         manifest_path = os.path.join(staging, "manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as fh:
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(manifest, fh, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
+        if not _private(manifest_path, is_dir=False):
+            # Record the failure in the report itself; never claim privacy.
+            manifest["private"] = False
+            with open(manifest_path, "w", encoding="utf-8",
+                      newline="\n") as fh:
+                json.dump(manifest, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
         old = None
         if os.path.exists(root):
             old = tempfile.mkdtemp(prefix=".dsh-tmp-baseline-old-", dir=parent)

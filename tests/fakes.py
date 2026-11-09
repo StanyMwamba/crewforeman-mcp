@@ -1,6 +1,7 @@
 """Test fakes: a local DeepSeek HTTP server and a fake ``dsh`` executable."""
 
 import json
+import os
 import stat
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -358,6 +359,14 @@ sys.exit(int(os.environ.get("FAKE_DSH_EXIT", "0")))
     path = Path(path)
     path.write_text(content, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if os.name == "nt":
+        # Windows CreateProcess cannot run a shebang script; compile the
+        # test-only launcher and return it.  A missing compiler is fatal.
+        try:
+            from . import build_fake_dsh
+        except ImportError:  # tests run as top-level modules
+            import build_fake_dsh
+        return build_fake_dsh.build_launcher(path)
     return path
 
 

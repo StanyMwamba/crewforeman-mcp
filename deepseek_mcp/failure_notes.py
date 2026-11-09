@@ -17,15 +17,10 @@ from pathlib import Path
 from . import quality
 from . import store
 
-try:  # pragma: no cover - platform import
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None
-
-try:  # pragma: no cover - platform import
-    import msvcrt
-except ImportError:  # pragma: no cover
-    msvcrt = None
+# Locking is delegated to ``platforms.file_lock`` at call time.  This module
+# must never import ``fcntl``/``msvcrt`` at import time: the other module is
+# absent on the current platform.
+from . import platforms
 
 try:
     from .api import redact_secrets
@@ -516,58 +511,40 @@ class _LockTimeout(Exception):
 
 
 class _Lock(object):
-    """Exclusive store lock with a bounded timeout (fcntl/msvcrt)."""
+    """Exclusive store lock with a bounded timeout (``platforms.file_lock``).
+
+    The public context-manager API and ``_LockTimeout`` behaviour are kept;
+    only the OS-specific locking primitive moved into ``platforms``.
+    """
 
     def __init__(self, path, timeout=_LOCK_TIMEOUT):
         self.path = Path(path)
         self.timeout = timeout
-        self.handle = None
+        self._lock = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = open(self.path, "a+b")
-        deadline = time.time() + self.timeout
-        while True:
-            try:
-                self._acquire()
-                return self
-            except OSError:
-                if time.time() >= deadline:
-                    self.handle.close()
-                    self.handle = None
-                    raise _LockTimeout()
-                time.sleep(0.02)
-
-    def _acquire(self):
-        if fcntl is not None:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        elif msvcrt is not None:  # pragma: no cover - Windows only
-            self.handle.seek(0, os.SEEK_END)
-            if self.handle.tell() == 0:
-                self.handle.write(b"\0")
-                self.handle.flush()
-            self.handle.seek(0)
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            self._lock = platforms.file_lock(str(self.path),
+                                             timeout=self.timeout)
+            self._lock.__enter__()
+            return self
+        except TimeoutError:
+            self._lock = None
+            raise _LockTimeout()
+        except Exception:
+            # A store error must never change the outcome of a run.
+            self._lock = None
+            raise _LockTimeout()
 
     def __exit__(self, exc_type, exc, tb):
-        handle = self.handle
-        self.handle = None
-        if handle is None:
+        lock, self._lock = self._lock, None
+        if lock is None:
             return False
         try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            elif msvcrt is not None:  # pragma: no cover - Windows only
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass
-        finally:
-            try:
-                handle.close()
-            except OSError:
-                pass
-        return False
+            return bool(lock.__exit__(exc_type, exc, tb))
+        except Exception:
+            return False
 
 
 def _sort_items(items):

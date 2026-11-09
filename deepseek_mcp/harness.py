@@ -969,6 +969,8 @@ def _result_text(run, path):
         head += " | stalled: %s" % (run.get("stalled_step") or "no progress event")
     if run.get("child_progress_events"):
         head += " | child activity: %d event(s)" % int(run.get("child_progress_events") or 0)
+    if run.get("sandbox_header"):
+        head += " | " + str(run.get("sandbox_header"))
     retry = run.get("builder_retry") or {}
     if retry and retry.get("status") != "skipped":
         head += " | retried once: %s" % (retry.get("reason") or "transient")
@@ -1452,7 +1454,7 @@ def _restore_review_report(workspace, data):
             target.write_text(api.redact_secrets(text).rstrip() + "\n",
                               encoding="utf-8")
             try:
-                os.chmod(str(target), 0o600)
+                platforms.private_permissions(str(target), is_dir=False)
             except OSError:
                 pass
             return str(target)
@@ -2300,6 +2302,34 @@ def _child_env(cfg, policy, model_spec):
     return env
 
 
+
+def _sandbox_blocked_execution(policy, sandbox_meta, started,
+                               transport="headless"):
+    """Execution record for os_sandbox=require with no enforced boundary."""
+    reason = (sandbox_meta or {}).get("reason") or "sandbox_unavailable"
+    return {
+        "status": "error", "answer": None, "exit_code": None,
+        "error": ("os_sandbox=require has no enforced file-write boundary "
+                  "on this host: %s" % reason),
+        "tools_used": {}, "events": 0, "output_files": [],
+        "seconds": round(time.time() - started, 1), "stderr_tail": "",
+        "session_logs": [], "tokens_in": None, "cache_read_tokens": None,
+        "tokens_out": None, "total_tokens": None,
+        "estimated_cost_usd": None, "cost_source": "unknown",
+        "cost_known": False, "usage_unknown_reason": "sandbox unavailable",
+        "models": None, "usage": None, "stalled": False,
+        "stalled_step": None, "stall_elapsed": None,
+        "stall_seconds": _stall_seconds(None),
+        "stall_max_seconds": _stall_max_seconds(None),
+        "stall_cap_hard_max_seconds": _stall_cap_hard_max(None),
+        "stall_cap_hit": False, "timed_out": False,
+        "stop_reason": "sandbox_unavailable", "child_progress_events": 0,
+        "child_sessions_active": 0, "transport": transport,
+        "sandbox": policy, "os_sandbox": sandbox_meta,
+        "os_sandbox_wrapped": False, "transport_session_id": None,
+    }
+
+
 def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
                    session_id, started, output_slack, cancel_check=None,
                    live_usage_cb=None, dsh_bin=None, model_spec=None,
@@ -2334,6 +2364,9 @@ def _sdk_execution(cfg, workspace, task, limit, progress_cb, label, policy,
         sdk_argv, policy, workspace, tmpdir,
         extra_writes=extra_writes,
         dsh_home=str(reviewer_home) if reviewer_home else None)
+    if sandbox_meta.get("blocked"):
+        return _sandbox_blocked_execution(
+            policy, sandbox_meta, started, transport="sdk")
     client = None
     observed_usage_events = []
 
@@ -2623,6 +2656,8 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                                             dsh_home=(str(reviewer_home)
                                                       if reviewer_home else None))
     sandbox_meta.update(sandbox_meta_extra)
+    if sandbox_meta.get("blocked"):
+        return _sandbox_blocked_execution(policy, sandbox_meta, started)
     tools, events, final, errors = {}, 0, None, []
     stderr_text = ""
     stall_limit = _stall_seconds(cfg)
@@ -3374,7 +3409,9 @@ def _transient_failure_reason(execution):
         seconds = float(execution.get("seconds") or 0.0)
     except (TypeError, ValueError):
         seconds = 0.0
-    if seconds <= 0 or seconds > 30:
+    if seconds < 0 or seconds > 30:
+        # ``seconds`` is rounded to 0.1; a fast (<0.05 s) child legitimately
+        # records 0.0. It still wrote nothing, so it remains retry-safe.
         return None
     text = (str(execution.get("error") or "") + " " +
             str(execution.get("stderr_tail") or ""))
@@ -5461,8 +5498,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     run["builder_sandbox_used"] = builder.get("sandbox") or builder_policy
     run["builder_transport"] = builder.get("transport") or "headless"
     run["transport_fallback_reason"] = builder.get("transport_fallback_reason")
-    run["os_sandbox"] = builder.get("os_sandbox") or {"wrapped": False,
-                                                       "reason": "not evaluated"}
+    raw_sandbox = builder.get("os_sandbox") or {"wrapped": False,
+                                                "reason": "not evaluated"}
+    run["os_sandbox"] = safety.normalize_os_sandbox_record(raw_sandbox)
+    run["sandbox_header"] = (raw_sandbox.get("sandbox_header")
+                             if isinstance(raw_sandbox, dict) else None) \
+        or run["os_sandbox"].get("sandbox_header")
     run["seconds"] = round(time.time() - overall_started, 1)
     run["builder"] = {
         "seconds": builder.get("seconds"),

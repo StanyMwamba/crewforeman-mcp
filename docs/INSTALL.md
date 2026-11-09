@@ -1,11 +1,11 @@
-# Installing crewforeman-mcp 3.12.2
+# Installing crewforeman-mcp 3.13.0
 
 `crewforeman-mcp` is a Python 3.9+ package with **zero runtime dependencies**.
 It ships a local MCP stdio server and five skill checklists (`code`, `data`,
 `document`, `poster`, `web`) installed as data files under
 `share/crewforeman-mcp/skills`.
 
-3.12.2 is a patch release on the 3.12.0 line. The package name, console
+3.13.0 adds the Linux and Windows OS sandboxes and the `os_sandbox` modes. The package name, console
 scripts, skills layout and zero-dependency install contract are unchanged, so
 there is no migration step. The 3.12.1 change is key lookup: a provider key is
 resolved by the **name** of its variable, first from the connector's process
@@ -38,7 +38,7 @@ Run these from the repository root (the directory containing `pyproject.toml`).
 `uvx crewforeman-mcp` resolves the package from the configured index;
 `uvx --from . crewforeman-mcp` runs a local checkout before it is published.
 Pin this release for a reproducible install with
-`uvx crewforeman-mcp==3.12.2`. After a `pipx` or `pip` install, both
+`uvx crewforeman-mcp==3.13.0`. After a `pipx` or `pip` install, both
 `crewforeman-mcp` and the shorter alias `deepseek-mcp` are on `PATH`.
 
 ### macOS
@@ -84,6 +84,14 @@ On distributions with PEP 668 ("externally managed environment"), use `pipx`
 or a venv; a bare `python3 -m pip install .` may refuse with
 `error: externally-managed-environment`.
 
+The Linux file-write boundary is Landlock, applied by an unprivileged launcher.
+It needs Ubuntu 24.04 or newer with kernel 6.2+ (Landlock ABI 3) and enabled
+Landlock support. There is no extra install step, no root and no `sudo`: the
+launcher restricts itself and then executes `dsh`. Kernel ABI 1-2 runs in
+degraded mode and does not claim truncate protection; `os_sandbox=require`
+refuses to start instead. Network is not restricted.
+
+
 ### Windows
 
 Use PowerShell; `py -3` selects the launcher's Python 3.
@@ -103,6 +111,16 @@ Skills install under `<venv>\share\crewforeman-mcp\skills`; pipx environments
 live under `%LOCALAPPDATA%\pipx\venvs`. Every module is pure Python, so no
 compiler or Visual C++ build tools are needed.
 
+The Windows file-write boundary uses a write-restricted token with an ACE on
+the workspace and temp directory. Run the connector and builders as a standard
+user; this is the tested path. Windows CI is PENDING the user's non-admin VM
+run; until it passes, no runner elevation is recorded and no no-admin claim is
+made. UNC workspaces are
+unsupported (the ACL boundary is local-path only), and network/UNC writes are
+not blocked. `os_sandbox=require` refuses to start when the token or ACL cannot
+be created.
+
+
 ### Fresh-venv verification
 
 Run this from a checkout. `PIP_NO_INDEX=1` proves the install needs no network
@@ -121,7 +139,7 @@ python -m deepseek_mcp --help
 python -m pip show -f crewforeman-mcp | grep crewforeman-mcp/skills
 ```
 
-Expected: the version prints `3.12.2`, each `--help` exits 0, and the file
+Expected: the version prints `3.13.0`, each `--help` exits 0, and the file
 listing shows the five `.md` skill files. On Windows replace the last line with
 `python -m pip show -f crewforeman-mcp | Select-String crewforeman-mcp/skills`.
 If the files exist but a run says skills are missing, set `DSH_SKILLS_DIR` to
@@ -141,7 +159,7 @@ under `share/crewforeman-mcp/skills`. A source checkout is untouched. Delete
 
 ## Keys
 
-3.12.2 looks a provider key up by its variable **name**: first the connector's
+3.13.0 looks a provider key up by its variable **name**: first the connector's
 process environment is checked, then the Harness credentials file
 (`~/.dsh/.credentials.yaml` by default). `config.json` lists variable names,
 never values.

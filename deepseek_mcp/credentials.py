@@ -32,6 +32,8 @@ import os
 import re
 import sys
 
+from . import platforms
+
 DEFAULT_CREDENTIALS_FILE = "~/.dsh/.credentials.yaml"
 MAX_FILE_BYTES = 256 * 1024
 CREDENTIALS_ENV_NAMES = (
@@ -93,20 +95,48 @@ def credentials_path(cfg=None, env=None):
     return expanded
 
 
-def _owner_only(path):
-    """True when no group/other permission bits are set (POSIX)."""
-    if os.name == "nt":  # pragma: no cover - Windows has no POSIX mode
+def _is_windows(system=None):
+    text = str(system or "").strip().lower()
+    if text.startswith("win") or text == "nt":
         return True
+    return system is None and os.name == "nt"
+
+
+def private_status(path, system=None):
+    """Owner-only status: POSIX mode bits, Windows owner-only ACL."""
+    path = str(path)
+    if _is_windows(system):
+        checker = getattr(platforms, "private_permissions", None)
+        ok = False
+        if checker is not None:
+            try:
+                ok = bool(checker(path, system=system or "Windows"))
+            except Exception:
+                ok = False
+        return {"private": ok, "method": "acl",
+                "reason": None if ok else
+                "owner-only ACL could not be verified (private=false)"}
     try:
         mode = os.stat(path).st_mode & 0o777
     except OSError:
-        return False
-    return (mode & 0o077) == 0
+        return {"private": False, "method": "mode", "reason": "stat failed"}
+    ok = (mode & 0o077) == 0
+    return {"private": ok, "method": "mode", "mode": mode,
+            "reason": None if ok else "group/other permission bits set"}
 
 
-def _warn_once(path, mode, warn=None):
-    message = ("crewforeman: ignoring credentials file %s: mode %04o is not "
-               "owner-only (chmod 600 required)\n" % (path, mode))
+def _owner_only(path, system=None):
+    """True when the credentials file is private on this platform."""
+    return bool(private_status(path, system=system)["private"])
+
+
+def _warn_once(path, mode, warn=None, system=None):
+    if _is_windows(system):
+        message = ("crewforeman: ignoring credentials file %s: owner-only ACL "
+                   "check failed (private=false)\n" % path)
+    else:
+        message = ("crewforeman: ignoring credentials file %s: mode %04o is "
+                   "not owner-only (chmod 600 required)\n" % (path, mode))
     if callable(warn):
         try:
             warn(message.rstrip("\n"))

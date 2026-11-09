@@ -1,4 +1,4 @@
-"""Contract tests for the crewforeman-mcp 3.12.2 INSTALL and CLIENTS docs.
+"""Contract tests for the crewforeman-mcp 3.13.0 INSTALL and CLIENTS docs.
 
 Standard library only and Python 3.9 compatible.  Intended to live at
 ``repo/tests/test_v3121_install_docs.py`` and run with::
@@ -71,7 +71,7 @@ CLIENT_LAUNCH_TERMS = (
 )
 
 INSTALL_TERMS = (
-    ("3.12.2", "3.12.2"),
+    ("3.13.0", "3.13.0"),
     ("~/.dsh/.credentials.yaml", "~/.dsh/.credentials.yaml"),
     ("DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"),
     ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
@@ -185,8 +185,8 @@ def _matches(headings, aliases):
 
 
 def _mentions(text, term):
-    if term == "3.12.2":
-        return re.search(r"(?<![\d.])3\.12\.2(?![\d.])", text) is not None
+    if term == "3.13.0":
+        return re.search(r"(?<![\d.])3\.13\.0(?![\d.])", text) is not None
     if term.startswith("~"):
         return term in text
     return re.search(
@@ -223,11 +223,20 @@ def _states_names_not_values(section):
 
 def _privacy_patterns():
     patterns = [
-        ("macOS home path", re.compile(r"/Users/")),
-        ("Linux home path", re.compile(r"/home/")),
+        (
+            "macOS home path",
+            re.compile(r"/Users/[A-Za-z0-9._-]+(?:/|$)"),
+        ),
+        (
+            "Linux home path",
+            re.compile(r"/home/[A-Za-z0-9._-]+(?:/|$)"),
+        ),
         (
             "Windows home path",
-            re.compile(r"[A-Za-z]:[\\/]+Users[\\/]", re.I),
+            re.compile(
+                r"[A-Za-z]:[\\/]+Users[\\/][A-Za-z0-9._-]+(?:[\\/]|$)",
+                re.I,
+            ),
         ),
         (
             "email address",
@@ -239,22 +248,6 @@ def _privacy_patterns():
         ("Slack token", re.compile(r"xox[baprs]-")),
         ("Google API key", re.compile(r"AIza[0-9A-Za-z_-]{20,}")),
     ]
-    try:
-        home_name = Path.home().name
-    except RuntimeError:
-        home_name = ""
-    if home_name:
-        patterns.append(
-            (
-                "current home username",
-                re.compile(
-                    r"(?<![A-Za-z0-9._-])"
-                    + re.escape(home_name)
-                    + r"(?![A-Za-z0-9._-])",
-                    re.I,
-                ),
-            )
-        )
     return patterns
 
 
@@ -602,6 +595,21 @@ class InstallDocsContractTest(unittest.TestCase):
             )
         if problems:
             self._fail("Keys section vendor variables", problems)
+
+    def test_privacy_patterns_allow_bare_username_reject_home_paths(self):
+        def labels(text):
+            return [label for label, pattern in _privacy_patterns()
+                    if pattern.search(text)]
+
+        # A bare account name in prose (e.g. "repository root") is not a path.
+        self.assertEqual(
+            labels("Run this from the repository root as root."), [])
+        self.assertIn("macOS home path",
+                      labels("Open " + "/Users/" + "root/project."))
+        self.assertIn("Linux home path",
+                      labels("Open " + "/home/" + "root/project."))
+        self.assertIn("Windows home path",
+                      labels(r"Open C:\Users\root\project."))
 
     def test_no_private_paths_emails_usernames_or_real_keys(self):
         problems = []

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from deepseek_mcp import harness, progress, store
+from deepseek_mcp import harness, platforms, progress, store
 from deepseek_mcp.config import load_config
 from tests.fakes import base_env, write_fake_dsh
 
@@ -339,9 +339,7 @@ class ChildProgressIntegrationTests(unittest.TestCase):
         pid = int(pidfile.read_text(encoding="utf-8"))
         alive = True
         for _ in range(40):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not platforms.pid_alive(pid):
                 alive = False
                 break
             time.sleep(0.1)

@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from deepseek_mcp import harness
+from deepseek_mcp import harness, platforms
 from deepseek_mcp.config import load_config
 from tests.fakes import base_env
 
@@ -139,9 +139,7 @@ class NormalExitPipeTests(unittest.TestCase):
     def _wait_gone(self, pid, timeout=2.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not platforms.pid_alive(pid):
                 return True
             time.sleep(0.02)
         return False
@@ -206,11 +204,9 @@ class NormalExitPipeTests(unittest.TestCase):
 
         # Prove the test held stdout open after the direct child exited.
         self._grandchild_pid = self._read_grandchild_pid()
-        try:
-            os.kill(self._grandchild_pid, 0)
-        except OSError as exc:
-            self.fail("grandchild %d was not alive after the run: %s"
-                      % (self._grandchild_pid, exc))
+        if not platforms.pid_alive(self._grandchild_pid):
+            self.fail("grandchild %d was not alive after the run"
+                      % self._grandchild_pid)
 
     def test_02_never_exit_grandchild_is_bounded_and_reaped(self):
         baseline = set(threading.enumerate())

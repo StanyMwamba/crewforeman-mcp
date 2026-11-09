@@ -210,30 +210,51 @@ class HelperCommandTests(unittest.TestCase):
 
 class SandboxAndPermissionsTests(unittest.TestCase):
     def test_sandbox_support(self):
-        with mock.patch.object(platforms.Path, "is_file", return_value=True):
+        from deepseek_mcp import safety
+        with mock.patch.object(
+                safety, "sandbox_status",
+                return_value={"kind": "seatbelt", "enforcement": "enforced",
+                              "abi": "seatbelt", "reason": None}):
             mac = platforms.sandbox_support(system="Darwin")
         self.assertEqual(mac["kind"], "seatbelt")
         self.assertTrue(mac["available"])
-        with mock.patch.object(platforms.Path, "is_file", return_value=False):
+        with mock.patch.object(
+                safety, "sandbox_status",
+                return_value={"kind": "none", "enforcement": "none",
+                              "abi": None,
+                              "reason": "sandbox-exec not available"}):
             missing = platforms.sandbox_support(system="Darwin")
         self.assertFalse(missing["available"])
         self.assertIn("sandbox-exec", missing["reason"])
-        for system in ("Linux", "Windows"):
-            with self.subTest(system=system):
-                unsupported = platforms.sandbox_support(system=system)
-                self.assertEqual(unsupported["kind"], "none")
-                self.assertFalse(unsupported["available"])
-                self.assertTrue(unsupported["reason"])
+        with mock.patch.object(
+                safety, "sandbox_status",
+                return_value={"kind": "landlock", "enforcement": "enforced",
+                              "abi": "landlock-8", "reason": None}):
+            linux = platforms.sandbox_support(system="Linux")
+        self.assertEqual(linux["kind"], "landlock")
+        self.assertTrue(linux["available"])
+        with mock.patch.object(
+                safety, "sandbox_status",
+                return_value={"kind": "none", "enforcement": "none",
+                              "abi": None, "reason": "not_windows"}):
+            unsupported = platforms.sandbox_support(system="Windows")
+        self.assertEqual(unsupported["kind"], "none")
+        self.assertFalse(unsupported["available"])
 
     def test_private_permissions_and_secure_tree(self):
         with mock.patch.object(platforms.os, "chmod") as chmod:
             self.assertTrue(platforms.private_permissions("/x/file", system="Linux"))
-            chmod.assert_called_once_with("/x/file", 0o600)
+            chmod.assert_called_once_with("/x/file", 0o600,
+                                          follow_symlinks=False)
         with mock.patch.object(platforms.os, "chmod") as chmod:
             self.assertTrue(platforms.private_permissions("/x/dir", system="Darwin", is_dir=True))
-            chmod.assert_called_once_with("/x/dir", 0o700)
+            chmod.assert_called_once_with("/x/dir", 0o700,
+                                          follow_symlinks=False)
         with mock.patch.object(platforms.os, "chmod") as chmod:
-            self.assertFalse(platforms.private_permissions("/x/file", system="Windows"))
+            with mock.patch.object(platforms, "_windows_private_acl",
+                                   return_value=False):
+                self.assertFalse(
+                    platforms.private_permissions("/x/file", system="Windows"))
             chmod.assert_not_called()
 
         with tempfile.TemporaryDirectory() as tmp:
