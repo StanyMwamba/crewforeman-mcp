@@ -8,7 +8,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .api import fmt_cost, redact_secrets
+from .api import fmt_cost, redact_data, redact_secrets
 from .config import ROOT_DIR
 
 FALLBACK_LOG_DIR = ROOT_DIR / "runs"
@@ -372,7 +372,11 @@ def save_run(run, cfg, ledger=True):
         run.pop("log_fallback_reason", None)
     base = directory / run["id"]
     json_path = base.with_suffix(".json")
-    _atomic_write(json_path, redact_secrets(json.dumps(run, ensure_ascii=False, indent=2)))
+    # Redact the object graph, then serialise.  Regexing the serialised JSON
+    # can eat the backslash of an escaped quote that follows a home path and
+    # leave an unparseable record behind.
+    clean = redact_data(run)
+    _atomic_write(json_path, json.dumps(clean, ensure_ascii=False, indent=2))
     _atomic_write(base.with_suffix(".md"), redact_secrets(_md(run)))
     if ledger:
         try:
@@ -438,7 +442,9 @@ def find_run(run_id, cfg):
             try:
                 run = json.loads(json_path.read_text(encoding="utf-8"))
             except Exception as exc:
-                raise RuntimeError("Cannot read run %s: %s" % (run_id, exc))
+                raise RuntimeError(
+                    "Run record %s is corrupt or unreadable (%s); %s"
+                    % (json_path, type(exc).__name__, exc))
             return run, json_path, md_path
     raise RuntimeError("No saved run with id %r in %s" % (run_id, cfg.log_dir))
 

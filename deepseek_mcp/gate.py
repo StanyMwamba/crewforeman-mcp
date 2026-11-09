@@ -26,7 +26,8 @@ from . import path_scope, platforms, review_context, safety
 from .api import redact_secrets
 
 ALGORITHM = "sha256"
-SECRET_BUDGET_SECONDS = 10.0
+SECRET_SCAN_BUDGET_SECONDS = 120.0
+GIT_LIST_TIMEOUT_SECONDS = 10.0
 LINT_BUDGET_SECONDS = 60.0
 DEFAULT_TOTAL_SECONDS = 300.0
 DEFAULT_MAX_OUTPUT_CHARS = 4000
@@ -510,11 +511,28 @@ def _secret_rules(cfg):
     return rules
 
 
+# Tool/vendor trees never contain product secrets.  They are skipped both by
+# name (so os.walk never descends into them) and by glob (for flat path lists
+# such as a git index or a change diff).
+_SECRET_SKIP_DIR_NAMES = (
+    ".git", ".uv-python", ".venv", "venv", "node_modules", ".tox",
+    "site-packages", ".eggs", ".nox", ".pixi",
+)
+
 _SECRET_SKIP_DEFAULTS = (
     "logs/**", "**/logs/**", "**/*.log", "**/*.diff", "**/*.patch",
     "**/*.rej", "**/*.orig", "repo-ref/**", "**/repo-ref/**",
     ".dsh-tmp-*", ".dsh-model-overlay-*",
     "**/cache/**", "cache/**", "**/coverage/**", "coverage/**",
+    "**/.uv-python/**", ".uv-python/**",
+    "**/.venv/**", ".venv/**",
+    "**/venv/**", "venv/**",
+    "**/node_modules/**", "node_modules/**",
+    "**/.tox/**", ".tox/**",
+    "**/site-packages/**", "site-packages/**",
+    "**/.eggs/**", ".eggs/**",
+    "**/.nox/**", ".nox/**",
+    "**/.pixi/**", ".pixi/**",
 )
 
 
@@ -525,6 +543,30 @@ def _secret_skip_globs(cfg):
     if isinstance(raw, str):
         raw = [raw]
     return [str(item) for item in raw if item]
+
+
+def _secret_scan_budget(cfg):
+    """Wall-clock budget for one secret scan; never negative."""
+    raw = _cfg(cfg, "gate_secret_scan_budget_seconds",
+               SECRET_SCAN_BUDGET_SECONDS)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = SECRET_SCAN_BUDGET_SECONDS
+    return max(0.0, value)
+
+
+def _scan_deadline(cfg, deadline, started=None):
+    """Return the effective scan deadline, applying the config budget."""
+    base = time.monotonic() if started is None else started
+    budget_deadline = base + _secret_scan_budget(cfg)
+    if deadline is None:
+        return budget_deadline
+    try:
+        deadline = float(deadline)
+    except (TypeError, ValueError):
+        return budget_deadline
+    return min(deadline, budget_deadline)
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -684,8 +726,9 @@ def _scan_rel_file(cfg, workspace, rel, rules, findings):
 def _scan_paths(cfg, workspace, paths, rules, findings, deadline=None):
     stats = {"scanned": 0, "binary": 0, "large": 0, "skipped": 0}
     timed_out = False
+    deadline = _scan_deadline(cfg, deadline)
     for rel in sorted(set(str(path) for path in paths if path)):
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             timed_out = True
             break
         scanned, binary, large = _scan_rel_file(
@@ -708,31 +751,207 @@ def scan_files(cfg, workspace, paths):
     return findings
 
 
-def scan_tree(cfg, root, skip=None):
-    """Public scanner: walk ``root`` and return findings (skip globs/dirs)."""
+def _skip_names_and_globs(cfg, skip):
+    """Merge configured skip globs with per-call skip names/globs."""
+    names = set(_SECRET_SKIP_DIR_NAMES)
+    globs = list(_secret_skip_globs(cfg))
+    for item in skip or ():
+        text = path_scope.normalize_rel(item).rstrip("/")
+        if not text:
+            continue
+        if any(ch in text for ch in "*?["):
+            globs.append(text)
+            prefix = text[:-3] if text.endswith("/**") else ""
+            if prefix and not any(ch in prefix for ch in "*?["):
+                names.add(prefix.rsplit("/", 1)[-1])
+        elif "/" in text:
+            names.add(text.rsplit("/", 1)[-1])
+        else:
+            names.add(text)
+    return names, globs
+
+
+def _path_is_skipped(rel, names, globs):
+    rel = path_scope.normalize_rel(rel)
+    if not rel:
+        return True
+    if any(part in names for part in rel.split("/")[:-1]):
+        return True
+    return path_scope.match_any(rel, globs)
+
+
+def _dir_is_skipped(rel, names, globs):
+    rel = path_scope.normalize_rel(rel).rstrip("/")
+    if not rel:
+        return False
+    if rel.rsplit("/", 1)[-1] in names:
+        return True
+    if any(part in names for part in rel.split("/")[:-1]):
+        return True
+    return path_scope.match_any(rel, globs)
+
+
+def _git_enumeration(root, deadline):
+    """List tracked + untracked-not-ignored files.
+
+    Returns ``(paths, timed_out)``.  ``paths`` is ``None`` when the root is
+    not a usable git work tree (or git is unavailable), which asks the caller
+    to fall back to ``os.walk``.  The subprocess always has a hard timeout.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None, False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None, True
+    timeout = min(GIT_LIST_TIMEOUT_SECONDS, remaining)
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    # Only trust ls-files when ``root`` itself is the work-tree top level.
+    # Running inside an outer repo (for example a disposable test root under
+    # an ignored directory) otherwise returns an empty list with rc=0 and would
+    # report a clean scan over zero files.
+    try:
+        top = subprocess.run(
+            [git, "-C", root, "rev-parse", "--show-toplevel"],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return None, True
+    except (OSError, ValueError):
+        return None, False
+    if top.returncode != 0:
+        return None, False
+    try:
+        toplevel = top.stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        return None, False
+    if (not toplevel
+            or os.path.realpath(toplevel) != os.path.realpath(root)):
+        return None, False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None, True
+    timeout = min(GIT_LIST_TIMEOUT_SECONDS, remaining)
+    try:
+        proc = subprocess.run(
+            [git, "-C", root, "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return None, True
+    except (OSError, ValueError):
+        return None, False
+    if proc.returncode != 0:
+        return None, False
+    try:
+        raw = proc.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None, False
+    return [item for item in raw.split("\0") if item], False
+
+
+def scan_tree_report(cfg, root, skip=None, deadline=None, budget_seconds=None):
+    """Scan a tree within a budget and return findings plus status.
+
+    The report always carries ``findings`` (list), ``timed_out`` and
+    ``truncated`` booleans, plus file counts and the enumeration source
+    (``git`` or ``walk``).  It never raises because the budget expired.
+    """
+    started = time.monotonic()
     root = os.path.abspath(str(root))
-    skip = list(skip or (".git",))
-    paths = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
-        rel_dir = "" if rel_dir == "." else rel_dir
-        keep = []
-        for name in dirnames:
-            rel = (rel_dir + "/" + name) if rel_dir else name
-            if name in skip or path_scope.match_any(rel, skip):
+    if budget_seconds is None:
+        deadline = _scan_deadline(cfg, deadline, started=started)
+    else:
+        try:
+            budget = max(0.0, float(budget_seconds))
+        except (TypeError, ValueError):
+            budget = _secret_scan_budget(cfg)
+        budget_deadline = started + budget
+        if deadline is None:
+            deadline = budget_deadline
+        else:
+            try:
+                deadline = min(float(deadline), budget_deadline)
+            except (TypeError, ValueError):
+                deadline = budget_deadline
+    names, globs = _skip_names_and_globs(cfg, skip)
+    findings = []
+    paths, enum_timed_out = _git_enumeration(root, deadline)
+    source = "git"
+    truncated = bool(enum_timed_out)
+    if paths is None:
+        source = "walk"
+        paths = []
+        walk_timed_out = False
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            if time.monotonic() >= deadline:
+                walk_timed_out = True
+                break
+            rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+            rel_dir = "" if rel_dir == "." else rel_dir
+            keep = []
+            for name in dirnames:
+                rel = (rel_dir + "/" + name) if rel_dir else name
+                if _dir_is_skipped(rel, names, globs):
+                    continue
+                keep.append(name)
+            dirnames[:] = sorted(keep)
+            stop = False
+            for name in sorted(filenames):
+                if time.monotonic() >= deadline:
+                    walk_timed_out = True
+                    stop = True
+                    break
+                rel = (rel_dir + "/" + name) if rel_dir else name
+                if _path_is_skipped(rel, names, globs):
+                    continue
+                paths.append(rel)
+            if stop:
+                break
+        truncated = truncated or walk_timed_out
+    else:
+        filtered = []
+        for item in paths:
+            rel = path_scope.normalize_rel(item)
+            if not rel or _path_is_skipped(rel, names, globs):
                 continue
-            keep.append(name)
-        dirnames[:] = sorted(keep)
-        for name in sorted(filenames):
-            rel = (rel_dir + "/" + name) if rel_dir else name
-            if path_scope.match_any(rel, skip):
-                continue
-            paths.append(rel)
-    return scan_files(cfg, root, paths)
+            filtered.append(rel)
+        paths = filtered
+    stats, scan_timed_out = _scan_paths(
+        cfg, root, paths, _secret_rules(cfg), findings, deadline)
+    timed_out = bool(enum_timed_out or scan_timed_out)
+    truncated = bool(truncated or timed_out)
+    return {
+        "findings": findings,
+        "timed_out": timed_out,
+        "truncated": truncated,
+        "source": source,
+        "files_total": len(paths),
+        "files_scanned": stats["scanned"],
+        "files_skipped_binary": stats["binary"],
+        "files_skipped_large": stats["large"],
+        "files_skipped": stats["skipped"],
+        "seconds": round(time.monotonic() - started, 4),
+    }
+
+
+def scan_tree(cfg, root, skip=None, deadline=None, budget_seconds=None):
+    """Public scanner: walk ``root`` and return findings (backward compatible)."""
+    return scan_tree_report(
+        cfg, root, skip=skip, deadline=deadline,
+        budget_seconds=budget_seconds)["findings"]
 
 
 def _secret_check(cfg, workspace, before, after, deadline, only_paths=None):
     started = time.monotonic()
+    budget_seconds = _secret_scan_budget(cfg)
+    if deadline is None:
+        deadline = started + budget_seconds
+    else:
+        deadline = min(deadline, started + budget_seconds)
     if not _as_bool(_cfg(cfg, "gate_secret_scan", True), True):
         return {
             "name": "secrets", "status": "skipped", "command": None,
@@ -760,8 +979,38 @@ def _secret_check(cfg, workspace, before, after, deadline, only_paths=None):
             skipped_artifacts += 1
             continue
         scanned_paths.append(rel)
-    stats, timed_out = _scan_paths(
-        cfg, workspace, scanned_paths, rules, findings, deadline)
+    scan_source = "diff"
+    files_total = len(scanned_paths)
+    if scanned_paths:
+        stats, timed_out = _scan_paths(
+            cfg, workspace, scanned_paths, rules, findings, deadline)
+    elif before is None and not any(only_paths or ()):
+        # A genuinely fresh/synthetic run has no baseline snapshot and no
+        # explicit path list, so a whole-tree scan is the only way to check it.
+        # This is the one path that uses the git-aware enumerator, vendor skips
+        # and budget.  When a baseline exists but nothing changed, do not
+        # rescan pre-existing files: an untouched old finding is not this
+        # builder's change.  An explicit path list that filtered down to
+        # nothing must stay an empty scan, not silently widen to the tree.
+        report = scan_tree_report(cfg, workspace, deadline=deadline)
+        for item in report["findings"]:
+            if path_scope.is_split_fixture(item.get("path"), cfg):
+                skipped_artifacts += 1
+                continue
+            findings.append(item)
+        stats = {
+            "scanned": report["files_scanned"],
+            "binary": report["files_skipped_binary"],
+            "large": report["files_skipped_large"],
+            "skipped": report["files_skipped"],
+        }
+        timed_out = bool(report["timed_out"])
+        scan_source = str(report.get("source") or "tree")
+        files_total = int(report.get("files_total") or 0)
+        skipped_artifacts += int(report["files_skipped"])
+    else:
+        stats = {"scanned": 0, "binary": 0, "large": 0, "skipped": 0}
+        timed_out = time.monotonic() >= deadline
     active = [item for item in findings if not item["allowlisted"]]
     if timed_out:
         status = "timed_out"
@@ -782,11 +1031,15 @@ def _secret_check(cfg, workspace, before, after, deadline, only_paths=None):
         "output_digest": _sha256_text(summary),
         "output_tail": summary,
         "tree_changed": False, "timed_out": timed_out,
+        "truncated": timed_out,
+        "scan_budget_seconds": round(budget_seconds, 4),
         "skipped_reason": None, "findings": findings,
         "files_scanned": stats["scanned"],
+        "files_total": files_total,
         "files_skipped_binary": stats["binary"],
         "files_skipped_large": stats["large"],
         "files_skipped_artifact": skipped_artifacts,
+        "scan_source": scan_source,
     }
 
 
@@ -1144,7 +1397,7 @@ def run_gate(cfg, workspace, run, *, phase="pre_review", before=None):
         try:
             secret_check = _secret_check(
                 cfg, workspace, baseline, snapshot,
-                min(deadline, time.monotonic() + SECRET_BUDGET_SECONDS),
+                deadline,
                 only_paths=(output_paths if no_baseline_scan else None))
             checks.append(secret_check)
             checks.append(_skipped_lint_check("no_product_code_change"))
@@ -1172,7 +1425,7 @@ def run_gate(cfg, workspace, run, *, phase="pre_review", before=None):
     try:
         secret_check = _secret_check(
             cfg, workspace, baseline, snapshot,
-            min(deadline, time.monotonic() + SECRET_BUDGET_SECONDS),
+            deadline,
             only_paths=(output_paths if no_baseline_scan else None))
         checks.append(secret_check)
         secrets_failed = secret_check.get("status") in (

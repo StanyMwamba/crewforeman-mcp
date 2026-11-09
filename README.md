@@ -1,6 +1,6 @@
 # CrewForeman
 
-CrewForeman 3.13.9 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.14.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -86,8 +86,8 @@ Call `harness_deepseek` with a prompt and a workspace. A long run may return a j
 - The builder writes `PLAN.json` before the first edit; the connector compares it with the actual diff and warns by default or blocks on mismatches.
 - Bounded, decaying failure notes for each task type are added to the next builder prompt; only fixed defect categories and opaque ids are stored.
 - A disjoint queued job (declared write-set) may start during another job's review in its own worktree; patches are installed only after `git apply --check` proves the whole set applies.
-- The builder model is configurable per job and per slice, teams may mix models and run competing candidates, and the default stays DeepSeek.
-- Cost and score are tracked per model for team sizing and failure notes; a backup builder may take over under its own cost ceiling after credit, auth, 5xx or repeated stream-drop failures.
+- The builder model is configurable per job and per slice, teams may mix models and run competing candidates, and the default stays DeepSeek; cost and score are tracked per model, and a backup builder may take over under its own cost ceiling after credit, auth, 5xx or repeated stream-drop failures.
+- A deterministic loop guard catches repeated commands, edit ping-pong, no-change runs and repeated test failures, then nudges, re-plans or stops the agent.
 - A reviewer must come from a different vendor than every builder; if none is available the job asks once and labels a user-chosen same-vendor review, and the gate skips lint and tests when no product code changed while tiny single-file jobs may omit PLAN.json.
 ## Limits
 - **macOS:** Seatbelt; the boundary suite proves create, modify, truncate, rename and delete outside the workspace, plus symlink and `..` escapes, are refused; reads and network are unrestricted.

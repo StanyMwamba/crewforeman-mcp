@@ -19,7 +19,7 @@ from pathlib import Path
 from . import events as events_mod
 from . import admission as admission_mod
 from . import platforms, providers, safety, tasks, work
-from .api import redact_secrets
+from .api import redact_data, redact_secrets
 from .config import ENTRY_SCRIPT, load_config
 
 _status_path = None
@@ -290,7 +290,8 @@ def write_status(path, **fields):
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(redact_secrets(json.dumps(current, ensure_ascii=False, indent=2)))
+            handle.write(json.dumps(redact_data(current), ensure_ascii=False,
+                                    indent=2))
         os.replace(tmp, str(path))
         try:
             os.chmod(str(path), 0o600)
@@ -1224,8 +1225,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
     # different file (or defaults) even after read_config_file learned to
     # expand "~".  The spec itself is 0600 and is runtime state, not a
     # deliverable.
-    safe_args = json.loads(redact_secrets(
-        json.dumps(call_args, ensure_ascii=False)))
+    safe_args = redact_data(call_args)
     config_path = cfg.get("_config_path")
     if config_path:
         config_path = str(Path(os.path.expanduser(str(config_path))).resolve())
@@ -1715,7 +1715,14 @@ def tool_status(args, cfg=None):
     path = jobs_dir / (run_id + ".status.json")
     if not path.exists():
         raise RuntimeError("No background job with id %r" % run_id)
-    state = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return ("[Job %s status record is corrupt or unreadable (%s); job "
+                "state is unknown.]" % (run_id, type(exc).__name__))
+    if not isinstance(state, dict):
+        return ("[Job %s status record is not an object; job state is "
+                "unknown.]" % run_id)
     try:
         state.update(_admission_status_fields(cfg, run_id, state))
     except Exception:

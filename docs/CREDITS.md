@@ -55,6 +55,17 @@ the ideas that informed our original text.
   repository's files. CrewForeman's practice wording is independent and
   original.
 
+## TokenEconomizer
+
+- Source: TokenEconomizer
+- License: Apache License 2.0
+- What we used: the idea that repeated agent work can be detected from
+  deterministic signals and that the saved tokens can be reported. CrewForeman
+  implemented its own detector (`deepseek_mcp/loop_guard.py`) from scratch for
+  this project. No TokenEconomizer source code, tests, data or prose were
+  copied, so no Apache-2.0 source notice is reproduced here; the attribution
+  records the inspiration only.
+
 ## Originality and scope
 
 The `builder-practices` block in CrewForeman is original text written for this

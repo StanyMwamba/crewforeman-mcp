@@ -20,6 +20,7 @@ STATUSES = (
     "deadline_exceeded",
     "budget_exceeded",
     "gate_failed",
+    "stopped",
     "needs_input",
 )
 
@@ -29,7 +30,8 @@ STATUSES = (
 SUCCESS_STATUSES = frozenset(("ok", "ok_rescued", "ok_unreviewed",
                               "ok_below_gate"))
 FAILURE_STATUSES = frozenset(("error", "no_balance", "cancelled",
-                              "deadline_exceeded", "budget_exceeded", "gate_failed"))
+                              "deadline_exceeded", "budget_exceeded",
+                              "gate_failed", "stopped"))
 
 STATUS_MEANING = {
     "ok": "finished and, when a review ran, accepted at or above the gate with zero blocking defects.",
@@ -42,6 +44,7 @@ STATUS_MEANING = {
     "deadline_exceeded": "the whole-job deadline stopped the run before it finished.",
     "budget_exceeded": "the whole-job estimated-cost budget stopped the run before it finished.",
     "gate_failed": "the deterministic gate exhausted its revision budget; the paid reviewer was not called.",
+    "stopped": "the loop guard stopped the builder after repeated work; the finisher and review were skipped.",
     "needs_input": "the job paused on one validated question and is waiting for a client answer; resume it.",
 }
 
@@ -70,6 +73,8 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "budget_exceeded", STATUS_MEANING["budget_exceeded"], None
     if builder_status == "no_balance":
         return "no_balance", STATUS_MEANING["no_balance"], None
+    if builder_status == "stopped":
+        return "stopped", STATUS_MEANING["stopped"], None
     if builder_status not in ("ok", "ok_rescued"):
         return "error", STATUS_MEANING["error"], None
     if gate_status == "gate_failed":

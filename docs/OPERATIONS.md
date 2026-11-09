@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.13.9)
+# Operations: configuration, safety, budgets, traces and retention (v3.14.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -352,6 +352,12 @@ re-verifying the carried findings. The new report and the carried findings are
 merged into one `REVIEW.md`; a carried blocking defect still counts toward the
 acceptance gate, so a high new score cannot silently drop it.
 
+A paused reviewer-vendor question is durable too. `resume_deepseek` with
+`option` or `answer` re-enters the review, runs the chosen reviewer and records
+the same-vendor label when the user chose one; the attention block is recovered
+from checkpoint metadata or phase data when the run JSON is a synthetic or
+early skeleton.
+
 ### Reviewer pre-flight (P3.2)
 
 Before each paid review round, `review_preflight` (default `true`,
@@ -461,9 +467,19 @@ is safe. Evidence is signed and bounded; `output_tail` is capped and redacted.
 | `gate_lint_command` | `""` | Explicit command; a missing executable fails the gate. |
 | `gate_secret_scan` | `True` | Built-in scan; no external command replaces it. |
 | `gate_secret_patterns` | `[]` | Additional regexes. They add findings, never suppress them. |
+| `gate_secret_scan_budget_seconds` | `120.0` | Per-scan wall clock; expiry is reported as `timed_out`, not raised. |
 | `gate_timeout_seconds` | `300.0` | Total gate wall clock. |
 | `gate_max_revisions` | `2` | Gate-funded revisions before `gate_failed`. |
 | `gate_max_output_chars` | `4000` | Per-check output tail cap. |
+
+The scan skips tool and vendor trees at any depth (`.uv-python`, `.venv`,
+`venv`, `node_modules`, `.tox`, `site-packages`, `.eggs`, `.nox`, `.pixi`) in
+both the changed-file path and a whole-tree scan. When a whole-tree scan is
+needed (a fresh or synthetic run with no baseline snapshot and no explicit
+output paths), it enumerates
+tracked plus untracked-not-ignored files with `git ls-files` under a hard
+subprocess timeout and falls back to a bounded walk on any error. An expired budget reports `timed_out` and
+`truncated` and never hangs the gate.
 
 A failure starts a gate revision with the same cost, health and checkpoint path
 as a review revision, but no reviewer process. After the cap the run ends
@@ -541,6 +557,31 @@ patch at the FIFO head is a drain point: later patches stay pending. Set
 `pipeline_install="manual"` to stop canonical installs while inspecting
 patches; set `pipeline_enabled=false` to stop new starts.
 
+## Loop guard (3.14.0)
+
+Builder and finisher phases feed raw Harness events and the workspace digest
+to a deterministic detector (`deepseek_mcp/loop_guard.py`). It counts four
+signals: repeated failing command plus error, edit ping-pong on the same
+file/hunk, tool calls with no workspace change, and repeated test-failure
+signatures. Thresholds are `loop_guard_repeat_command`,
+`loop_guard_edit_pingpong`, `loop_guard_nochange_calls` and
+`loop_guard_same_test_failure`; `loop_guard_max_actions` caps the ladder and
+`loop_guard_tokens_per_call` sets the estimate basis.
+
+`loop_guard_enabled` defaults to true with conservative thresholds. A nudge
+writes `LOOP_GUARD_NUDGE.md`, emits a progress line, stops the looping attempt
+and restarts the builder once with the nudge and the repeated evidence in its
+task (a headless child has no live message channel). A re-plan runs after a
+second loop: it starts the existing rescue finisher with a re-plan instruction
+that names the evidence. A hard stop skips the finisher and the review and records
+`status="stopped"`. Escalation requires another threshold of new evidence, so
+poll timing alone cannot stop a run. With `loop_guard_confirm=true`, one
+bounded `deepseek-flash` call may confirm a replan or stop; a missing key or an
+error keeps the deterministic decision. The run record gets `loop_guard` and
+`metrics.loops_caught` / `metrics.loop_guard_tokens_saved_estimate`, and
+`WASTE_REPORT.md` gets a short `## Loop guard (v3.14.0)` block. Savings are an
+estimate, never a billing claim.
+
 ## Safety and sandboxing
 
 Builders default to `workspace-write`; the independent reviewer defaults to
@@ -560,7 +601,7 @@ at all; its own home lives under the state directory, outside the
 builder-writable workspace. Credential documents are denied after every grant.
 This is a file-write boundary, not a network fence or a process fence.
 
-### OS sandbox modes and config keys (3.13.9)
+### OS sandbox modes and config keys (3.14.0)
 
 `os_sandbox` is `auto` (default), `off` or `require` (`DSH_OS_SANDBOX`; legacy
 `true`/`false` normalizes to `auto`/`off`). `auto` uses the best available
@@ -574,7 +615,7 @@ boundary. `off` records `enforcement=none` and does not claim a boundary.
 | `os_sandbox` | `auto` | `auto`, `off`, `require` | `DSH_OS_SANDBOX` |
 | `linux_sandbox` | `auto` | `auto`, `landlock`, `bwrap`, `off` | `DEEPSEEK_MCP_LINUX_SANDBOX` |
 | `linux_min_abi` | `3` | Below this, no `enforced` claim; ABI 1-2 is degraded. | `DEEPSEEK_MCP_LINUX_MIN_ABI` |
-| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.13.9 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
+| `windows_sandbox` | `auto` | `auto`, `restricted`, `appcontainer`, `off`; AppContainer is not provisioned in 3.14.0 and fails closed as unavailable | `DEEPSEEK_MCP_WINDOWS_SANDBOX` |
 | `sandbox_extra_writes` | `[]` | Absolute roots; canonicalized, deduped, at most 32. | `DEEPSEEK_MCP_SANDBOX_EXTRA_WRITES` (JSON) |
 | `sandbox_probe_ttl` | `300.0` | Probe cache seconds; `0` re-probes. | `DEEPSEEK_MCP_SANDBOX_PROBE_TTL` |
 | `sandbox_canary` | `auto` | `auto` or `off`; off is recorded. | `DEEPSEEK_MCP_SANDBOX_CANARY` |
@@ -600,8 +641,8 @@ the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`,
 `usable=false`). 3.13.3 fixed the wrong-DLL bindings; run 42648360100 then
 proved the probe (`usable=true`, `write_restricted=true` on py3.9 and py3.15)
 but the suite was red and `admin_member` could not be measured (`WinError
-1309`). 3.13.9 contains the suite fixes; the next GitHub run is the required Windows evidence
-of the suite and the boundary. The runner account is an Administrators member,
+1309`). 3.13.9 was green in run 42697229851; 3.14.0 needs its own green Windows run as
+the required proof of the suite and the boundary. The runner account is an Administrators member,
 but that is not the same as an elevated process token; the probe records
 `admin` (token elevation) and `admin_member` (account group) separately. This
 is a file-write boundary, not a container, VM, network firewall or malware
@@ -612,7 +653,7 @@ variables named by configured providers survive, and keys are never written to
 run records or checkpoints. No API key is stored in a run record, checkpoint or
 trace.
 
-### Restart per OS (3.13.9)
+### Restart per OS (3.14.0)
 
 Restart is best-effort and OS-specific; the status file records `state`,
 `verified_by`, `error` and the resolved opener. macOS closes/reopens with
@@ -946,9 +987,10 @@ The admin-runner caveat is stated rather than hidden: the first
 `windows-2025` run (42629362611) failed in the probe, so its `admin=False` was
 not a measured elevation result. Run 42648360100 proved the probe on both
 Pythons but was red in the suite, and its Administrators-membership query
-failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.9
-records token elevation and group membership separately; the next GitHub run
-is the only Windows proof of the suite and the boundary. Until it is green, no
+failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.9 was green on both Windows
+Pythons in run 42697229851 (suite and boundary) and records token elevation
+and group membership separately; 3.14.0 needs its own green Windows run as the
+required proof for this release. Until that run is green, no
 create/modify/append/truncate denial is claimed, delete/rename outside stays
 `delete_outside=unverified`, and CI makes no no-admin claim. The standard-user
 path remains established only by the user's Windows 11 arm64 VM run.

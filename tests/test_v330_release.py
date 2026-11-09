@@ -25,14 +25,14 @@ CONTRIBUTORS_LABEL = re.compile(
 
 class ReleaseMetadataTests(unittest.TestCase):
     def test_version_is_current_everywhere(self):
-        self.assertEqual(__version__, "3.13.9")
-        self.assertEqual(config.SERVER_VERSION, "3.13.9")
+        self.assertEqual(__version__, "3.14.0")
+        self.assertEqual(config.SERVER_VERSION, "3.14.0")
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(config_path=Path(tmp) / "missing.json", env={})
             response = server.dispatch(
                 "initialize", {"protocolVersion": "2025-06-18"}, cfg=cfg)
         self.assertNotIn("error", response)
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.13.9")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.14.0")
         instructions = response["result"]["instructions"]
         self.assertTrue(instructions.startswith(f"crewforeman-mcp {config.SERVER_VERSION}:"))
         self.assertNotIn("v3.1", instructions)
@@ -54,7 +54,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotIn("600", max_seconds)
         readme = README.read_text(encoding="utf-8")
         self.assertIn("# CrewForeman", readme.splitlines()[0])
-        self.assertIn("CrewForeman 3.13.9", readme)
+        self.assertIn("CrewForeman 3.14.0", readme)
 
     def test_changelog_has_a_3_3_0_section_before_3_2_0(self):
         text = CHANGELOG.read_text(encoding="utf-8")

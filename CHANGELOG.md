@@ -5,6 +5,60 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.14.0
+
+3.14.0: JSON-safe record redaction, applied reviewer answers, isolation-safe restart test, a bounded secret scan, and a deterministic loop guard.
+
+- **JSON record redaction (bug A).** `store.save_run` redacted the serialised
+  JSON with a home-path regex. Inside a JSON-escaped string the pattern could
+  consume the backslash of the following `\"` escape, turning
+  `\"<home>/...\"` into `\"~"` and leaving an unparseable record. Redaction
+  now walks the Python object graph (`api.redact_data`) and serialises the
+  cleaned object; the job-spec writer does the same. `load_runs` still skips a
+  single corrupt record with a warning and keeps the rest, `find_run` names the
+  corrupt path in its error, and `tool_status` returns an "unknown" message
+  for a corrupt status JSON instead of raising `JSONDecodeError`.
+- **Reviewer answer on resume (bug B).** `resume_deepseek` with `option` or
+  `answer` now re-enters the review when the run paused on the reviewer-vendor
+  question. The attention block is recovered from the checkpoint metadata,
+  spec or phase data when the saved run is synthetic or an early skeleton, and
+  a manifest with every review phase marked done can still reopen `review-1`.
+  The chosen reviewer runs and the header records `same-vendor review (chosen
+  by user)` with `reviewer_choice.chosen_by_user=true`.
+- **Concurrent restart test (bug C).** `tests/test_p32_restart.py` used one
+  fixed process name (`cfp32fakeapp`) for the fake app, decoy and `pkill -x`
+  cleanup, so two CI runs on one host killed each other's app. Each instance now
+  gets a unique 11-character `cfp32<hex>` name, and cleanup targets only its
+  own name. A two-instance test proves the scoped cleanup.
+- **Bounded secret scan (bug D).** The default skip lists and directory
+  pruning now cover `.uv-python`, `.venv`, `venv`, `node_modules`, `.tox`,
+  `site-packages`, `.eggs`, `.nox` and `.pixi` at any depth. Inside a git work
+  tree `scan_tree` enumerates tracked plus untracked-not-ignored files with
+  `git ls-files -z` under a 10-second subprocess timeout, falling back to a
+  bounded walk. `gate_secret_scan_budget_seconds` (default 120) makes the scan
+  report `timed_out`/`truncated` instead of hanging; explicit `scan_files`
+  still scans named files.
+- **Loop guard (new).** `deepseek_mcp/loop_guard.py` detects four
+  deterministic signals per builder/finisher: the same failing command with
+  the same error, edit ping-pong on the same file/hunk, many tool calls with no
+  workspace change, and the same test-failure signature. Thresholds are
+  configurable with conservative defaults (3/3/40/3). Only when a signal fires
+  can the optional cheap `deepseek-flash` confirmation run
+  (`loop_guard_confirm`, off by default). The ladder is a nudge: the looping
+  attempt is stopped and restarted once with the nudge and evidence in its
+  task; then a re-plan by a fresh rescue finisher if it loops again; then a
+  hard stop that skips the finisher and the review.
+  Escalation requires another threshold of new evidence, so poll timing alone
+  cannot stop a healthy run. The run record stores `loops_caught`, the actions
+  and an approximate tokens-saved estimate, and `WASTE_REPORT.md` gets the same
+  block. The idea is credited to TokenEconomizer (Apache-2.0) in
+  `docs/CREDITS.md`; no source code is copied.
+- **Docs and version.** `docs/TEAMS.md` and `docs/OPERATIONS.md` describe the
+  loop guard, the bounded secret scan and the applied reviewer answer. README
+  stays at 110 lines with the version line and one short Guarantees bullet;
+  Roles, the bold vendor line, Convergence and both Mermaid diagrams are
+  unchanged.
+
 ## 3.13.9
 
 3.13.9: make the secure-tree unit test host-independent (proof pending the next windows-2025 run)

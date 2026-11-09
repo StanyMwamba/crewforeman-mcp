@@ -33,10 +33,20 @@ from pathlib import Path
 from . import platforms
 
 try:  # pragma: no cover - the normal package import path
+    from .api import redact_data as _redact_data
     from .api import redact_secrets as _redact
 except Exception:  # pragma: no cover - standalone import
     def _redact(text):
         return text
+
+    def _redact_data(value):
+        if isinstance(value, str):
+            return _redact(value)
+        if isinstance(value, dict):
+            return {key: _redact_data(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_redact_data(item) for item in value]
+        return value
 
 try:  # pragma: no cover - the normal package import path
     from .status import STATUSES as _STATUS_VOCAB
@@ -323,9 +333,11 @@ class EventLog(object):
         if not isinstance(payload, dict):
             raise ValueError("Event payload must be a dict")
         try:
-            rendered = json.dumps(payload, ensure_ascii=False,
-                                  separators=(",", ":"))
-            payload = json.loads(_redact(rendered))
+            # Redact the object graph, never the serialised JSON: a regex on
+            # JSON can consume the backslash of an escaped quote and corrupt
+            # the event line.
+            payload = _redact_data(payload)
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             raise ValueError("Event payload is not JSON-serialisable: %s" % exc)
 

@@ -67,6 +67,34 @@ def redact_secrets(text):
     return text
 
 
+def redact_value(value):
+    """Redact one already-decoded value, recursing through containers.
+
+    Only strings are scrubbed; every other scalar keeps its type so that a
+    redacted object can still be serialised as valid JSON.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {(redact_secrets(key) if isinstance(key, str) else key):
+                redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(item) for item in value)
+    return value
+
+
+def redact_data(value):
+    """Recursively redact strings in a Python object graph.
+
+    Callers must serialise the returned object afterwards; never run
+    :func:`redact_secrets` over serialised JSON, because the home-path pattern
+    can consume the backslash of an escaped quote and corrupt the document.
+    """
+    return redact_value(value)
+
+
 def fmt_cost(cost):
     return "n/a" if cost is None else "%.6f" % float(cost)
 

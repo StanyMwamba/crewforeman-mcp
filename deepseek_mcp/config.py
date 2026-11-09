@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.13.9"
+SERVER_VERSION = "3.14.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -114,6 +114,17 @@ DEFAULTS = {
     # A changed file under the workspace is progress even when the parent
     # emits no JSON event (long render/build tool calls).
     "workspace_progress": True,
+    # Deterministic loop detector (E1). Conservative defaults; actions never
+    # call a model and token savings are estimates, not billed amounts.
+    "loop_guard_enabled": True,
+    "loop_guard_confirm": False,
+    "loop_guard_repeat_command": 3,
+    "loop_guard_edit_pingpong": 3,
+    "loop_guard_nochange_calls": 40,
+    "loop_guard_same_test_failure": 3,
+    "loop_guard_tokens_per_call": 1200,
+    "loop_guard_max_actions": 3,
+    "loop_guard_poll_seconds": 5.0,
     # Whole-job bounds across builder, live-scaling waves, reviewer, revisions,
     # rescue and retries. None/0 disables a bound. With a cost ceiling set, an
     # unknown cost is over budget: it cannot be proven under the ceiling, so
@@ -301,6 +312,7 @@ DEFAULTS = {
     "gate_lint_command": "",
     "gate_secret_scan": True,
     "gate_secret_patterns": [],
+    "gate_secret_scan_budget_seconds": 120.0,
     "gate_timeout_seconds": 300.0,
     "gate_max_revisions": 2,
     "gate_max_output_chars": 4000,
@@ -364,6 +376,11 @@ DEFAULTS = {
         "**/*.rej", "**/*.orig", "repo-ref/**", "**/repo-ref/**",
         ".dsh-tmp-*", ".dsh-model-overlay-*", ".pytest_cache/**", "**/__pycache__/**", ".mypy_cache/**",
         ".ruff_cache/**", "htmlcov/**", "coverage/**", ".coverage",
+        "**/.uv-python/**", ".uv-python/**", "**/.venv/**", ".venv/**",
+        "**/venv/**", "venv/**", "**/node_modules/**", "node_modules/**",
+        "**/.tox/**", ".tox/**", "**/site-packages/**", "site-packages/**",
+        "**/.eggs/**", ".eggs/**", "**/.nox/**", ".nox/**",
+        "**/.pixi/**", ".pixi/**",
         "PLAN.json", "MODEL_AUDIT.json", "REVIEW*.md",
         "QUALITY_REPORT*.md", "WASTE_REPORT.md",
         "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.svg",
@@ -376,6 +393,11 @@ DEFAULTS = {
         ".pytest_cache/**",
         "**/__pycache__/**", ".mypy_cache/**", ".ruff_cache/**",
         "htmlcov/**", "coverage/**", ".coverage",
+        "**/.uv-python/**", ".uv-python/**", "**/.venv/**", ".venv/**",
+        "**/venv/**", "venv/**", "**/node_modules/**", "node_modules/**",
+        "**/.tox/**", ".tox/**", "**/site-packages/**", "site-packages/**",
+        "**/.eggs/**", ".eggs/**", "**/.nox/**", ".nox/**",
+        "**/.pixi/**", ".pixi/**",
     ],
     "gate_split_fixture_paths": [
         "tests/test_v3110_gate.py", "tests/test_v3110_integration.py",
@@ -591,6 +613,8 @@ ENV_MAP = {
     "DEEPSEEK_GATE_SECRET_SCAN": "gate_secret_scan",
     "DSH_GATE_SECRET_PATTERNS": "gate_secret_patterns",
     "DEEPSEEK_GATE_SECRET_PATTERNS": "gate_secret_patterns",
+    "DSH_GATE_SECRET_SCAN_BUDGET_SECONDS": "gate_secret_scan_budget_seconds",
+    "DEEPSEEK_GATE_SECRET_SCAN_BUDGET_SECONDS": "gate_secret_scan_budget_seconds",
     "DSH_GATE_TIMEOUT_SECONDS": "gate_timeout_seconds",
     "DEEPSEEK_GATE_TIMEOUT_SECONDS": "gate_timeout_seconds",
     "DSH_GATE_MAX_REVISIONS": "gate_max_revisions",
@@ -654,7 +678,8 @@ BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "i
              "health_gate", "allow_first_phase_overrun",
              "reserve_resume_slot", "review_preflight",
              "gate_enabled", "gate_secret_scan", "pipeline_enabled",
-             "pipeline_require_disjoint"}
+             "pipeline_require_disjoint",
+             "loop_guard_enabled", "loop_guard_confirm"}
 INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
              "restart_helper_attempts",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
@@ -674,6 +699,9 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "cost_reservation_ttl_seconds",
             "gate_max_revisions", "gate_max_output_chars",
             "plan_max_files", "plan_max_risks",
+            "loop_guard_repeat_command", "loop_guard_edit_pingpong",
+            "loop_guard_nochange_calls", "loop_guard_same_test_failure",
+            "loop_guard_tokens_per_call", "loop_guard_max_actions",
             "failure_notes_max",
             "failure_notes_min_occurrences", "failure_notes_max_store",
             "pipeline_max_extra_jobs", "pipeline_max_pending_patches",
@@ -732,7 +760,9 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "retry_backoff_base_seconds", "retry_backoff_cap_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds",
-              "gate_timeout_seconds", "pipeline_min_remaining_usd",
+              "gate_timeout_seconds", "gate_secret_scan_budget_seconds",
+              "loop_guard_poll_seconds",
+              "pipeline_min_remaining_usd",
               "backup_builder_max_cost_usd", "sandbox_probe_ttl"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",

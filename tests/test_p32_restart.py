@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -331,6 +332,26 @@ class MacOSDefaultCommandTests(unittest.TestCase):
             0, "123 Claude\n9999 Claude\n", ancestors={123}))
 
 
+
+_ISSUED_APP_NAMES = set()
+
+
+def _unique_app_name():
+    """Return a concurrency-safe Linux comm name (<= 15 chars).
+
+    Two CI runs on one host must never share this name: each run's
+    ``pkill -x`` may only target its own fake app.  The pid keeps names
+    distinct across processes and the random suffix makes collisions
+    vanishingly unlikely; the in-process set makes them impossible.
+    """
+    while True:
+        name = "cfp32%06x" % (
+            (os.getpid() + random.getrandbits(24)) & 0xFFFFFF)
+        if name not in _ISSUED_APP_NAMES:
+            _ISSUED_APP_NAMES.add(name)
+            return name
+
+
 class LinuxDefaultCommandTests(unittest.TestCase):
     """The real Linux defaults must use exact names, never full cmdlines."""
 
@@ -341,17 +362,20 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         self.status = self.root / "restart-status.json"
         if os.name != "posix":
             self.skipTest("Linux restart defaults are POSIX-only")
+        # Per-instance name: concurrent CI runs on one host must not share
+        # a comm name, or one run's pkill -x kills the other's fake app.
+        self.app_name = _unique_app_name()
         # Ubuntu 26.04 ships a multicall coreutils whose applets are hard
-        # links: executing a symlink named ``cfp32fakeapp`` fails with
+        # links: executing a symlink named like the app fails with
         # "Requested utility does not match executable name".  Build a tiny
         # real executable with the app name instead; fall back to the old
         # symlink only when no C compiler exists.
-        self.fake_app = self.root / "cfp32fakeapp"
+        self.fake_app = self.root / self.app_name
         self.expected_exe = self.fake_app
         compiler = (shutil.which("cc") or shutil.which("gcc")
                     or shutil.which("clang"))
         if compiler:
-            source_file = self.root / "cfp32fakeapp.c"
+            source_file = self.root / (self.app_name + ".c")
             source_file.write_text(
                 "#include <stdlib.h>\n#include <unistd.h>\n"
                 "int main(int argc, char **argv) {\n"
@@ -367,9 +391,9 @@ class LinuxDefaultCommandTests(unittest.TestCase):
             # interpreter that /proc/<pid>/exe really points at.
             self.fake_app.write_text(
                 "#!%s\nimport ctypes, sys, time\n"
-                "ctypes.CDLL(None).prctl(15, b'cfp32fakeapp', 0, 0, 0)\n"
+                "ctypes.CDLL(None).prctl(15, b'%s', 0, 0, 0)\n"
                 "time.sleep(int(sys.argv[1]) if len(sys.argv) > 1 else 60)\n"
-                % sys.executable, encoding="utf-8")
+                % (sys.executable, self.app_name), encoding="utf-8")
             self.fake_app.chmod(0o755)
             self.expected_exe = Path(sys.executable)
         else:
@@ -387,14 +411,14 @@ class LinuxDefaultCommandTests(unittest.TestCase):
             except Exception:
                 pass
         try:
-            subprocess.run(["pkill", "-x", "cfp32fakeapp"],
+            subprocess.run(["pkill", "-x", self.app_name],
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=5)
         except Exception:
             pass
 
     def _which(self, name):
-        return str(self.fake_app) if name == "cfp32fakeapp" else None
+        return str(self.fake_app) if name == self.app_name else None
 
     def _launch_open(self):
         # Detached on purpose (the reopen must survive the opener); mark the
@@ -409,15 +433,61 @@ class LinuxDefaultCommandTests(unittest.TestCase):
 
     def test_defaults_use_exact_process_name_not_full_cmdline(self):
         commands = restart_helper.resolve_commands(
-            "linux", "cfp32fakeapp", which=self._which)
+            "linux", self.app_name, which=self._which)
         self.assertEqual(commands["close"][:2], ["pkill", "-x"])
         self.assertEqual(commands["verify"][:2], ["pgrep", "-x"])
-        self.assertEqual(commands["close"][2], "cfp32fakeapp")
-        self.assertEqual(commands["verify"][2], "cfp32fakeapp")
+        self.assertEqual(commands["close"][2], self.app_name)
+        self.assertEqual(commands["verify"][2], self.app_name)
         for argv in (commands["close"], commands["verify"]):
             self.assertNotIn("-f", argv)
             self.assertNotIn("--full", argv)
         self.assertEqual(commands["expected_executable"], str(self.fake_app))
+
+    def test_two_instances_use_distinct_names_and_scoped_cleanup(self):
+        # Concurrent runs get independent instances.  Their cleanup must
+        # target only their own comm name, never the sibling's.
+        other = self.__class__(
+            "test_defaults_use_exact_process_name_not_full_cmdline")
+        other.setUp()
+        proc = None
+        try:
+            self.assertNotEqual(self.app_name, other.app_name)
+            for instance in (self, other):
+                self.assertRegex(instance.app_name, r"^cfp32[0-9a-f]{6}$")
+                self.assertLessEqual(len(instance.app_name), 15)
+
+            # Run the sibling's fake app so a mis-scoped pkill is observable.
+            proc = subprocess.Popen(
+                [str(other.fake_app), "60"], start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.assertTrue(self._wait_pgrep(other.app_name, present=True),
+                            "sibling fake app never became visible to pgrep")
+
+            self._cleanup()
+            self.assertIsNone(
+                proc.poll(),
+                "cleanup targeted another instance's app name")
+
+            other._cleanup()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("owning instance's cleanup did not kill its app")
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            other.doCleanups()
+
+    def _wait_pgrep(self, name, present, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            code, _out, _err = restart_helper._execute(
+                ["pgrep", "-x", name])
+            if (code == 0) == present:
+                return True
+            time.sleep(0.05)
+        return False
 
     def test_default_close_ignores_helper_shaped_decoy_and_reopens(self):
         # A process whose *command line* contains the app name (as the
@@ -425,12 +495,12 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         # pkill -x.  It is the closest stand-in for the helper itself.
         decoy = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)",
-             "--app-name", "cfp32fakeapp"],
+             "--app-name", self.app_name],
             start_new_session=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         self.decoys.append(decoy)
         record = restart_helper.run_once({
-            "app_name": "cfp32fakeapp", "system": "linux", "attempts": 2,
+            "app_name": self.app_name, "system": "linux", "attempts": 2,
             "retry_seconds": 0.2, "status_path": str(self.status),
             "expected_exe": str(self.expected_exe),
             "open": self._launch_open(),
@@ -448,7 +518,7 @@ class LinuxDefaultCommandTests(unittest.TestCase):
         # Now the failure path: the default close kills the running fake app,
         # the opener does nothing, and default verify must report failure.
         failed = restart_helper.run_once({
-            "app_name": "cfp32fakeapp", "system": "linux", "attempts": 1,
+            "app_name": self.app_name, "system": "linux", "attempts": 1,
             "retry_seconds": 0.2, "status_path": str(self.status),
             "expected_exe": str(self.expected_exe),
             "open": _py("pass"), "which": self._which,

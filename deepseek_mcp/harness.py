@@ -932,8 +932,86 @@ def _team_modules():
     return slices_mod, waste_mod
 
 
+_LOOP_WASTE_MARKER = "## Loop guard (v3.14.0)"
+
+
+def _record_loop_guard_waste(run, workspace):
+    """Append loop-guard evidence to WASTE_REPORT.md (idempotent, bounded)."""
+    info = run.get("loop_guard") if isinstance(run, dict) else None
+    if not isinstance(info, dict):
+        return
+    snapshot = info.get("snapshot") if isinstance(info.get("snapshot"), dict) else {}
+    actions = info.get("actions") if isinstance(info.get("actions"), list) else []
+    loops = int(snapshot.get("loops_caught") or 0)
+    tokens = int(snapshot.get("estimated_tokens_saved") or 0)
+    if not loops and not actions:
+        return
+    path = Path(str(workspace)) / "WASTE_REPORT.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:20000]
+    except OSError:
+        text = "# WASTE_REPORT\n"
+    if _LOOP_WASTE_MARKER in text:
+        return
+    counts = {}
+    for entry in actions:
+        if isinstance(entry, dict):
+            key = str(entry.get("action") or "unknown")
+            counts[key] = counts.get(key, 0) + 1
+    block = (
+        "\n%s\n\n"
+        "Loops caught: %d\n"
+        "Estimated tokens saved: %d (approximate, not billed)\n"
+        "Actions: %s\n"
+        % (_LOOP_WASTE_MARKER, loops, tokens,
+           ", ".join("%s=%d" % item for item in sorted(counts.items()))
+           or "none"))
+    try:
+        path.write_text(text.rstrip() + block, encoding="utf-8")
+    except OSError:
+        return
+
+
+def _merge_loop_guard(run, execution, label):
+    """Fold a finisher's loop-guard evidence into the run-level aggregate."""
+    info = execution.get("loop_guard") if isinstance(execution, dict) else None
+    if not isinstance(info, dict):
+        return
+    snapshot = info.get("snapshot") if isinstance(info.get("snapshot"), dict) else {}
+    actions = [dict(item) for item in info.get("actions") or []
+               if isinstance(item, dict)]
+    if not actions and not int(snapshot.get("loops_caught") or 0):
+        return
+    current = run.get("loop_guard") if isinstance(run.get("loop_guard"), dict) else {}
+    base_snapshot = (dict(current.get("snapshot"))
+                     if isinstance(current.get("snapshot"), dict) else {})
+    finisher_snapshot = (dict(snapshot)
+                         if isinstance(snapshot, dict) else {})
+    for action in actions:
+        action.setdefault("label", str(label))
+    merged_actions = list(current.get("actions") or []) + actions
+    snapshot = dict(base_snapshot)
+    snapshot["loops_caught"] = int(base_snapshot.get("loops_caught") or 0) + int(
+        finisher_snapshot.get("loops_caught") or 0)
+    snapshot["estimated_tokens_saved"] = int(
+        base_snapshot.get("estimated_tokens_saved") or 0) + int(
+        finisher_snapshot.get("estimated_tokens_saved") or 0)
+    phases = list(current.get("phases") or [])
+    phases.append({"label": str(label),
+                   "snapshot": finisher_snapshot,
+                   "actions": actions})
+    run["loop_guard"] = {
+        "enabled": True,
+        "label": current.get("label") or "builder",
+        "snapshot": snapshot,
+        "actions": merged_actions,
+        "phases": phases,
+    }
+
+
 def _collect_team_artifacts(run, workspace, state_dir=None):
     """Collect SLICES/WASTE artifacts, metrics and the last review's follow-ups."""
+    _record_loop_guard_waste(run, workspace)
     slices_mod, waste_mod = _team_modules()
     empty_slices = {"present": False, "waves": 0, "slices": 0,
                     "overlaps": [], "warnings": 0}
@@ -978,12 +1056,19 @@ def _collect_team_artifacts(run, workspace, state_dir=None):
     blocking_follow = [item for item in follow_ups
                        if isinstance(item, dict) and item.get("blocking")]
     metrics = dict(run.get("metrics") or {})
+    loop_info = run.get("loop_guard") if isinstance(run.get("loop_guard"), dict) else {}
+    loop_snapshot = (loop_info.get("snapshot")
+                     if isinstance(loop_info.get("snapshot"), dict) else {})
     metrics.update({
         "slices_present": bool(slices_info.get("present")),
         "slices_overlap_warnings": int(slices_info.get("warnings") or 0),
         "waste_agents_launched": waste_info.get("agents_launched"),
         "waste_agents_discarded": waste_info.get("agents_discarded"),
         "waste_ratio": waste_info.get("waste_ratio"),
+        "loops_caught": int(loop_snapshot.get("loops_caught") or 0),
+        "loop_guard_actions": len(loop_info.get("actions") or []),
+        "loop_guard_tokens_saved_estimate": int(
+            loop_snapshot.get("estimated_tokens_saved") or 0),
         "follow_ups": len(follow_ups),
         "blocking_follow_ups": len(blocking_follow),
     })
@@ -2641,6 +2726,241 @@ def _workspace_signature(workspace, limit=4000):
     return tuple(sorted(entries))
 
 
+_RESCUE_STOP_REASONS = ("stalled", "time_limit", "loop")
+
+
+def _loop_guard_blocks_finisher(stop_reason):
+    """A hard loop stop must skip the finisher and review entirely."""
+    return str(stop_reason or "") == "loop_stop"
+
+
+def _loop_nudge_task(task, info):
+    """Return the builder task for the one nudged restart.
+
+    The headless child cannot receive a live message, so the nudge is delivered
+    as part of a fresh builder prompt.  Only bounded, redacted evidence is
+    copied; the original task is otherwise unchanged.
+    """
+    actions = (info or {}).get("actions") if isinstance(info, dict) else []
+    nudge = None
+    for entry in actions or []:
+        if isinstance(entry, dict) and entry.get("action") == "nudge":
+            nudge = entry
+    evidence = (nudge or {}).get("evidence")
+    try:
+        if isinstance(evidence, str):
+            detail = evidence
+        else:
+            detail = json.dumps(evidence, indent=2, sort_keys=True, default=str)
+    except Exception:
+        detail = str(evidence)
+    detail = api.redact_secrets(detail)[:1800]
+    signal = str((nudge or {}).get("signal") or "repeated work")[:160]
+    return (
+        "%s\n\n## Loop guard nudge (connector)\n\n"
+        "Your previous attempt was stopped because it repeated the same work: "
+        "`%s`. This is a nudge, not a new task. Read `LOOP_GUARD_NUDGE.md` in "
+        "the workspace, change the approach, and continue from the files that "
+        "are already there. Do not repeat the same command, edit or test "
+        "failure.\n\n```\n%s\n```\n"
+        % (str(task or ""), signal, detail))
+
+
+def _merge_loop_guard_info(*infos):
+    """Merge per-attempt loop-guard records without double counting.
+
+    A nudged restart is two builder processes; the run record and the waste
+    report must still show the first nudge plus the second attempt's actions.
+    """
+    valid = [dict(item) for item in infos
+             if isinstance(item, dict) and item]
+    if not valid:
+        return {}
+    actions = []
+    loops = 0
+    tokens = 0
+    snapshot = {}
+    for item in valid:
+        actions.extend(list(item.get("actions") or []))
+        snap = item.get("snapshot")
+        if isinstance(snap, dict):
+            snapshot.update(snap)
+            try:
+                loops += int(snap.get("loops_caught") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                tokens += int(snap.get("estimated_tokens_saved") or 0)
+            except (TypeError, ValueError):
+                pass
+    if not snapshot:
+        snapshot = {}
+    snapshot["loops_caught"] = loops
+    snapshot["estimated_tokens_saved"] = tokens
+    merged = dict(valid[-1])
+    merged["actions"] = actions
+    merged["snapshot"] = snapshot
+    merged["enabled"] = any(bool(item.get("enabled")) for item in valid)
+    return merged
+
+
+def _make_loop_guard(cfg, label, clock=None):
+    """Build a LoopGuard for builder/finisher phases, never for reviewer/ask.
+
+    Imported lazily and fully guarded: a missing or broken loop_guard module
+    must not change the behaviour of a healthy run.
+    """
+    try:
+        text = str(label or "").strip().lower()
+        if not any(token in text for token in
+                   ("builder", "finisher", "rescue")):
+            return None
+        enabled = getattr(cfg, "loop_guard_enabled", True)
+        if not enabled:
+            return None
+        from .loop_guard import LoopGuard
+        # Pass the real config so every loop_guard_* threshold is honoured
+        # (the detector reads the same keys from a mapping or a namespace).
+        return LoopGuard(config=cfg, label=text or "builder", clock=clock)
+    except Exception:
+        return None
+
+
+def _confirm_loop_signal(cfg, action):
+    """Optional cheap DeepSeek confirmation for a fired deterministic signal.
+
+    Off by default. When enabled it makes one bounded text call; any error,
+    missing key or ambiguous answer keeps the deterministic evidence (returns
+    True) rather than disabling the guard. It never receives file contents,
+    secrets or a home path.
+    """
+    if not bool(getattr(cfg, "loop_guard_confirm", False)):
+        return True
+    evidence = action.get("evidence") if isinstance(action, dict) else {}
+    if isinstance(evidence, dict):
+        detail = {
+            "signal": evidence.get("signal"),
+            "count": evidence.get("count"),
+            "threshold": evidence.get("threshold"),
+            "wasted_calls": evidence.get("wasted_calls_beyond_threshold"),
+        }
+    else:
+        detail = {"signal": str(action.get("signal") or "loop")}
+    try:
+        from . import api
+        response = api.call_deepseek(
+            [{"role": "system",
+              "content": "You confirm whether an AI coding agent is stuck in "
+                         "a repeated loop. Reply with exactly CONFIRM or CONTINUE."},
+             {"role": "user", "content": json.dumps(detail, sort_keys=True)}],
+            model="deepseek-flash", max_tokens=8, timeout=20)
+        text = ""
+        for choice in response.get("choices") or []:
+            message = choice.get("message") or {}
+            text += str(message.get("content") or "")
+        return "CONFIRM" in text.upper()
+    except Exception:
+        return True
+
+
+def _apply_loop_guard_action(guard, workspace, label, request_stop,
+                             progress_cb, actions, started=None, confirm=None):
+    """Poll the guard once and apply nudge/replan/stop. Never raises.
+
+    Returns the recorded action dict, or None when the guard has no action.
+    A ``confirm`` callback may veto a replan/stop (the optional cheap-model
+    check); a veto is recorded as a nudge, so deterministic evidence alone can
+    never silently escalate.
+    """
+    try:
+        action = guard.poll()
+    except Exception:
+        return None
+    if not isinstance(action, dict):
+        return None
+    kind = str(action.get("action") or "").strip().lower()
+    if kind not in ("nudge", "replan", "stop"):
+        return None
+    requested = kind
+    confirmed = True
+    if kind in ("replan", "stop") and action.get("needs_confirm") and confirm:
+        try:
+            confirmed = bool(confirm(action))
+        except Exception:
+            confirmed = True
+        if not confirmed:
+            kind = "nudge"
+    entry = {
+        "action": kind,
+        "requested_action": requested,
+        "confirmed": confirmed,
+        "signal": action.get("signal"),
+        "evidence": action.get("evidence"),
+        "label": str(label),
+    }
+    if started is not None:
+        try:
+            entry["seconds"] = round(time.time() - started, 1)
+        except Exception:
+            pass
+    if kind == "nudge":
+        try:
+            path = Path(workspace) / "LOOP_GUARD_NUDGE.md"
+            evidence = action.get("evidence")
+            if isinstance(evidence, str):
+                evidence_text = evidence
+            else:
+                try:
+                    evidence_text = json.dumps(evidence, indent=2, default=str)
+                except Exception:
+                    evidence_text = str(evidence)
+            evidence_text = api.redact_secrets(evidence_text)
+            path.write_text(
+                "# Loop guard nudge\n\n"
+                "The phase `%s` appears to be repeating the same work.\n\n"
+                "## Signal\n\n`%s`\n\n"
+                "## Concrete repeated evidence\n\n```\n%s\n```\n"
+                % (label, action.get("signal"), evidence_text[:6000]),
+                encoding="utf-8")
+            entry["file"] = "LOOP_GUARD_NUDGE.md"
+        except Exception:
+            entry["file"] = None
+        actions.append(entry)
+        if progress_cb:
+            try:
+                progress_cb("%s: LOOP GUARD nudge - %s; stopping this attempt "
+                            "and restarting it with the nudge"
+                            % (label, action.get("signal") or "repeated work"))
+            except Exception:
+                pass
+        # The headless child has no message channel (stdin is closed), so a
+        # file alone can never reach the running agent.  Stop this attempt;
+        # run_harness sees ``loop_nudge`` and starts one fresh builder whose
+        # task carries the nudge and the repeated evidence.
+        try:
+            request_stop("loop_nudge")
+        except Exception:
+            pass
+        return entry
+    actions.append(entry)
+    reason = "loop" if kind == "replan" else "loop_stop"
+    try:
+        request_stop(reason)
+    except Exception:
+        pass
+    if progress_cb:
+        try:
+            if kind == "replan":
+                progress_cb("%s: LOOP GUARD re-plan - %s; stopping for a finisher"
+                            % (label, action.get("signal") or "loop"))
+            else:
+                progress_cb("%s: LOOP GUARD stop - %s; review will be skipped"
+                            % (label, action.get("signal") or "loop"))
+        except Exception:
+            pass
+    return entry
+
+
 def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
                        exclude_logs=None, clock=None, output_slack=2.0,
                        policy=None, session_id=None, cancel_check=None,
@@ -2774,6 +3094,14 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 if getattr(cfg, "child_progress", False) else None)
     child_state = {"events": 0, "active": 0}
     workspace_state = {"events": 0, "last_scan": 0.0, "signature": None}
+    loop_guard = _make_loop_guard(cfg, label, clock=clock)
+    loop_actions = []
+    loop_poll = {"last": None}
+    try:
+        loop_poll_seconds = max(
+            0.0, float(getattr(cfg, "loop_guard_poll_seconds", 5.0) or 0.0))
+    except (TypeError, ValueError):
+        loop_poll_seconds = 5.0
     monitor_stop = threading.Event()
 
     def _request_stop(reason):
@@ -2782,6 +3110,24 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 return False
             stop["reason"] = reason
             return True
+
+    def _loop_guard_poll():
+        if loop_guard is None or stop["reason"] is not None:
+            return
+        now = (clock or time.monotonic)()
+        if (loop_poll["last"] is not None
+                and now - loop_poll["last"] < loop_poll_seconds):
+            return
+        loop_poll["last"] = now
+        entry = _apply_loop_guard_action(
+            loop_guard, workspace, label, _request_stop, progress_cb,
+            loop_actions, started,
+            confirm=lambda action: _confirm_loop_signal(cfg, action))
+        if entry and entry.get("action") in ("nudge", "replan", "stop"):
+            try:
+                _terminate_process(proc)
+            except Exception:
+                pass
 
     def _timeout():
         # Do not label a process that already exited on its own.
@@ -2843,6 +3189,12 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                             except Exception:
                                 pass
                     workspace_state["signature"] = signature
+                    if loop_guard is not None:
+                        try:
+                            loop_guard.note_workspace(signature)
+                        except Exception:
+                            pass
+            _loop_guard_poll()
             if not watch.poll():
                 continue
             stalled_by_cap = watch.cap_hit()
@@ -2902,6 +3254,11 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
             return
         events += 1
         parsed = parse_event(event)
+        if loop_guard is not None:
+            try:
+                loop_guard.observe_event(event, parsed=parsed)
+            except Exception:
+                pass
         if not parsed:
             return
         # P2-3: live cost enforcement is claimed only when the child actually
@@ -3076,7 +3433,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 errfile.close()
             except Exception:
                 pass
-        if reason and code == 0 and final:
+        if reason and reason not in ("loop", "loop_nudge", "loop_stop") and code == 0 and final:
             # The process completed on its own at the same instant the timer
             # or watchdog fired; do not mislabel a normal completion.
             reason = None
@@ -3209,6 +3566,28 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     }
     if reason == "cancelled":
         result["error"] = "cancelled by client"
+    if loop_guard is not None or loop_actions:
+        try:
+            guard_snapshot = (loop_guard.snapshot()
+                              if loop_guard is not None else None)
+        except Exception:
+            guard_snapshot = None
+        result["loop_guard"] = {
+            "enabled": loop_guard is not None,
+            "label": str(label),
+            "snapshot": guard_snapshot,
+            "actions": list(loop_actions),
+            "workspace_signature": workspace_state.get("signature"),
+        }
+        if stop_reason == "loop":
+            result["status"] = "error"
+            result["error"] = "loop guard requested a re-plan"
+        elif stop_reason == "loop_nudge":
+            result["status"] = "error"
+            result["error"] = "loop guard requested a nudged restart"
+        elif stop_reason == "loop_stop":
+            result["status"] = "stopped"
+            result["error"] = "loop guard stopped the phase; review skipped"
     if usage:
         result.update(
             tokens_in=usage["input_tokens"],
@@ -3549,7 +3928,8 @@ def _stop_reason(execution):
     """Return ``stalled``/``time_limit`` for an early stop, else ``None``."""
     if execution.get("status") == "ok":
         return None
-    if execution.get("stop_reason") in ("stalled", "time_limit", "cancelled"):
+    if execution.get("stop_reason") in ("stalled", "time_limit", "cancelled",
+                                        "loop", "loop_nudge", "loop_stop"):
         return execution.get("stop_reason")
     if execution.get("stalled"):
         return "stalled"
@@ -3941,6 +4321,11 @@ def _synthetic_saved_run(manifest):
     """Rebuild the fields ``resume_harness`` needs when run JSON is gone."""
     metadata = (manifest or {}).get("metadata") or {}
     spec = dict(metadata.get("spec") or metadata or {})
+    pending_attention = metadata.get("reviewer_attention")
+    if not isinstance(pending_attention, dict):
+        pending_attention = spec.get("reviewer_attention")
+    if not isinstance(pending_attention, dict):
+        pending_attention = None
     phases = (manifest or {}).get("phases") or {}
     builder = (phases.get("builder") or {}).get("data") or {}
     saved = {
@@ -3968,11 +4353,18 @@ def _synthetic_saved_run(manifest):
         "answer": None,
         "authority": metadata.get("authority"),
         "authority_version": metadata.get("authority_version"),
+        "reviewer_attention": pending_attention,
+        "reviewer_attention_reason": (
+            metadata.get("reviewer_attention_reason")
+            or spec.get("reviewer_attention_reason")),
     }
     for phase in phases.values():
         data = (phase or {}).get("data") or {}
         if data.get("answer") and not saved["answer"]:
             saved["answer"] = data["answer"]
+        if (not saved.get("reviewer_attention")
+                and isinstance(data.get("reviewer_attention"), dict)):
+            saved["reviewer_attention"] = data["reviewer_attention"]
     return saved
 
 
@@ -4456,6 +4848,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     for name in ("attention_answer", "attention_option"):
         if args.get(name) is not None:
             run[name] = api.redact_secrets(str(args.get(name)))
+    # Bug B (3.14.0): a per-job reviewer target must survive the needs_input
+    # pause.  Without it, resume_deepseek cannot rebuild the candidate named in
+    # the user's answer and the answer is replayed as another pause.
+    for name in ("reviewer_model", "reviewer_provider"):
+        value = args.get(name)
+        if value in (None, "", []):
+            value = getattr(cfg, name, None)
+        if value not in (None, "", []):
+            run[name] = str(value)
     run["stall_seconds"] = _stall_seconds(cfg)
     run["stall_max_seconds"] = _stall_max_seconds(cfg)
     run["stall_cap_hard_max_seconds"] = _stall_cap_hard_max(cfg)
@@ -5363,6 +5764,92 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "limit_seconds": retry_limit,
                         }
                         builder = retried
+    # Loop-guard nudge: the child has no live message channel, so the nudge is
+    # delivered by restarting the builder once with a task that names the
+    # repeated evidence.  A second nudge is not retried: it escalates to the
+    # existing re-plan/rescue finisher.
+    if _stop_reason(builder) == "loop_nudge":
+        first_loop = (builder.get("loop_guard")
+                      if isinstance(builder.get("loop_guard"), dict) else {})
+        used_nudge = bool((run.get("loop_nudge") or {}).get("used"))
+        run["loop_nudge"] = {
+            "used": used_nudge,
+            "first_seconds": builder.get("seconds"),
+            "signal": ((first_loop.get("actions") or [{}])[-1].get("signal")
+                       if first_loop.get("actions") else None),
+        }
+        if used_nudge:
+            # The nudged restart looped again: hand this to the finisher.
+            builder["stop_reason"] = "loop"
+            run["loop_nudge"]["escalated_to"] = "replan"
+        else:
+            nudge_limit = _retry_budget(job_budget.phase_limit(limit),
+                                        time.time() - overall_started)
+            nudge_admission = None
+            if nudge_limit and not job_budget.time_exceeded():
+                nudge_admission = _cost_admit(
+                    run, cfg, cost_ledger, "builder-nudge",
+                    run.get("subagents") or 1, nudge_limit, job_budget)
+            if (not nudge_limit
+                    or (nudge_admission and nudge_admission.get("error"))):
+                run["loop_nudge"].update(
+                    status="skipped",
+                    skip_reason=((nudge_admission or {}).get("error")
+                                 or "no time left for a nudged restart"))
+            else:
+                run["loop_nudge"].update(used=True, status="running",
+                                         limit_seconds=nudge_limit)
+                run["loop_guard"] = _merge_loop_guard_info(
+                    run.get("loop_guard"), first_loop)
+                if progress_cb:
+                    try:
+                        progress_cb("builder: loop guard nudge; restarting once "
+                                    "with the repeated evidence (<=%.0f s)"
+                                    % nudge_limit)
+                    except Exception:
+                        pass
+                nudge_live = None
+                if job_budget.max_cost_usd is not None:
+                    nudge_prior, nudge_known = _guard_prior(
+                        nudge_admission, *_running_cost(executions))
+                    nudge_live = budget_mod.LiveCostGuard(
+                        limit=job_budget.max_cost_usd,
+                        reserved=(nudge_admission or {}).get(
+                            "estimate", {}).get("cost_usd") or 0.0,
+                        prior_committed=nudge_prior,
+                        prior_known=nudge_known,
+                        model=getattr(cfg, "dsh_model", None))
+
+                    def nudge_live_cb(event, parsed, _guard=nudge_live):
+                        usage = _usage_from_event(event)
+                        if not usage:
+                            return None
+                        if _guard.observe(usage, _model_from_event(event)):
+                            return "budget"
+                        return None
+                else:
+                    nudge_live_cb = None
+                nudged = _execute_once(
+                    cfg, workspace, _loop_nudge_task(task, first_loop),
+                    limit=nudge_limit, progress_cb=progress_cb,
+                    label="builder nudged", exclude_logs=used_logs,
+                    policy=builder_policy, add_dirs=run["add_dirs"],
+                    transport_name=run["transport"], cancel_check=cancel_check,
+                    live_usage_cb=nudge_live_cb, model_spec=builder_target,
+                    role="builder")
+                executions.append(nudged)
+                used_logs.update(nudged.get("session_logs") or [])
+                _cost_settle(run, cost_ledger, "builder-nudge", nudged,
+                             job_budget,
+                             operation_id=(nudge_admission or {}).get(
+                                 "reservation", {}).get("id"))
+                run["loop_nudge"].update(
+                    status=nudged.get("status"),
+                    retry_seconds=nudged.get("seconds"))
+                builder = nudged
+                if _stop_reason(builder) == "loop_nudge":
+                    builder["stop_reason"] = "loop"
+                    run["loop_nudge"]["escalated_to"] = "replan"
     backup_settings = builder_backup.configured(cfg)
     if (backup_settings and args.get("_prior_builder") is None
             and not builder_backup.uses_backup_once(
@@ -5611,6 +6098,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     run["stalled"] = bool(builder.get("stalled"))
     run["stalled_step"] = builder.get("stalled_step")
     run["stop_reason"] = stop_reason
+    if isinstance(builder.get("loop_guard"), dict):
+        run["loop_guard"] = _merge_loop_guard_info(
+            run.get("loop_guard"), builder.get("loop_guard"))
     run["rescued"] = False
     review_scope = list(builder.get("output_files") or [])
 
@@ -5643,15 +6133,31 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         raise RuntimeError("%s%s" % (run["error"], _saved_note(run, path)))
 
     if builder.get("status") != "ok":
+        if _loop_guard_blocks_finisher(stop_reason):
+            # A hard loop stop is terminal for this phase: no finisher, and no
+            # review of the partial/repetitive work.
+            run["status"] = "stopped"
+            run["stop_reason"] = "loop_stop"
+            run["phase"] = "stopped"
+            run["review_status"] = "skipped"
+            run["phase_status"] = {"phase": "stopped", "review": "skipped"}
+            run["status_detail"] = "loop guard stopped the run; review skipped"
+            run["error"] = "loop guard stopped the run after repeated evidence"
+            run["loop_guard"] = _merge_loop_guard_info(
+                run.get("loop_guard"), builder.get("loop_guard") or {})
+            _record_loop_guard_waste(run, workspace)
+            path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
+            raise RuntimeError("%s%s" % (run["error"], _saved_note(run, path)))
         candidates = (_rescue_candidates(workspace, review_scope)
-                      if stop_reason in ("stalled", "time_limit") else [])
+                      if stop_reason in _RESCUE_STOP_REASONS else [])
         rescue = {
             "attempted": False,
             "reason": stop_reason or "not_stopped_early",
             "candidate_files": candidates,
             "builder_error": (builder.get("error") or "")[:1000] or None,
         }
-        if stop_reason in ("stalled", "time_limit") and candidates:
+        if (stop_reason in _RESCUE_STOP_REASONS
+                and (candidates or stop_reason == "loop")):
             elapsed = time.time() - overall_started
             rescue_limit = _rescue_limit(limit, elapsed)
             remaining = job_budget.remaining_seconds()
@@ -5710,7 +6216,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 prompt, candidates, stop_reason=stop_reason,
                 stopped_after=builder.get("seconds"), skill=skill,
                 quality=quality, quality_target=DEFAULT_QUALITY_TARGET,
-                limit_seconds=rescue_limit)
+                limit_seconds=rescue_limit,
+                loop_evidence=(builder.get("loop_guard") or {}).get("actions"))
             rescue_block = (health_board.quarantine_block("rescue")
                             if getattr(cfg, "health_gate", True) else None)
             if rescue_block:
@@ -5809,6 +6316,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 "cost": finisher.get("estimated_cost_usd"),
                 "status": finisher.get("status"),
             }
+            _merge_loop_guard(run, finisher, "finisher")
             rescue.update(
                 finisher_status=finisher.get("status"),
                 finisher_error=(finisher.get("error") or "")[:1000] or None,
@@ -6785,6 +7293,26 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             reviewer_same_vendor = True
                             break
                     if selected_reviewer is None:
+                        # The answer can name a reviewer that only existed as a
+                        # per-job target (not in the current candidate list).
+                        # Rebuild that exact target instead of re-asking, so
+                        # the choice the user made is the reviewer that runs.
+                        vendor = reviewer_vendor.canonical_vendor(
+                            chosen.get("vendor"))
+                        model = str(chosen.get("model") or "").strip()
+                        if vendor and model and model != "unknown":
+                            selected_reviewer = {
+                                "name": "user-choice",
+                                "vendor": vendor,
+                                "provider": str(chosen.get("provider") or ""),
+                                "model": model,
+                                "dsh_bin": str(cfg.get("dsh_bin") or ""),
+                                "patch": "", "api_key_env": "",
+                                "enabled": True, "legacy_wrapper": False,
+                                "error": None,
+                            }
+                            reviewer_same_vendor = True
+                    if selected_reviewer is None:
                         reviewer_paused = True
                         run["reviewer_attention"] = pending
             legacy_reviewer_mode = not bool(cfg.get("reviewers")) and not job_model
@@ -6845,6 +7373,22 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     else:
                         reviewer_paused = True
                         run["reviewer_attention"] = selected.get("attention")
+            # Resolve the chosen reviewer's model target before declaring it
+            # selected.  A resolution failure must pause visibly instead of
+            # silently falling through to the legacy wrapper (and printing a
+            # label for a model that never ran).
+            if (not reviewer_declined and not reviewer_paused
+                    and selected_reviewer is not None):
+                try:
+                    selected_spec = _spec_for(selected_reviewer)
+                except Exception as exc:
+                    reviewer_paused = True
+                    run["reviewer_attention_reason"] = (
+                        "chosen_reviewer_unavailable")
+                    run["reviewer_choice_error"] = api.redact_secrets(
+                        "chosen reviewer unavailable: %s" % exc)[:300]
+                    if not isinstance(run.get("reviewer_attention"), dict):
+                        run["reviewer_attention"] = pending
             if reviewer_declined:
                 review_status = "declined"
                 run["review_declined_by_user"] = True
@@ -6870,7 +7414,6 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     selected_reviewer, builder_vendors,
                     chosen_by_user=reviewer_same_vendor,
                     same_vendor=reviewer_same_vendor)
-                selected_spec = _spec_for(selected_reviewer)
                 run["reviewer_choice"] = {
                     "status": "selected",
                     "vendor": reviewer_vendor.canonical_vendor(
@@ -9063,6 +9606,30 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         saved, md_path = _synthetic_saved_run(manifest), None
     metadata = manifest.get("metadata") or {}
     spec = dict(metadata.get("spec") or {})
+    # A paused reviewer question is durable in the checkpoint even when the
+    # run record is synthetic or predates the question. Recover it before the
+    # "nothing left to execute" decision so the supplied answer is applied.
+    pending_attention = saved.get("reviewer_attention")
+    if not isinstance(pending_attention, dict) or not pending_attention:
+        pending_attention = None
+        for source in (metadata, spec):
+            found = source.get("reviewer_attention")
+            if isinstance(found, dict) and found:
+                pending_attention = found
+                break
+        if pending_attention is None:
+            for phase in (manifest.get("phases") or {}).values():
+                data = (phase or {}).get("data") or {}
+                found = data.get("reviewer_attention")
+                if isinstance(found, dict) and found:
+                    pending_attention = found
+                    break
+        if pending_attention is not None:
+            saved["reviewer_attention"] = dict(pending_attention)
+            reason = (metadata.get("reviewer_attention_reason")
+                      or spec.get("reviewer_attention_reason"))
+            if reason and not saved.get("reviewer_attention_reason"):
+                saved["reviewer_attention_reason"] = reason
     # P2-1: revalidate before any phase. A pre-authority 3.8.0 record gets a
     # conservative legacy envelope; a record that advertises authority but has
     # none/invalid/newer authority fails closed.
@@ -9115,11 +9682,17 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
             next_phase = str(name)
             break
     reviewer_pending_saved = bool(saved.get("reviewer_attention"))
-    if (reviewer_pending_saved and next_phase is None
+    review_phase_left = any(
+        str(name).startswith("review-")
+        and str(((manifest.get("phases") or {}).get(str(name)) or {})
+                .get("status") or "").strip().lower() != "done"
+        for name in (manifest.get("plan") or []))
+    if (reviewer_pending_saved and not review_phase_left
             and (args.get("answer") is not None
                  or args.get("option") is not None)):
         # The paused reviewer question has an answer; re-enter run_harness so
-        # the chosen candidate is re-preflighted and the paid review runs.
+        # the chosen candidate is preflighted and the paid review runs, even
+        # when the manifest already marks every review phase done.
         next_phase = "review-1"
 
     # P3-2: a convergence stop finalized the run with the repeated defect
@@ -9375,6 +9948,13 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
     }
     if saved.get("builder_model"):
         resume_args["_saved_builder_model"] = dict(saved["builder_model"])
+    # The paused question may name a per-job reviewer that only existed in the
+    # original args.  Restore it from the run record or the checkpoint spec so
+    # the chosen candidate can be matched and executed.
+    for name in ("reviewer_model", "reviewer_provider"):
+        value = saved.get(name) or spec.get(name)
+        if value not in (None, "", []):
+            resume_args[name] = str(value)
     if saved.get("reviewer_attention"):
         resume_args["_saved_reviewer_attention"] = dict(
             saved["reviewer_attention"])

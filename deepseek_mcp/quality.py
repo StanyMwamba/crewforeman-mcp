@@ -1504,7 +1504,8 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
 
 def build_finisher_task(prompt, candidate_files, stop_reason="stalled",
                         stopped_after=None, skill=None, quality=True,
-                        quality_target=DEFAULT_QUALITY_TARGET, limit_seconds=None):
+                        quality_target=DEFAULT_QUALITY_TARGET, limit_seconds=None,
+                        loop_evidence=None):
     """Task text for the short rescue run after a stalled/timed-out builder.
 
     The finisher is deliberately a single agent with a hard call budget: the
@@ -1518,6 +1519,8 @@ def build_finisher_task(prompt, candidate_files, stop_reason="stalled",
         reason = "stalled with no progress events"
     elif stop_reason == "time_limit":
         reason = "hit its time limit"
+    elif stop_reason == "loop":
+        reason = "was stopped by the loop guard for repeating the same work"
     else:
         reason = "stopped early"
     if stopped_after is not None:
@@ -1529,6 +1532,14 @@ def build_finisher_task(prompt, candidate_files, stop_reason="stalled",
                           "answer before then)" % int(float(limit_seconds)))
     except (TypeError, ValueError):
         limit_note = ""
+    if stop_reason == "loop":
+        limit_note += (
+            "\n\n## Re-plan required (loop guard)\n"
+            "The loop guard stopped the previous attempt because it kept repeating "
+            "the same action. Do not repeat that sequence. First write a short "
+            "re-plan that names a different approach, then execute it. The concrete "
+            "repeated evidence is:\n\n```\n%s\n```\n"
+            % str(loop_evidence or "loop guard repeated-work signal")[:2500])
     parts = [
         "You are the FINISHER. This is a rescue, not a normal run. The previous builder "
         "attempt stopped early: it %s. Its process is no longer running, but its files "
