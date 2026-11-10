@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover - standalone file copied next to api.py
 
 
 SERVICE_NAME = "deepseek-harness-mcp"
-SERVICE_VERSION = "3.14.0"
+SERVICE_VERSION = "3.14.1"
 SCOPE_NAME = "deepseek_mcp.observability"
 DEFAULT_STATE_DIR = "~/DeepSeek-MCP/state"
 DEFAULT_EXPORT_TIMEOUT = 10.0

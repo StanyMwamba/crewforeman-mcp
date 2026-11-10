@@ -1,4 +1,4 @@
-"""v3.14.0 slice D: secret-scan vendor skips, git listing and time budget."""
+"""v3.14.1 slice D: secret-scan vendor skips, git listing and time budget."""
 import os
 import shutil
 import subprocess

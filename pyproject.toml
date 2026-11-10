@@ -1,4 +1,4 @@
-# PEP 621 metadata for crewforeman-mcp v3.14.0.
+# PEP 621 metadata for crewforeman-mcp v3.14.1.
 # The in-tree stdlib-only backend keeps `pip install .` working offline on
 # stock Python 3.9, where pip's isolated build env has no setuptools.
 [build-system]
@@ -8,7 +8,7 @@ backend-path = ["."]
 
 [project]
 name = "crewforeman-mcp"
-version = "3.14.0"
+version = "3.14.1"
 description = "Local MCP server exposing DeepSeek agents and DeepSeek Harness runs to any MCP client."
 readme = "README.md"
 requires-python = ">=3.9"

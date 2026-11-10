@@ -93,6 +93,30 @@ class LoopGuardTests(unittest.TestCase):
         self.assertEqual(action["signal"], SIGNAL_TEST)
         self.assertIn("test_alpha", action["evidence"]["key"])
 
+    def test_real_dsh_callid_shape_and_out_of_order_results(self):
+        # Captured from a real `dsh --json` run: tool/tool callId/input, and
+        # tool_result callId/status/result.
+        guard = LoopGuard({"loop_guard_repeat_command": 2,
+                           "loop_guard_same_test_failure": 99})
+        guard.observe_event({
+            "type": "tool_call", "callId": "c1", "tool": "bash",
+            "input": {"command": "make test"}})
+        guard.observe_event({
+            "type": "tool_call", "callId": "c2", "tool": "bash",
+            "input": {"command": "pytest -q"}})
+        # Results arrive in the opposite order; callId must match each one.
+        guard.observe_event({
+            "type": "tool_result", "callId": "c2", "status": "error",
+            "result": "boom-two"})
+        guard.observe_event({
+            "type": "tool_result", "callId": "c1", "status": "error",
+            "result": "boom-one"})
+        details = guard.snapshot()["signals"][SIGNAL_REPEAT]["details"]
+        self.assertEqual(len(details), 2, details)
+        commands = " ".join(item["command"] for item in details.values())
+        self.assertIn("make test", commands)
+        self.assertIn("pytest -q", commands)
+
     def test_assistant_content_blocks_are_observed_once(self):
         guard = LoopGuard({"loop_guard_repeat_command": 2,
                            "loop_guard_nochange_calls": 2,

@@ -932,7 +932,40 @@ def _team_modules():
     return slices_mod, waste_mod
 
 
-_LOOP_WASTE_MARKER = "## Loop guard (v3.14.0)"
+_LOOP_WASTE_MARKER = "## Loop guard (v3.14.1)"
+
+
+def _loop_guard_totals(info):
+    """Return (loops caught, estimated tokens saved, vetoed actions).
+
+    A vetoed action means the agent kept running, so it saved nothing.  Only
+    distinct effective (label, signal) episodes count; per-action evidence
+    estimates are maxed within an episode so a nudge and its later escalation
+    do not double-count.
+    """
+    snapshot = info.get("snapshot") if isinstance(info.get("snapshot"), dict) else {}
+    actions = [item for item in info.get("actions") or []
+               if isinstance(item, dict)]
+    effective = [item for item in actions if item.get("action") != "vetoed"]
+    vetoed = len(actions) - len(effective)
+    if not actions:
+        return (int(snapshot.get("loops_caught") or 0),
+                int(snapshot.get("estimated_tokens_saved") or 0), 0)
+    groups = {}
+    for item in effective:
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        key = (str(item.get("label") or ""), str(item.get("signal") or ""))
+        try:
+            estimate = max(0, int(evidence.get("token_estimate") or 0))
+        except (TypeError, ValueError):
+            estimate = 0
+        groups[key] = max(groups.get(key, 0), estimate)
+    tokens = sum(groups.values())
+    if not tokens and effective:
+        tokens = int(snapshot.get("estimated_tokens_saved") or 0)
+    if not effective:
+        tokens = 0
+    return len(groups), tokens, vetoed
 
 
 def _record_loop_guard_waste(run, workspace):
@@ -940,10 +973,8 @@ def _record_loop_guard_waste(run, workspace):
     info = run.get("loop_guard") if isinstance(run, dict) else None
     if not isinstance(info, dict):
         return
-    snapshot = info.get("snapshot") if isinstance(info.get("snapshot"), dict) else {}
     actions = info.get("actions") if isinstance(info.get("actions"), list) else []
-    loops = int(snapshot.get("loops_caught") or 0)
-    tokens = int(snapshot.get("estimated_tokens_saved") or 0)
+    loops, tokens, vetoed = _loop_guard_totals(info)
     if not loops and not actions:
         return
     path = Path(str(workspace)) / "WASTE_REPORT.md"
@@ -961,9 +992,10 @@ def _record_loop_guard_waste(run, workspace):
     block = (
         "\n%s\n\n"
         "Loops caught: %d\n"
+        "Vetoed actions: %d (no savings claimed)\n"
         "Estimated tokens saved: %d (approximate, not billed)\n"
         "Actions: %s\n"
-        % (_LOOP_WASTE_MARKER, loops, tokens,
+        % (_LOOP_WASTE_MARKER, loops, vetoed, tokens,
            ", ".join("%s=%d" % item for item in sorted(counts.items()))
            or "none"))
     try:
@@ -1007,6 +1039,26 @@ def _merge_loop_guard(run, execution, label):
         "actions": merged_actions,
         "phases": phases,
     }
+
+
+def _finalize_loop_guard(run, workspace=None):
+    """Persist loop-guard metrics and the WASTE block on any terminal path."""
+    info = run.get("loop_guard") if isinstance(run, dict) else None
+    if not isinstance(info, dict):
+        return
+    actions = info.get("actions") if isinstance(info.get("actions"), list) else []
+    loops, tokens, vetoed = _loop_guard_totals(info)
+    metrics = dict(run.get("metrics") or {})
+    metrics.update({
+        "loops_caught": loops,
+        "loops_vetoed": vetoed,
+        "loop_guard_actions": len(actions),
+        "loop_guard_tokens_saved_estimate": tokens,
+    })
+    run["metrics"] = metrics
+    target = workspace or run.get("workspace") or run.get("workspace_configured")
+    if target:
+        _record_loop_guard_waste(run, os.path.expanduser(str(target)))
 
 
 def _collect_team_artifacts(run, workspace, state_dir=None):
@@ -1057,18 +1109,17 @@ def _collect_team_artifacts(run, workspace, state_dir=None):
                        if isinstance(item, dict) and item.get("blocking")]
     metrics = dict(run.get("metrics") or {})
     loop_info = run.get("loop_guard") if isinstance(run.get("loop_guard"), dict) else {}
-    loop_snapshot = (loop_info.get("snapshot")
-                     if isinstance(loop_info.get("snapshot"), dict) else {})
+    loop_loops, loop_tokens, loop_vetoed = _loop_guard_totals(loop_info)
     metrics.update({
         "slices_present": bool(slices_info.get("present")),
         "slices_overlap_warnings": int(slices_info.get("warnings") or 0),
         "waste_agents_launched": waste_info.get("agents_launched"),
         "waste_agents_discarded": waste_info.get("agents_discarded"),
         "waste_ratio": waste_info.get("waste_ratio"),
-        "loops_caught": int(loop_snapshot.get("loops_caught") or 0),
+        "loops_caught": loop_loops,
+        "loops_vetoed": loop_vetoed,
         "loop_guard_actions": len(loop_info.get("actions") or []),
-        "loop_guard_tokens_saved_estimate": int(
-            loop_snapshot.get("estimated_tokens_saved") or 0),
+        "loop_guard_tokens_saved_estimate": loop_tokens,
         "follow_ups": len(follow_ups),
         "blocking_follow_ups": len(blocking_follow),
     })
@@ -2882,14 +2933,45 @@ def _apply_loop_guard_action(guard, workspace, label, request_stop,
     if kind not in ("nudge", "replan", "stop"):
         return None
     requested = kind
+    finisher_phase = str(label or "").strip().lower().startswith(
+        ("finisher", "rescue"))
+    # A rescue/finisher is already the re-plan/reassignment rung: there is no
+    # further agent to hand the work to.  Any loop there is terminal, so the
+    # nudge/replan rungs collapse into the hard stop.  This is what makes the
+    # third rung reachable in production.
+    if finisher_phase and kind in ("nudge", "replan"):
+        kind = "stop"
     confirmed = True
-    if kind in ("replan", "stop") and action.get("needs_confirm") and confirm:
+    if action.get("needs_confirm") and confirm:
         try:
             confirmed = bool(confirm(action))
         except Exception:
             confirmed = True
         if not confirmed:
-            kind = "nudge"
+            # The cheap check may veto any scheduled action.  Record the veto
+            # and leave the child running; the next threshold of fresh
+            # evidence can try again.  A veto must never nudge/stop by itself.
+            entry = {
+                "action": "vetoed",
+                "requested_action": requested,
+                "confirmed": False,
+                "signal": action.get("signal"),
+                "evidence": action.get("evidence"),
+                "label": str(label),
+            }
+            if started is not None:
+                try:
+                    entry["seconds"] = round(time.time() - started, 1)
+                except Exception:
+                    pass
+            actions.append(entry)
+            if progress_cb:
+                try:
+                    progress_cb("%s: LOOP GUARD confirmation declined; the "
+                                "agent keeps running" % label)
+                except Exception:
+                    pass
+            return entry
     entry = {
         "action": kind,
         "requested_action": requested,
@@ -2898,6 +2980,8 @@ def _apply_loop_guard_action(guard, workspace, label, request_stop,
         "evidence": action.get("evidence"),
         "label": str(label),
     }
+    if finisher_phase and requested != kind:
+        entry["terminal_for_finisher"] = True
     if started is not None:
         try:
             entry["seconds"] = round(time.time() - started, 1)
@@ -4514,6 +4598,7 @@ def _observe_skills(run, cfg, history_runs, trace, cancel_check):
 
 def _save_terminal(run, cfg, history_runs, trace, cancel_check):
     """The single post-detection terminal save; observes before saving."""
+    _finalize_loop_guard(run)
     _observe_skills(run, cfg, history_runs, trace, cancel_check)
     path = save_run(run, cfg)
     _finalize_work(run, cfg)
@@ -4848,7 +4933,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     for name in ("attention_answer", "attention_option"):
         if args.get(name) is not None:
             run[name] = api.redact_secrets(str(args.get(name)))
-    # Bug B (3.14.0): a per-job reviewer target must survive the needs_input
+    # Bug B (3.14.1): a per-job reviewer target must survive the needs_input
     # pause.  Without it, resume_deepseek cannot rebuild the candidate named in
     # the user's answer and the answer is replayed as another pause.
     for name in ("reviewer_model", "reviewer_provider"):
@@ -6317,6 +6402,33 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 "status": finisher.get("status"),
             }
             _merge_loop_guard(run, finisher, "finisher")
+            if _stop_reason(finisher) == "loop_stop":
+                # The finisher is the last re-plan rung.  A loop there is
+                # terminal: mark the run stopped, skip the review, and persist
+                # the loop evidence even though this path raises.
+                rescue.update(
+                    finisher_status=finisher.get("status"),
+                    finisher_error=(finisher.get("error") or "")[:1000] or None,
+                    status="stopped",
+                )
+                run["rescue"] = rescue
+                run.update(
+                    status="stopped", stop_reason="loop_stop",
+                    phase="stopped", review_status="skipped",
+                    phase_status={"phase": "stopped", "review": "skipped"},
+                    status_detail=("loop guard stopped the finisher after "
+                                   "repeated work; review skipped"),
+                    error=("loop guard stopped the finisher after repeated "
+                           "work; review skipped"))
+                _finalize_loop_guard(run, workspace)
+                if checkpoint:
+                    try:
+                        checkpoint.interrupted(run["error"])
+                    except Exception:
+                        pass
+                path = _save_terminal(run, cfg, history_runs, trace,
+                                      cancel_check)
+                raise RuntimeError(run["error"] + _saved_note(run, path))
             rescue.update(
                 finisher_status=finisher.get("status"),
                 finisher_error=(finisher.get("error") or "")[:1000] or None,

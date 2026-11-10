@@ -60,12 +60,12 @@ class ReleaseMetadataTests(unittest.TestCase):
         return load_config(config_path=Path(tmp.name) / "missing.json", env={})
 
     def test_version_and_instructions_are_360(self):
-        self.assertEqual(__version__, "3.14.0")
-        self.assertEqual(config.SERVER_VERSION, "3.14.0")
+        self.assertEqual(__version__, "3.14.1")
+        self.assertEqual(config.SERVER_VERSION, "3.14.1")
         response = server.dispatch("initialize", {"protocolVersion": "2025-06-18"},
                                    cfg=self.cfg())
         self.assertNotIn("error", response)
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.14.0")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.14.1")
         instructions = response["result"]["instructions"]
         self.assertTrue(instructions.startswith(f"crewforeman-mcp {config.SERVER_VERSION}:"))
         for phrase in ("consult_deepseek", "resume", "checkpoints",

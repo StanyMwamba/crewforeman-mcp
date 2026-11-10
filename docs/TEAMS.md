@@ -36,7 +36,7 @@ When a wave's candidates score below `live_scaling_threshold` (default 7.0), Cre
 
 If the builder stalls or hits its time limit but has left usable output files, a short rescue finisher can complete the work. It gets at most 8 minutes and 12 tool calls and never extends the whole-job deadline. It is reported as a rescue, not as a normal completion.
 
-## Loop guard (new in 3.14.0)
+## Loop guard (new in 3.14.1)
 
 While a builder or finisher runs, the connector watches the raw Harness event
 stream and the workspace digest for four deterministic signs: the same failing
@@ -47,12 +47,15 @@ the same test-failure signature. Thresholds are configurable:
 `loop_guard_nochange_calls` (40) and `loop_guard_same_test_failure` (3).
 
 Only when a threshold fires can the optional cheap DeepSeek confirmation run
-(`loop_guard_confirm`, off by default). The response ladder is: a nudge file
-(`LOOP_GUARD_NUDGE.md`) plus a progress line, and the stopped builder is
-restarted once with that evidence in its task; then a fresh finisher re-plans
-if the restart loops again; then a hard stop that skips the finisher and the
-review. Escalation needs another full threshold of evidence, so one
-transient repeat cannot stop a healthy run. The run record stores
+(`loop_guard_confirm`, off by default); a veto keeps the agent running and is
+recorded, and a missing key keeps the deterministic decision. The response
+ladder is: a nudge writes `LOOP_GUARD_NUDGE.md`, emits a progress line, and
+(because a headless child has no live message channel) restarts the builder
+once with the nudge and the evidence in its task when budget allows; then a
+re-plan stops the looping attempt and hands the work to a fresh finisher;
+then a hard stop that ends the attempt and skips the review. Escalation needs
+another full threshold of evidence, so one transient repeat cannot stop a
+healthy run. The run record stores
 `loops_caught`, the actions and an approximate tokens-saved estimate, and the
 same block is appended to `WASTE_REPORT.md`. The idea is credited to
 TokenEconomizer (Apache-2.0) in `CREDITS.md`; no source code is copied.

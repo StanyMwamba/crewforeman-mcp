@@ -1,7 +1,9 @@
 """Slice E2: loop-guard harness integration (no real model calls)."""
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 import types
 import unittest
 from unittest import mock
@@ -94,6 +96,116 @@ class LoopGuardHarnessTests(unittest.TestCase):
         self.assertFalse(harness._loop_guard_blocks_finisher("loop"))
         self.assertTrue(any("re-plan" in line.lower() for line in lines))
 
+    def test_finisher_replan_escalates_to_hard_stop(self):
+        # The finisher is the re-plan rung; there is no further agent to hand
+        # the work to, so its next rung must be the hard stop (otherwise the
+        # documented third rung is unreachable in production).
+        guard = ActionGuard([{
+            "action": "replan",
+            "signal": "same_test_failure",
+            "evidence": {"count": 6},
+        }])
+        stops, lines, actions = [], [], []
+        entry = harness._apply_loop_guard_action(
+            guard, tempfile.gettempdir(), "finisher", stops.append,
+            lines.append, actions)
+        self.assertEqual(entry["action"], "stop")
+        self.assertEqual(entry["requested_action"], "replan")
+        self.assertEqual(stops, ["loop_stop"])
+        self.assertTrue(harness._loop_guard_blocks_finisher("loop_stop"))
+        self.assertTrue(any("LOOP GUARD stop" in line for line in lines))
+
+    def test_finisher_nudge_is_terminal_instead_of_restarting(self):
+        guard = ActionGuard([{
+            "action": "nudge",
+            "signal": "nochange",
+            "evidence": {"count": 40},
+        }])
+        stops, lines, actions = [], [], []
+        entry = harness._apply_loop_guard_action(
+            guard, tempfile.gettempdir(), "finisher", stops.append,
+            lines.append, actions)
+        self.assertEqual(entry["action"], "stop")
+        self.assertEqual(entry["requested_action"], "nudge")
+        self.assertTrue(entry.get("terminal_for_finisher"))
+        self.assertEqual(stops, ["loop_stop"])
+
+    def test_confirmation_is_consulted_for_the_first_nudge(self):
+        guard = ActionGuard([{
+            "action": "nudge",
+            "signal": "repeat_tool",
+            "needs_confirm": True,
+            "evidence": {"count": 4},
+        }])
+        calls, stops, actions = [], [], []
+        entry = harness._apply_loop_guard_action(
+            guard, tempfile.gettempdir(), "builder", stops.append,
+            lambda line: None, actions,
+            confirm=lambda action: calls.append(action) or True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(entry["action"], "nudge")
+        self.assertTrue(entry["confirmed"])
+        self.assertEqual(stops, ["loop_nudge"])
+
+    def test_confirmation_veto_keeps_the_agent_running(self):
+        guard = ActionGuard([{
+            "action": "nudge",
+            "signal": "repeat_tool",
+            "needs_confirm": True,
+            "evidence": {"count": 4},
+        }])
+        stops, lines, actions = [], [], []
+        entry = harness._apply_loop_guard_action(
+            guard, tempfile.gettempdir(), "builder", stops.append,
+            lines.append, actions, confirm=lambda action: False)
+        self.assertEqual(entry["action"], "vetoed")
+        self.assertFalse(entry["confirmed"])
+        self.assertEqual(stops, [])
+        self.assertEqual(actions[0]["action"], "vetoed")
+        self.assertTrue(any("declined" in line for line in lines))
+
+    def test_terminal_loop_guard_records_metrics_and_waste(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = {
+                "id": "terminal-loop",
+                "workspace": tmp,
+                "loop_guard": {
+                    "snapshot": {"loops_caught": 2,
+                                 "estimated_tokens_saved": 1200},
+                    "actions": [{"action": "nudge", "label": "builder", "signal": "repeat_tool"},
+                            {"action": "stop", "label": "finisher", "signal": "repeat_tool"}],
+                },
+            }
+            harness._finalize_loop_guard(run)
+            self.assertEqual(run["metrics"]["loops_caught"], 2)
+            self.assertEqual(run["metrics"]["loop_guard_actions"], 2)
+            self.assertEqual(
+                run["metrics"]["loop_guard_tokens_saved_estimate"], 1200)
+            text = (Path(tmp) / "WASTE_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("Loops caught: 2", text)
+
+    def test_vetoed_run_claims_no_savings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = {
+                "id": "vetoed-loop",
+                "workspace": tmp,
+                "loop_guard": {
+                    "snapshot": {"loops_caught": 1,
+                                 "estimated_tokens_saved": 33600},
+                    "actions": [{"action": "vetoed", "label": "builder",
+                                 "signal": "repeat_tool"}],
+                },
+            }
+            harness._finalize_loop_guard(run)
+            self.assertEqual(run["metrics"]["loops_caught"], 0)
+            self.assertEqual(run["metrics"]["loops_vetoed"], 1)
+            self.assertEqual(
+                run["metrics"]["loop_guard_tokens_saved_estimate"], 0)
+            text = (Path(tmp) / "WASTE_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("Loops caught: 0", text)
+            self.assertIn("Vetoed actions: 1 (no savings claimed)", text)
+            self.assertIn("Estimated tokens saved: 0", text)
+
     def test_stop_requests_loop_stop_and_does_not_rescue(self):
         guard = ActionGuard([{
             "action": "stop",
@@ -178,7 +290,8 @@ class LoopGuardHarnessTests(unittest.TestCase):
             run = {"loop_guard": {
                 "snapshot": {"loops_caught": 2,
                              "estimated_tokens_saved": 4800},
-                "actions": [{"action": "nudge"}, {"action": "replan"}],
+                "actions": [{"action": "nudge", "label": "builder", "signal": "repeat_tool"},
+                            {"action": "replan", "label": "finisher", "signal": "repeat_tool"}],
             }}
             harness._record_loop_guard_waste(run, tmp)
             path = os.path.join(tmp, "WASTE_REPORT.md")
@@ -305,6 +418,56 @@ class NudgedRestartTests(unittest.TestCase):
 
 
 class LiveLoopGuardPathTests(unittest.TestCase):
+    def test_live_finisher_loop_is_stopped_and_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            workspace = os.path.join(root, "workspace")
+            os.makedirs(workspace)
+            body = (
+                "#!/usr/bin/env python3\n"
+                "import json, time\n"
+                "for index in range(20):\n"
+                "    print(json.dumps({'type': 'tool_call', 'name': 'bash',"
+                " 'input': {'command': 'pytest -q'}}), flush=True)\n"
+                "    print(json.dumps({'type': 'tool_result', 'name': 'bash',"
+                " 'is_error': True, 'output':"
+                " 'FAILED tests/x.py - AssertionError: boom'}), flush=True)\n"
+                "    time.sleep(0.02)\n"
+                "print(json.dumps({'type': 'final', 'text': 'done'}), flush=True)\n")
+            dsh = write_fake_script(os.path.join(root, "loop-dsh"), body)
+            cfg = load_config(
+                config_path=os.path.join(root, "config.json"),
+                env=base_env(root, fake_dsh=dsh))
+            for key, value in (("loop_guard_enabled", True),
+                               ("loop_guard_repeat_command", 2),
+                               ("loop_guard_same_test_failure", 2),
+                               ("loop_guard_poll_seconds", 0.0),
+                               ("loop_guard_confirm", False)):
+                cfg._values[key] = value
+            args = {
+                "prompt": "Do a looping task", "workspace": workspace,
+                "subagents": 0, "quality": False,
+                "independent_review": False, "sandbox": "workspace",
+            }
+            try:
+                harness.run_harness(args, cfg)
+            except RuntimeError:
+                pass
+            reports = sorted(
+                Path(cfg.log_dir).glob("*.json"),
+                key=lambda path: path.stat().st_mtime)
+            self.assertTrue(reports, "no run record was written")
+            run = json.loads(reports[-1].read_text(encoding="utf-8"))
+            self.assertEqual(run.get("status"), "stopped", run.get("error"))
+            self.assertEqual(run.get("stop_reason"), "loop_stop")
+            self.assertEqual(run.get("review_status"), "skipped")
+            actions = (run.get("loop_guard") or {}).get("actions") or []
+            self.assertIn("stop", [item.get("action") for item in actions])
+            self.assertGreaterEqual(
+                (run.get("metrics") or {}).get("loops_caught", 0), 1)
+            waste = Path(workspace) / "WASTE_REPORT.md"
+            self.assertTrue(waste.is_file(), "WASTE_REPORT.md missing")
+            self.assertIn("Loops caught:", waste.read_text(encoding="utf-8"))
     """Exercise the real subprocess path, not only the extracted helpers."""
 
     def test_execute_once_stops_a_repeating_builder(self):

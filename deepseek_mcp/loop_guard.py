@@ -497,8 +497,9 @@ class LoopGuard:
     def _observe_call(self, event, parsed):
         name = self._event_name(event, parsed)
         tool_input = self._event_input(event)
-        call_id = (event.get("id") or event.get("tool_use_id")
-                   or event.get("toolUseId") or event.get("call_id"))
+        call_id = (event.get("id") or event.get("callId")
+                   or event.get("tool_use_id") or event.get("toolUseId")
+                   or event.get("call_id"))
         if call_id is not None:
             key = str(call_id)
             # Some providers replay the same call as both a tool_call event and
@@ -528,8 +529,9 @@ class LoopGuard:
                     self._calls_since_change)
 
     def _take_pending(self, event):
-        call_id = (event.get("tool_use_id") or event.get("toolUseId")
-                   or event.get("call_id") or event.get("id"))
+        call_id = (event.get("callId") or event.get("tool_use_id")
+                   or event.get("toolUseId") or event.get("call_id")
+                   or event.get("id"))
         if call_id is not None:
             for index, pending in enumerate(self._pending_calls):
                 if pending.get("id") == str(call_id):

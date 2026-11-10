@@ -5,6 +5,25 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.14.1
+
+3.14.1: finish the loop-guard ladder and record its evidence.
+
+- The optional DeepSeek confirmation now runs for the first scheduled action
+  (the nudge). A veto keeps the child running and is recorded as `vetoed`;
+  a veto claims no saved tokens.
+- A finisher's nudge or re-plan collapses to the hard stop: the run ends
+  `status="stopped"`, `review_status="skipped"`, and no review runs.
+- Every terminal path writes `metrics.loops_caught`,
+  `metrics.loops_vetoed`, `metrics.loop_guard_tokens_saved_estimate` and the
+  `WASTE_REPORT.md` block.
+- Loop events match the real `dsh --json` shape (`callId`/`tool`/`input` for
+  calls, `callId`/`status`/`result` for results); out-of-order results are
+  matched by id.
+- Docs now describe the nudge restart, the finisher's terminal stop, the
+  immediate `timed_out` for a zero scan budget, and the findings-only
+  `scan_tree` wrapper.
+
 ## 3.14.0
 
 3.14.0: JSON-safe record redaction, applied reviewer answers, isolation-safe restart test, a bounded secret scan, and a deterministic loop guard.
@@ -46,8 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   can the optional cheap `deepseek-flash` confirmation run
   (`loop_guard_confirm`, off by default). The ladder is a nudge: the looping
   attempt is stopped and restarted once with the nudge and evidence in its
-  task; then a re-plan by a fresh rescue finisher if it loops again; then a
-  hard stop that skips the finisher and the review.
+  task when budget allows; then a re-plan by a fresh rescue finisher if it
+  loops again; then a hard stop if that finisher also loops, with the review
+  skipped.
   Escalation requires another threshold of new evidence, so poll timing alone
   cannot stop a healthy run. The run record stores `loops_caught`, the actions
   and an approximate tokens-saved estimate, and `WASTE_REPORT.md` gets the same
