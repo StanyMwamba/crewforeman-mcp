@@ -107,6 +107,28 @@ def _cfg_float(cfg, key, default):
         return float(default)
 
 
+def _job_value(args, cfg, key, default):
+    """Per-job tool argument, else the config value, else the default."""
+    value = _arg(args, key, None)
+    if value is None:
+        value = _cfg(cfg, key, default)
+    return value
+
+
+def _job_bool(args, cfg, key, default):
+    value = _job_value(args, cfg, key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
+    return bool(value)
+
+
+def _job_float(args, cfg, key, default):
+    try:
+        return float(_job_value(args, cfg, key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _arg(args, key, default=None):
     if args is None:
         return default
@@ -491,7 +513,7 @@ def declared_write_set(args, cfg):
         # v3.14.2: automatic inference is the last resort.  It is cheap and
         # pure-Python, and only a confident, disjoint set is allowed to run in
         # parallel; a low-confidence result keeps the serial path.
-        if _cfg_bool(cfg, "auto_parallel", True):
+        if _job_bool(args, cfg, "auto_parallel", True):
             try:
                 from . import writesets as writesets_mod
                 inferred = writesets_mod.infer_write_set(prompt, workspace)
@@ -983,10 +1005,12 @@ def prepare_args(cfg, args, run=None):
             declared_confidence = float(declared.get("confidence") or 0.0)
         except (TypeError, ValueError):
             declared_confidence = 0.0
+        auto_parallel = _job_bool(args, cfg, "auto_parallel", True)
+        min_confidence = _job_float(
+            args, cfg, "auto_parallel_min_confidence", 0.85)
         inferred_ok = (source == "inferred"
-                       and _cfg_bool(cfg, "auto_parallel", True)
-                       and declared_confidence >= _cfg_float(
-                           cfg, "auto_parallel_min_confidence", 0.85))
+                       and auto_parallel
+                       and declared_confidence >= min_confidence)
         pre_source = (source in {"arg", "slice", "prompt"} or inferred_ok)
         check_set = declared.get("write_set") if pre_source else []
         existing = {}
@@ -1044,6 +1068,8 @@ def prepare_args(cfg, args, run=None):
             "write_set_basis": declared.get("basis"),
             "write_set_widened": bool(existing.get("write_set_widened", False)),
             "write_set_invalid": declared.get("invalid") or [],
+            "auto_parallel": auto_parallel,
+            "auto_parallel_min_confidence": min_confidence,
             "plan_files_outside_write_set": existing.get("plan_files_outside_write_set") or [],
             "worktree_retained": bool(existing.get("worktree_retained", False)),
             "defer_next_start": bool(existing.get("defer_next_start", False)),
@@ -1075,6 +1101,9 @@ def prepare_args(cfg, args, run=None):
             "write_set_impl": "builtin",
             "write_set_widened": False,
             "write_set_invalid": [],
+            "auto_parallel": _job_bool(args, cfg, "auto_parallel", True),
+            "auto_parallel_min_confidence": _job_float(
+                args, cfg, "auto_parallel_min_confidence", 0.85),
             "plan_files_outside_write_set": [],
             "worktree_retained": False,
             "patch": {},

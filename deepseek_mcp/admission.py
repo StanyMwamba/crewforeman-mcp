@@ -568,6 +568,7 @@ class AdmissionStore:
                 # P3.5 pipeline reservation: write-set, eligibility, slot and
                 # base-commit evidence are durable with the queue record.
                 for key in ("write_set", "write_set_source", "write_set_impl",
+                            "auto_parallel", "auto_parallel_min_confidence",
                             "pipeline_eligible", "pipeline_extra",
                             "base_commit", "base_ref", "canonical_workspace",
                             "defer_next_start", "head_skip_count",
@@ -1213,6 +1214,12 @@ class AdmissionController:
         if self.capacity is None or self.hard_ceiling is None:
             return False
         try:
+            from . import writesets as writesets_mod
+            if not writesets_mod.record_auto_parallel(record, self.cfg):
+                return False
+        except Exception:
+            return False
+        try:
             if not bool(_cfg_value(self.cfg, "pipeline_enabled", True)):
                 return False
         except Exception:
@@ -1412,7 +1419,12 @@ class AdmissionController:
             decision = self._parallel_decision(record, eligible_active)
             self._note_parallel(record, decision)
             if not decision.get("parallel"):
-                return False
+                # A per-job opt-out disables automatic parallelism, not the
+                # job itself: run it alone through the normal slot path. Any
+                # same-repo peer still keeps it serial.
+                if not (decision.get("reason") == "auto_parallel_disabled"
+                        and not decision.get("same_workspace_active")):
+                    return False
         else:
             if eligible_active or self._patch_backlog(record) > 0:
                 return False

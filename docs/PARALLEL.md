@@ -86,8 +86,13 @@ resolution and any conflict.
 | `pipeline_max_pending_patches` | `8` | Bounded patch backlog |
 
 The tool arguments `auto_parallel` and `auto_parallel_min_confidence`
-override the config for one job. `write_set` and SLICES precedence are
-unchanged; an explicit declaration always wins over inference.
+override the config for one job. The effective values are frozen into the
+job's `pipeline` block (`auto_parallel`, `auto_parallel_min_confidence`) and
+the admission queue item, so a per-job argument still wins after the job is
+queued or the live config changes. `write_set` and SLICES precedence are
+unchanged; an explicit declaration always wins over inference. A per-job
+`auto_parallel=false` keeps the job serial, but it still starts when no
+same-repository peer is running.
 
 ## Troubleshooting
 

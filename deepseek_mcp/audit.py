@@ -153,9 +153,13 @@ def _norm_path(value):
 def detect_risk(brief, paths, cfg=None):
     """Return ``{risky, reasons, globs, words}`` for a job."""
     globs = list(DEFAULT_RISKY_GLOBS)
-    extra = _cfg(cfg, "audit_risk_globs", None) or _cfg(cfg, "risk_paths", None) or []
-    if isinstance(extra, str):
-        extra = [extra]
+    extra = []
+    for key in ("audit_risk_globs", "risk_paths"):
+        value = _cfg(cfg, key, None)
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, (list, tuple)):
+            extra.extend(value)
     for pattern in extra:
         value = str(pattern or "").strip()
         if value and value not in globs:

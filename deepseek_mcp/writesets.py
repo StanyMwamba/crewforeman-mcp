@@ -81,6 +81,35 @@ def _float(value, default):
     return result if math.isfinite(result) else float(default)
 
 
+def _record_value(record, key):
+    """Effective setting frozen on a queue item or its pipeline block."""
+    if not isinstance(record, dict):
+        return None
+    if record.get(key) is not None:
+        return record[key]
+    pipeline = record.get("pipeline")
+    if isinstance(pipeline, dict) and pipeline.get(key) is not None:
+        return pipeline[key]
+    return None
+
+
+def record_auto_parallel(record, cfg=None):
+    """Admission view: the job's frozen opt-out wins over live config."""
+    value = _record_value(record, "auto_parallel")
+    if value is None:
+        value = _cfg(cfg, "auto_parallel", True)
+    return _bool(value, True)
+
+
+def record_min_confidence(record, cfg=None):
+    """Admission view: the job's frozen threshold wins over live config."""
+    value = _record_value(record, "auto_parallel_min_confidence")
+    if value is None:
+        value = _cfg(cfg, "auto_parallel_min_confidence",
+                     DEFAULT_MIN_CONFIDENCE)
+    return _float(value, DEFAULT_MIN_CONFIDENCE)
+
+
 def normalise_rel(path, workspace=None):
     """Normalise one path to a repo-relative forward-slash string."""
     text = str(path or "").strip().strip("`'\"")
@@ -367,15 +396,20 @@ def _workspace(record):
 
 def parallel_decision(record, active, cfg=None):
     """Decide whether ``record`` may run beside the already-active records."""
-    auto = _bool(_cfg(cfg, "auto_parallel", True), True)
-    minimum = _float(_cfg(cfg, "auto_parallel_min_confidence",
-                           DEFAULT_MIN_CONFIDENCE), DEFAULT_MIN_CONFIDENCE)
+    auto = record_auto_parallel(record, cfg)
+    minimum = record_min_confidence(record, cfg)
     write_set = _record_set(record)
     confidence = _record_confidence(record)
     workspace = _workspace(record)
     if not auto:
+        same_workspace = 0
+        for peer in active or []:
+            if (isinstance(peer, dict) and peer is not record
+                    and _workspace(peer) == workspace):
+                same_workspace += 1
         return {"parallel": False, "reason": "auto_parallel_disabled",
-                "write_set": write_set, "confidence": confidence}
+                "write_set": write_set, "confidence": confidence,
+                "same_workspace_active": same_workspace}
     if not write_set:
         return {"parallel": False, "reason": "no_write_set",
                 "write_set": [], "confidence": confidence}
@@ -395,12 +429,15 @@ def parallel_decision(record, active, cfg=None):
                     "write_set": write_set, "confidence": confidence}
         if _workspace(peer) != workspace:
             continue
+        if not record_auto_parallel(peer, cfg):
+            return {"parallel": False, "reason": "peer_serial",
+                    "write_set": write_set, "confidence": confidence}
         peer_set = _record_set(peer)
         if not peer_set:
             return {"parallel": False, "reason": "peer_unknown_write_set",
                     "write_set": write_set, "confidence": confidence}
         peer_conf = _record_confidence(peer)
-        if peer_conf < minimum:
+        if peer_conf < record_min_confidence(peer, cfg):
             return {"parallel": False, "reason": "peer_low_confidence",
                     "write_set": write_set, "confidence": confidence}
         if sets_overlap(write_set, peer_set):

@@ -7,8 +7,11 @@ import shutil
 import subprocess
 import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from deepseek_mcp import admission, pipeline, writesets
+from deepseek_mcp import admission, jobs, pipeline, writesets
+from deepseek_mcp.config import load_config
 
 
 def _record(workspace, write_set, confidence, eligible=True, run_id="r1"):
@@ -129,6 +132,62 @@ class DecisionTests(unittest.TestCase):
             _record(self.ws, ["src/a.py"], 0.92), [], cfg)
         self.assertFalse(decision["parallel"])
         self.assertEqual(decision["reason"], "auto_parallel_disabled")
+        self.assertEqual(decision.get("same_workspace_active"), 0)
+
+    def test_record_opt_out_overrides_enabled_config(self):
+        record = _record(self.ws, ["src/a.py"], 0.92)
+        record["auto_parallel"] = False
+        decision = writesets.parallel_decision(record, [], self.cfg)
+        self.assertFalse(decision["parallel"])
+        self.assertEqual(decision["reason"], "auto_parallel_disabled")
+
+    def test_pipeline_block_opt_out_is_seen_by_admission(self):
+        record = _record(self.ws, ["src/a.py"], 0.92)
+        record["pipeline"] = {"auto_parallel": False,
+                              "auto_parallel_min_confidence": 0.85}
+        decision = writesets.parallel_decision(record, [], self.cfg)
+        self.assertFalse(decision["parallel"])
+        self.assertEqual(decision["reason"], "auto_parallel_disabled")
+
+    def test_record_min_confidence_overrides_config(self):
+        record = _record(self.ws, ["src/a.py"], 0.92)
+        record["auto_parallel_min_confidence"] = 0.99
+        active = [_record(self.ws, ["src/b.py"], 0.92, run_id="old")]
+        decision = writesets.parallel_decision(record, active, self.cfg)
+        self.assertFalse(decision["parallel"])
+        self.assertEqual(decision["reason"], "low_confidence")
+
+    def test_admission_starts_opted_out_job_alone(self):
+        class Store:
+            dependency_probe = None
+
+            def __init__(self, active):
+                self._active = list(active)
+                self.saved = None
+
+            def active(self):
+                return list(self._active)
+
+            def _save_item(self, work_id, record):
+                self.saved = record
+
+        cfg = types.SimpleNamespace(
+            max_harness_jobs=4, reserve_resume_slot=False,
+            pipeline_enabled=True, pipeline_require_disjoint=True,
+            auto_parallel=True, auto_parallel_min_confidence=0.85,
+            state_dir=self.ws)
+        store = Store([])
+        controller = admission.AdmissionController(
+            cfg, store=store, detected_limit=4)
+        record = _record(self.ws, ["src/a.py"], 0.92, run_id="optout")
+        record["auto_parallel"] = False
+        # No same-repo peer: the opt-out disables parallelism, not the job.
+        self.assertTrue(controller._may_start(record))
+        self.assertEqual(record.get("parallel_reason"),
+                         "auto_parallel_disabled")
+        # A same-repo running peer keeps it serial.
+        store._active = [_record(self.ws, ["src/b.py"], 0.92)]
+        self.assertFalse(controller._may_start(record))
 
     def test_no_write_set_is_serial(self):
         decision = writesets.parallel_decision(
@@ -261,6 +320,90 @@ class PipelineInferenceTests(unittest.TestCase):
         declared = pipeline.declared_write_set(args, {"auto_parallel": False})
         self.assertEqual(declared["source"], "none")
         self.assertEqual(declared["write_set"], [])
+
+    def test_arg_auto_parallel_false_keeps_serial_none(self):
+        args = {"prompt": "Edit `src/a.py` and `tests/test_a.py`",
+                "workspace": self.tmp.name,
+                "auto_parallel": False}
+        declared = pipeline.declared_write_set(args, {})
+        self.assertNotEqual(declared["source"], "inferred")
+        self.assertEqual(declared["source"], "none")
+        self.assertEqual(declared["write_set"], [])
+
+    def test_arg_auto_parallel_true_overrides_cfg_false(self):
+        args = {"prompt": "Edit `src/a.py` and `tests/test_a.py`",
+                "workspace": self.tmp.name,
+                "auto_parallel": True}
+        declared = pipeline.declared_write_set(
+            args, {"auto_parallel": False})
+        self.assertEqual(declared["source"], "inferred")
+        self.assertIn("src/a.py", declared["write_set"])
+
+
+class StartJobOptOutTests(unittest.TestCase):
+    """The harness tool argument must beat the connector config per job."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = os.path.join(self.tmp.name, "ws")
+        os.makedirs(self.ws)
+
+    def _cfg(self, **overrides):
+        cfg = load_config(include_file=False, env={})
+        values = {
+            "state_dir": os.path.join(self.tmp.name, "state"),
+            "jobs_dir": os.path.join(self.tmp.name, "jobs"),
+            "harness_workspace": self.ws,
+            "max_harness_jobs": 2,
+            "reserve_resume_slot": False,
+            "pipeline_enabled": True,
+            "auto_parallel": True,
+        }
+        values.update(overrides)
+        cfg._values.update(values)
+        return cfg
+
+    def _start(self, cfg, args):
+        proc = mock.Mock(pid=4321)
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        with mock.patch.object(jobs, "_worker_env", return_value={}), \
+                mock.patch.object(jobs.subprocess, "Popen",
+                                  return_value=proc) as popen:
+            jobs.start_job("harness_deepseek", dict(args), cfg=cfg, wait=0)
+        self.assertEqual(popen.call_count, 1)
+        specs = list(Path(cfg.jobs_dir).glob("*.job.json"))
+        self.assertEqual(len(specs), 1)
+        return json.loads(specs[0].read_text(encoding="utf-8"))
+
+    def test_args_opt_out_beats_enabled_config(self):
+        cfg = self._cfg(auto_parallel=True)
+        spec = self._start(cfg, {
+            "prompt": "Edit `src/a.py` and `tests/test_a.py`",
+            "workspace": self.ws,
+            "auto_parallel": False,
+        })
+        pipe = spec.get("pipeline") or {}
+        self.assertFalse(pipe.get("eligible"))
+        self.assertNotEqual(pipe.get("write_set_source"), "inferred")
+        self.assertEqual(pipe.get("unavailable_reason"),
+                         "auto_parallel_disabled")
+        self.assertIs(pipe.get("auto_parallel"), False)
+
+    def test_args_min_confidence_beats_enabled_config(self):
+        cfg = self._cfg(auto_parallel=True,
+                        auto_parallel_min_confidence=0.85)
+        spec = self._start(cfg, {
+            "prompt": "Edit `src/a.py` and `tests/test_a.py`",
+            "workspace": self.ws,
+            "auto_parallel_min_confidence": 0.99,
+        })
+        pipe = spec.get("pipeline") or {}
+        self.assertFalse(pipe.get("eligible"))
+        self.assertEqual(pipe.get("unavailable_reason"),
+                         "inferred_low_confidence")
+        self.assertEqual(pipe.get("auto_parallel_min_confidence"), 0.99)
 
 
 if __name__ == "__main__":

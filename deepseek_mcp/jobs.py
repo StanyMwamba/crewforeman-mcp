@@ -103,6 +103,28 @@ def _cfg_get(cfg, name, default=None):
         return getattr(cfg, name, default)
 
 
+def _arg_or_cfg(args, cfg, name, default=None):
+    """Per-job tool argument wins over config, then the default."""
+    if isinstance(args, dict) and args.get(name) is not None:
+        return args[name]
+    return _cfg_get(cfg, name, default)
+
+
+def _as_bool(value, default=True):
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off", "none")
+    return bool(value)
+
+
+def _as_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _work_store(cfg):
     """Return the P1-1 work store rooted at ``<state_dir>/work``."""
     stale = _cfg_get(cfg, "work_stale_seconds")
@@ -1108,13 +1130,12 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 confidence = float(declared.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
-            auto_parallel = _cfg_get(cfg, "auto_parallel", True)
-            try:
-                min_confidence = float(_cfg_get(
-                    cfg, "auto_parallel_min_confidence", 0.85))
-            except (TypeError, ValueError):
-                min_confidence = 0.85
-            inferred_ok = (source == "inferred" and bool(auto_parallel)
+            auto_parallel = _as_bool(
+                _arg_or_cfg(call_args, cfg, "auto_parallel", True), True)
+            min_confidence = _as_float(
+                _arg_or_cfg(call_args, cfg, "auto_parallel_min_confidence",
+                            0.85), 0.85)
+            inferred_ok = (source == "inferred" and auto_parallel
                            and confidence >= min_confidence)
             pre_source = (source in ("arg", "slice", "prompt")
                           or inferred_ok)
@@ -1123,7 +1144,9 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 # do not run any git probe. This preserves the serial path
                 # byte-for-byte (and keeps existing job tests subprocess-free).
                 reason = "no_declared_write_set"
-                if source == "inferred":
+                if not auto_parallel and source in ("none", "inferred"):
+                    reason = "auto_parallel_disabled"
+                elif source == "inferred":
                     reason = ("inferred_low_confidence"
                               if confidence < min_confidence
                               else "auto_parallel_disabled")
@@ -1133,6 +1156,8 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                     "unavailable_reason": reason,
                     "slot": "base", "worktree": None,
                     "canonical_workspace": canonical,
+                    "auto_parallel": auto_parallel,
+                    "auto_parallel_min_confidence": min_confidence,
                     "base_ref": None, "base_commit": None,
                     "write_set": list(declared.get("write_set") or []),
                     "write_set_source": source,
@@ -1204,6 +1229,11 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                     call_args.get("workspace") or cfg.harness_workspace))),
                 "write_set": [], "write_set_source": "none",
                 "write_set_impl": "builtin",
+                "auto_parallel": _as_bool(
+                    _arg_or_cfg(call_args, cfg, "auto_parallel", True), True),
+                "auto_parallel_min_confidence": _as_float(
+                    _arg_or_cfg(call_args, cfg,
+                                "auto_parallel_min_confidence", 0.85), 0.85),
                 "install": {"status": "n/a", "applied": [], "reason": None},
             }
     if resume_source and not pipeline_info:
@@ -1414,6 +1444,9 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                     "write_set_confidence": pipeline_info.get(
                         "write_set_confidence"),
                     "write_set_basis": pipeline_info.get("write_set_basis"),
+                    "auto_parallel": pipeline_info.get("auto_parallel"),
+                    "auto_parallel_min_confidence": pipeline_info.get(
+                        "auto_parallel_min_confidence"),
                     "pipeline_eligible": bool(pipeline_info.get("eligible")),
                     "pipeline_extra": False,
                     "base_commit": pipeline_info.get("base_commit"),

@@ -120,7 +120,9 @@ adjacent behaviours.
 
 Risk detection is used only to (1) never sample the audit out and (2) record
 `risky: yes/no + why`. The reviewer model is never switched because a file is
-risky. `audit_sample_rate` defaults to 1.0; `0.2` audits one in five low-risk
-jobs. A failed crew claim forces full audits for the next five crosscheck jobs.
-An audit blocking list gets one crew fix round and a focused re-audit of only
+risky. Risk globs come from `risk_paths` (the name used in the 3.14.2 brief)
+and `audit_risk_globs`; both lists are merged with the built-in defaults.
+`audit_sample_rate` defaults to 1.0; `0.2` audits one in five low-risk jobs. A
+failed crew claim forces full audits for the next five crosscheck jobs. An
+audit blocking list gets one crew fix round and a focused re-audit of only
 those items.

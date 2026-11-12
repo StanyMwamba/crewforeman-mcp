@@ -45,6 +45,28 @@ class RiskTests(unittest.TestCase):
         self.assertTrue(audit.detect_risk("x", ["billing/pay.py"], cfg)["risky"])
         self.assertTrue(audit.detect_risk("x", ["deepseek_mcp/jobs.py"], cfg)["risky"])
 
+    def test_risk_paths_config_key_is_loaded(self):
+        from deepseek_mcp.config import load_config
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"risk_paths": ["billing/**"]}, handle)
+            cfg = load_config(config_path=path, env={})
+            self.assertEqual(cfg.get("risk_paths"), ["billing/**"])
+            self.assertTrue(audit.detect_risk(
+                "x", ["billing/pay.py"], cfg)["risky"])
+        finally:
+            os.unlink(path)
+
+    def test_risk_paths_and_audit_globs_are_merged(self):
+        cfg = _cfg("/tmp") | {"audit_risk_globs": ["billing/**"],
+                              "risk_paths": ["legal/**"]}
+        self.assertTrue(audit.detect_risk(
+            "x", ["billing/pay.py"], cfg)["risky"])
+        self.assertTrue(audit.detect_risk(
+            "x", ["legal/terms.md"], cfg)["risky"])
+
     def test_extract_diff_paths(self):
         diff = (
             "diff --git a/src/a.py b/src/a.py\n"

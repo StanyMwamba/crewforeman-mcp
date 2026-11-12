@@ -173,6 +173,8 @@
   "audit_sample_rate": 1.0,
   "audit_spot_requirements": 3,
   "audit_spot_fixes": 2,
+  "audit_risk_globs": [],
+  "risk_paths": [],
   "auto_parallel": true,
   "auto_parallel_min_confidence": 0.85
 }

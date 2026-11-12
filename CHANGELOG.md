@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   test result. It spot-checks `audit_spot_requirements` (default 3) and
   `audit_spot_fixes` (default 2) by re-running evidence commands and reports
   score, blocking items and crew claims that did not hold. Risk detection
-  never samples the audit out and records `risky: yes/no + why`;
+  never samples the audit out and records `risky: yes/no + why`; globs come
+  from `risk_paths` or `audit_risk_globs` (merged with the defaults).
   `audit_sample_rate` defaults to 1.0. A failed crew claim forces full audits
   for the next five crosscheck jobs. Audit blocking gets one crew fix round
   and a focused re-audit.
@@ -45,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   serial. Different workspaces are independent. Each parallel job uses its
   own worktree. A diff outside the inferred set, or a failed
   `git apply --check`, is never merged blindly: it is re-integrated serially
-  with a recorded reason.
+  with a recorded reason. The `harness_deepseek` arguments `auto_parallel`
+  and `auto_parallel_min_confidence` override the connector config for that
+  job; the effective values are frozen into the `pipeline` block and the
+  admission queue item.
 - Tests cover the scoring formula, threshold validation, max-round stop,
   N-part split and crew pairing, rescue, risk detection and sampling,
   audit spot checks, write-set inference, disjoint/overlap scheduling and

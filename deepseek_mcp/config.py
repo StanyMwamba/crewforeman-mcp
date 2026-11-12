@@ -353,6 +353,7 @@ DEFAULTS = {
     "audit_forced_jobs": 5,
     "audit_seed": 0,
     "audit_risk_globs": [],
+    "risk_paths": [],
     "auto_parallel": True,
     "auto_parallel_min_confidence": 0.85,
     # v3.12.0 S1/S2: builder target, mixed-model plan and model-aware records.
@@ -781,7 +782,7 @@ ENUM_FALLBACKS = {
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "allowed_workspace_roots", "gate_secret_patterns",
              "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths",
-             "sandbox_extra_writes", "audit_risk_globs"}
+             "sandbox_extra_writes", "audit_risk_globs", "risk_paths"}
 # Dict-valued keys keep JSON objects intact (never comma-split the text).
 DICT_KEYS = {"slice_models", "model_prices"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
