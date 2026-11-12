@@ -75,7 +75,7 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_readme_is_the_short_generic_quick_start(self):
         lines = README.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[0], "# CrewForeman")
+        self.assertEqual(lines[0], "# CrewForeman [![CI](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml)")
         text = README.read_text(encoding="utf-8")
         self.assertLessEqual(len(lines), 110, "README must stay a short front door")
         for heading in ("## Method", "## Outcomes", "## Install",
