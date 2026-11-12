@@ -87,14 +87,13 @@ def normalise_rel(path, workspace=None):
     text = text.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
     if _URL_RE.match(text):
         return ""
-    if text.startswith("//"):
-        text = text.lstrip("/")
     if workspace:
         root = os.path.normcase(os.path.realpath(str(workspace))).replace("\\", "/")
         candidate = os.path.normcase(os.path.realpath(text)) if os.path.isabs(text) else ""
         if candidate and candidate.startswith(root.rstrip("/") + "/"):
             text = candidate[len(root):]
-    if os.path.isabs(text) or re.match(r"^[A-Za-z]:/", text):
+    if (text.startswith("/") or os.path.isabs(text)
+            or re.match(r"^[A-Za-z]:/", text)):
         return ""
     while text.startswith("./"):
         text = text[2:]
