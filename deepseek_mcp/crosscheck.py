@@ -619,8 +619,15 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
         elif part_id in ("", "all"):
             for crews in rescuers.values():
                 crews.add(crew)
-    part_ok = all(str(part.get("status") or "built").lower()
-                  not in ("failed", "blocked", "error") for part in parts)
+    # Fail closed: a part counts only when the build wave (or a successful
+    # rescue) actually completed it.  "planned"/"pending"/"stalled"/empty
+    # statuses are not built, so an all-green evidence sheet cannot certify a
+    # task that was never built.  A missing status is treated as built for
+    # legacy records, matching the old contract.
+    done_statuses = ("built", "done", "ok", "complete", "completed", "passed")
+    part_ok = all(
+        str(part.get("status") or "built").strip().lower() in done_statuses
+        for part in parts)
 
     test_status = str((tests or {}).get("status") or "error").lower()
     t_value = 1.0 if test_status in ("passed", "smoke_passed") else 0.0
@@ -943,7 +950,8 @@ def apply_rescue(record, rescue, rescued=False):
         targets = [
             part for part in parts
             if str(part.get("status") or "").strip().lower()
-            in ("stalled", "failed", "blocked", "error", "planned")
+            in ("stalled", "failed", "blocked", "error", "planned",
+                "pending", "queued")
             and not part.get("rescued")
         ]
     rows = record.setdefault("rescues", [])
@@ -961,7 +969,8 @@ def apply_rescue(record, rescue, rescued=False):
                 # The finisher completed this part; a stale failed/blocked
                 # status must not keep the part_ok cap at 6.0.
                 if str(part.get("status") or "").strip().lower() in (
-                        "failed", "blocked", "error", "stalled"):
+                        "failed", "blocked", "error", "stalled", "planned",
+                        "pending", "queued"):
                     part["status"] = "built"
             rows.append({
                 "part_id": part_id,
@@ -989,6 +998,10 @@ def apply_rescue(record, rescue, rescued=False):
             for part in parts:
                 part["rescued"] = True
                 part["rescue_crew"] = rescue_crew
+                if str(part.get("status") or "").strip().lower() in (
+                        "failed", "blocked", "error", "stalled", "planned",
+                        "pending", "queued"):
+                    part["status"] = "built"
     # De-duplicate part/round pairs.
     seen = set()
     unique = []
@@ -1114,6 +1127,16 @@ def build_contract(cc, parts_info, pairing_map, prompt):
         "builder crew fixes; the finding crew re-runs the evidence and "
         "confirms each fix. Repeat up to %d rounds."
         % cc.get("max_rounds", DEFAULT_MAX_ROUNDS),
+        "",
+        "### Connector brief checklist (use these exact requirement ids)",
+    ]
+    for item in brief_requirements(prompt):
+        lines.append("- %s: %s" % (item.get("id"), item.get("text")))
+    lines += [
+        "Every point must appear in CROSSCHECK.json with this exact `id`, a "
+        "real `part_id`, evidence, and the part's assigned checker as "
+        "`checked_by`. The connector measures coverage against this list, not "
+        "against ids your crew invents.",
         "",
         "### CROSSCHECK.json (required)",
         "Write/update `CROSSCHECK.json` at the workspace root after each "

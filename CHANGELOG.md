@@ -66,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the connector's own brief ids. A semantically empty `AUDIT_JSON` fails closed.
   A failed rescue does not mark a part rescued and caps the score at 8.0;
   successful rescues target the unfinished parts and reconcile their status.
+  A part that is only `planned`/`pending` cannot reach 10.0, and the build
+  contract prints the connector's own `R1..Rn` brief checklist.
 - **Parallel/integration hardening.** A `PLAN.json` write set is
   pipeline-eligible; explicit declarations are trusted at confidence 1.0; a
   serial peer in another workspace no longer forces this workspace serial. A

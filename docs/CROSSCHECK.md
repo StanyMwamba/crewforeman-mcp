@@ -78,9 +78,14 @@ raw   = 2.0 * (tests + requirements + blocking + minors + fixes)
 score = 10.0 when every fraction is 1.0, else min(round(raw, 2), 9.99)
 ```
 
-A failed/blocked part caps the score at 6.0; an unresolved rescue caps it at
-8.0. Those caps keep a partially built task below a passing threshold. 10.0
-is reachable only when all five conditions are fully met.
+A part that is not built (`planned`, `pending`, `stalled`, `failed`,
+`blocked` or `error`) caps the score at 6.0; an unresolved rescue caps it at
+8.0. Those caps keep a partially built task below a passing threshold, and
+10.0 requires every part to be built (or completed by a successful rescue),
+not merely every evidence sheet to be green. The build contract also prints
+the connector's own brief checklist (`R1..Rn`); requirement rows must use
+those exact ids, because coverage is measured against the connector list, not
+against ids the crew invents.
 
 `crosscheck_threshold` defaults to **10.0** and is validated to the inclusive
 range 0.0-10.0. A malformed value stops the job before any paid call. Lower

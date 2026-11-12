@@ -100,6 +100,77 @@ class RescueTargetingTests(unittest.TestCase):
         self.assertLess(result["score"], 10.0)
 
 
+class RescueBuildsPlannedPartTests(unittest.TestCase):
+    def test_successful_rescue_completes_a_planned_part(self):
+        record = crosscheck.new_record({"threshold": 10.0})
+        record["parts"] = [{
+            "id": "p1", "write_set": ["a.py"], "builder_crew": "crew-1",
+            "checker_crew": "crew-2", "status": "planned"}]
+        record = crosscheck.apply_rescue(record, {
+            "attempted": True, "reason": "stall", "status": "ok",
+        }, rescued=True)
+        self.assertTrue(record["parts"][0]["rescued"])
+        self.assertEqual(record["parts"][0]["status"], "built")
+        requirements = [{"id": "R1", "part_id": "p1",
+                         "checked_by": "crew-2", "evidence": "cmd"}]
+        result = crosscheck.evaluate(
+            record["parts"], [], requirements, {"status": "passed"},
+            record["rescues"], threshold=10.0, brief_count=1)
+        self.assertTrue(result["parts_ok"])
+        self.assertEqual(result["score"], 10.0)
+
+    def test_whole_run_rescue_completes_pending_and_queued_parts(self):
+        for status in ("pending", "queued"):
+            record = crosscheck.new_record({"threshold": 10.0})
+            record["parts"] = [{
+                "id": "p1", "write_set": ["a.py"], "builder_crew": "crew-1",
+                "checker_crew": "crew-2", "status": status}]
+            record = crosscheck.apply_rescue(record, {
+                "attempted": True, "reason": "stall", "status": "ok",
+            }, rescued=True)
+            self.assertEqual(record["parts"][0]["status"], "built", status)
+            self.assertTrue(record["parts"][0]["rescued"], status)
+            requirements = [{"id": "R1", "part_id": "p1",
+                             "checked_by": "crew-2", "evidence": "cmd"}]
+            result = crosscheck.evaluate(
+                record["parts"], [], requirements, {"status": "passed"},
+                record["rescues"], threshold=10.0, brief_count=1)
+            self.assertTrue(result["parts_ok"], status)
+            self.assertEqual(result["score"], 10.0, status)
+
+
+class UnbuiltPartsTests(unittest.TestCase):
+    def test_planned_parts_cannot_score_ten(self):
+        parts = [
+            {"id": "p1", "write_set": ["a.py"], "builder_crew": "crew-1",
+             "checker_crew": "crew-2", "status": "planned"},
+            {"id": "p2", "write_set": ["b.py"], "builder_crew": "crew-2",
+             "checker_crew": "crew-1", "status": "planned"},
+        ]
+        requirements = [
+            {"id": "R1", "part_id": "p1", "checked_by": "crew-2",
+             "evidence": "cmd"},
+            {"id": "R2", "part_id": "p2", "checked_by": "crew-1",
+             "evidence": "cmd"},
+        ]
+        result = crosscheck.evaluate(
+            parts, [], requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["score"], 6.0)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["parts_ok"])
+        self.assertIn("part_failed", result["reasons"])
+
+    def test_build_contract_names_the_connector_checklist(self):
+        cc = crosscheck.normalise_config({"mode": "crosscheck"}, {})
+        contract = crosscheck.build_contract(
+            cc, {"parts": []}, {},
+            "Build a CLI.\n- must support JSON output\n- must write tests")
+        self.assertIn("Connector brief checklist", contract)
+        self.assertIn("R1", contract)
+        self.assertIn("support JSON output", contract)
+
+
 class ScoringIndependenceTests(unittest.TestCase):
     def test_unconfirmed_blocking_fix_costs_only_the_fixes_condition(self):
         parts = [_part("p1"), _part("p2", builder="crew-2", checker="crew-1")]
