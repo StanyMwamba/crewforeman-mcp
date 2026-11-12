@@ -60,13 +60,15 @@ initial build/check round).
 
 The crew's prose and self-score are ignored. The connector reads
 `CROSSCHECK.json`, checks the parts against `PLAN.json`, and runs the test
-suite through the deterministic gate. The score is five equally weighted
-conditions, 2.0 points each:
+suite through the deterministic gate. Crew pairing is connector-owned:
+builders/checkers reported by the artifact are ignored, and each part is
+assigned by rotation. The score is five equally weighted conditions, 2.0
+points each:
 
 | # | Condition | Fraction |
 |---|---|---|
 | 1 | Connector-run tests | 1.0 when the gate test check is `ok` (a bounded compile smoke is accepted only when no test suite is detected), else 0.0 |
-| 2 | Every brief requirement checked | checked requirements divided by the larger of the recorded requirement count and the brief checklist count; a check needs evidence and a crew that is neither builder nor rescuer |
+| 2 | Every brief requirement checked | checked requirements divided by the larger of the recorded requirement count and the brief checklist count; a requirement needs a real paired part, evidence, and its assigned checker (never the builder or rescuer) |
 | 3 | Zero open BLOCKING | 1.0 when no real BLOCKING finding is open, stale or unconfirmed, else 0.0 |
 | 4 | Every minor fixed or justified | fixed or justified minors divided by all real minors; a justification needs at least 20 characters and the finding crew's acceptance |
 | 5 | Every fix confirmed by the finding crew | confirmed fixes divided by fixed findings; confirmation must come from the crew that found it and carry evidence |

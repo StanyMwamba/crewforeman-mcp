@@ -199,6 +199,33 @@ class ScoringTests(unittest.TestCase):
             "tests": 1.0, "requirements": 1.0, "blocking": 1.0,
             "minors": 1.0, "fixes": 1.0})
 
+    def test_unknown_part_requirement_cannot_self_certify(self):
+        parts, findings, requirements = self._full()
+        requirements[0]["part_id"] = "p-does-not-exist"
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["requirements"], 0.5)
+        self.assertLess(result["score"], 10.0)
+
+    def test_requirement_must_be_checked_by_the_paired_checker(self):
+        parts, findings, requirements = self._full()
+        # crew-3 did not build p1 and is non-empty, but is not p1's checker.
+        requirements[0]["checked_by"] = "crew-3"
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["requirements"], 0.5)
+        self.assertLess(result["score"], 10.0)
+
+    def test_missing_part_requirement_cannot_self_certify(self):
+        parts, findings, requirements = self._full()
+        requirements[1].pop("part_id", None)
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["requirements"], 0.5)
+
     def test_failed_tests_costs_two_points(self):
         parts, findings, requirements = self._full()
         result = crosscheck.evaluate(

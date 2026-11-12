@@ -41,7 +41,7 @@ class RiskTests(unittest.TestCase):
         self.assertEqual(result["reasons"], [])
 
     def test_extra_globs_are_additive(self):
-        cfg = _cfg("/tmp") | {"audit_risk_globs": ["billing/**"]}
+        cfg = _cfg(tempfile.gettempdir()) | {"audit_risk_globs": ["billing/**"]}
         self.assertTrue(audit.detect_risk("x", ["billing/pay.py"], cfg)["risky"])
         self.assertTrue(audit.detect_risk("x", ["deepseek_mcp/jobs.py"], cfg)["risky"])
 
@@ -60,7 +60,7 @@ class RiskTests(unittest.TestCase):
             os.unlink(path)
 
     def test_risk_paths_and_audit_globs_are_merged(self):
-        cfg = _cfg("/tmp") | {"audit_risk_globs": ["billing/**"],
+        cfg = _cfg(tempfile.gettempdir()) | {"audit_risk_globs": ["billing/**"],
                               "risk_paths": ["legal/**"]}
         self.assertTrue(audit.detect_risk(
             "x", ["billing/pay.py"], cfg)["risky"])
@@ -111,6 +111,15 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(plan["record"]["rate_source"], "risk")
         self.assertTrue(plan["risky"])
         self.assertTrue(plan["risk_why"])
+
+    def test_risky_job_still_consumes_a_forced_audit(self):
+        audit.record_claim_failure(self.cfg, "job-1")
+        plan = self._prepare(sample_rate=0.0, brief="fix the sandbox",
+                             changed_paths=["deepseek_mcp/sandbox_linux.py"])
+        self.assertTrue(plan["sampled"])
+        self.assertEqual(plan["record"]["rate_source"], "risk")
+        self.assertTrue(plan["record"]["forced_consumed"])
+        self.assertEqual(plan["record"]["forced_remaining_after"], 4)
 
     def test_same_seed_same_decision(self):
         first = self._prepare(sample_rate=0.5, seed=99)
@@ -231,6 +240,22 @@ class PromptParseTests(unittest.TestCase):
         self.assertEqual(result["claims"][0]["claim"], "tests pass")
         self.assertEqual(result["spot_checks"][0]["id"], "R1")
 
+    def test_review_block_clean_audit_is_skipped_after_first_round(self):
+        record = {"sampled": True, "spot": {}, "blocking": [],
+                  "review_round": 1}
+        self.assertEqual(audit.review_block(record), "")
+        record.pop("review_round")
+        block = audit.review_block(record)
+        self.assertIn("Connector audit", block)
+
+    def test_review_block_reaudits_only_open_blocking(self):
+        record = {"sampled": True, "spot": {}, "review_round": 1,
+                  "blocking": [{"id": "AUD-1", "text": "still broken",
+                                "evidence": "cmd"}]}
+        block = audit.review_block(record)
+        self.assertIn("AUD-1", block)
+        self.assertIn("re-audit", block.lower())
+
     def test_parse_headings_fallback(self):
         report = (
             "## Connector audit\n- Audit score: 7.5\n- Audit blocking: 0\n"
@@ -284,11 +309,15 @@ class CrosscheckAuditInputsTests(unittest.TestCase):
                 {"id": "F2", "text": "unconfirmed", "status": "fixed",
                  "found_by_crew": "crew-2",
                  "confirmation": {"crew": "crew-1", "confirmed": True,
-                                  "evidence": "cmd"}}]}
+                                  "evidence": "cmd"}},
+                {"id": "F3", "text": "alias", "status": "fixed",
+                 "found_by_crew": "crew-2",
+                 "confirmation": {"confirmed_by": "crew-2",
+                                  "confirmed": True, "evidence": "cmd"}}]}
         self.assertEqual([item["id"] for item in
                           audit.requirements_for_audit(record)], ["R1"])
         self.assertEqual([item["id"] for item in
-                          audit.confirmed_fixes(record)], ["F1"])
+                          audit.confirmed_fixes(record)], ["F1", "F3"])
 
 
 if __name__ == "__main__":

@@ -440,7 +440,9 @@ def prepare(cfg, *, run, workspace, brief, changed_paths,
     if state_error:
         decision = {"sampled": True, "rate_source": "state_failure",
                     "reason": state_error}
-    if forced_before > 0 and not risk["risky"]:
+    if forced_before > 0:
+        # A forced full audit is one of the next five jobs even when the job
+        # is also risky.  Risk only decides sampling, never model routing.
         forced_used = True
         state["forced_remaining"] = max(0, forced_before - 1)
     state["last_job_id"] = job_id
@@ -463,6 +465,7 @@ def prepare(cfg, *, run, workspace, brief, changed_paths,
     record = {
         "ran": False,
         "job_id": job_id,
+        "workspace": str(workspace or ""),
         "enabled": True,
         "sampled": bool(decision["sampled"]),
         "reason": decision["reason"],
@@ -601,6 +604,24 @@ def reaudit_block(plan, prior_blocking):
     return "\n".join(lines)
 
 
+def review_block(plan, crew_evidence="", test_evidence=""):
+    """The audit block for this reviewer round, or "" when none applies.
+
+    The first audit review gets the full seeded block.  Later review rounds
+    only get a focused re-audit when the previous audit left blocking items;
+    a clean audit must not charge a synthetic "audit section missing" defect
+    just because a normal revision round followed it.
+    """
+    record = (plan or {}).get("record") or plan or {}
+    if not record.get("sampled"):
+        return ""
+    if not record.get("review_round"):
+        return prompt_block(plan, crew_evidence=crew_evidence,
+                            test_evidence=test_evidence)
+    blocking = record.get("blocking") or []
+    return reaudit_block(record, blocking) if blocking else ""
+
+
 # ---------------------------------------------------------------------------
 # parsing
 
@@ -723,7 +744,8 @@ def finish(plan, report_text, cfg=None):
         record["forced_rate_set"] = True
         if cfg is not None:
             record["forced_rate"] = record_claim_failure(
-                cfg, str(record.get("job_id") or ""), workspace=None)
+                cfg, str(record.get("job_id") or ""),
+                workspace=record.get("workspace") or None)
     return record
 
 
@@ -737,7 +759,8 @@ def confirmed_fixes(crosscheck_record):
         if not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True:
             continue
         finder = str(item.get("found_by_crew") or item.get("found_by") or "")
-        if str(confirmation.get("crew") or "") != finder:
+        if str(confirmation.get("crew")
+               or confirmation.get("confirmed_by") or "") != finder:
             continue
         rows.append({
             "id": item.get("id"),

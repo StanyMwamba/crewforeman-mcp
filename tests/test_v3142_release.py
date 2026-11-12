@@ -106,6 +106,7 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(config.DEFAULTS["audit_sample_rate"], 1.0)
         self.assertEqual(config.DEFAULTS["audit_spot_requirements"], 3)
         self.assertEqual(config.DEFAULTS["audit_spot_fixes"], 2)
+        self.assertEqual(config.DEFAULTS["risk_paths"], [])
         self.assertEqual(config.DEFAULTS["default_mode"], "")
         self.assertTrue(config.DEFAULTS["auto_parallel"])
         self.assertEqual(config.DEFAULTS["auto_parallel_min_confidence"], 0.85)

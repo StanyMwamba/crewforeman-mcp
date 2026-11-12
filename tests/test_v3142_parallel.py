@@ -126,6 +126,24 @@ class DecisionTests(unittest.TestCase):
         decision = writesets.parallel_decision(new, active, self.cfg)
         self.assertTrue(decision["parallel"])
 
+    def test_queue_persists_confidence_for_inferred_parallel_job(self):
+        store = admission.AdmissionStore(os.path.join(self.ws, "admission"))
+        store.enqueue("w1", pipeline={
+            "write_set": ["src/a.py"],
+            "write_set_source": "inferred",
+            "write_set_impl": "auto",
+            "write_set_confidence": 0.9,
+            "write_set_basis": "plan",
+            "pipeline_eligible": True,
+            "canonical_workspace": self.ws,
+        })
+        record = store._load_item("w1")
+        self.assertEqual(record.get("write_set_confidence"), 0.9)
+        self.assertEqual(record.get("write_set_basis"), "plan")
+        decision = writesets.parallel_decision(record, [], self.cfg)
+        self.assertTrue(decision["parallel"], decision)
+        self.assertEqual(decision["reason"], "disjoint_confident")
+
     def test_auto_parallel_opt_out(self):
         cfg = {"auto_parallel": False}
         decision = writesets.parallel_decision(
@@ -291,6 +309,36 @@ class PipelinePrepareTests(unittest.TestCase):
         self.assertEqual(pipe["write_set_source"], "inferred")
         self.assertIn("src/a.py", pipe["write_set"])
         self.assertGreaterEqual(pipe["write_set_confidence"], 0.85)
+
+
+class PipelinePrepareFrozenTests(unittest.TestCase):
+    def test_frozen_opt_out_survives_prepare_without_raw_arg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = {"state_dir": os.path.join(tmp.name, "state"),
+               "pipeline_enabled": True, "auto_parallel": True,
+               "auto_parallel_min_confidence": 0.85}
+        args = {
+            "prompt": "Edit `src/a.py` and `tests/test_a.py`",
+            "workspace": tmp.name,
+            "_canonical_workspace": tmp.name,
+            "_pipeline": {
+                "decided": True, "eligible": False,
+                "unavailable_reason": "auto_parallel_disabled",
+                "write_set": [], "write_set_source": "none",
+                "write_set_impl": "builtin", "write_set_confidence": 0.0,
+                "auto_parallel": False,
+                "auto_parallel_min_confidence": 0.85,
+                "base_commit": "deadbeef", "slot": "base",
+            },
+        }
+        pipe = pipeline.prepare_args(cfg, args, {"id": "run-1"})
+        self.assertFalse(pipe["auto_parallel"])
+        self.assertFalse(pipe["eligible"])
+        self.assertEqual(pipe["write_set_source"], "none")
+        self.assertEqual(pipe["write_set"], [])
+        self.assertEqual(pipe["unavailable_reason"],
+                         "auto_parallel_disabled")
 
 
 class PipelineInferenceTests(unittest.TestCase):

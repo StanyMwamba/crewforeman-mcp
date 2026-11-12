@@ -568,6 +568,8 @@ class AdmissionStore:
                 # P3.5 pipeline reservation: write-set, eligibility, slot and
                 # base-commit evidence are durable with the queue record.
                 for key in ("write_set", "write_set_source", "write_set_impl",
+                            "write_set_confidence", "write_set_basis",
+                            "write_set_wide",
                             "auto_parallel", "auto_parallel_min_confidence",
                             "pipeline_eligible", "pipeline_extra",
                             "base_commit", "base_ref", "canonical_workspace",
@@ -1644,6 +1646,17 @@ class AdmissionController:
                 if self._reject_bad_dependency_locked(rec):
                     continue
                 if not self._dependency_ready(rec):
+                    continue
+                # The idle safety net must not bypass a per-job opt-out and
+                # start a serial job beside a same-workspace peer.
+                try:
+                    from . import writesets as writesets_mod
+                    if not writesets_mod.record_auto_parallel(rec, self.cfg):
+                        workspace = writesets_mod._workspace(rec)
+                        if any(writesets_mod._workspace(other) == workspace
+                               for other in active):
+                            continue
+                except Exception:
                     continue
                 candidate = rec
                 break

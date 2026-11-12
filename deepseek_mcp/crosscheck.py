@@ -533,9 +533,11 @@ def _check_ok(item):
     return bool(str(item.get("evidence") or "").strip())
 
 
-def _check_crew_ok(check, builder, rescuer):
+def _check_crew_ok(check, builder, rescuer, checker=None):
     crew = str(check.get("checked_by") or check.get("crew") or "").strip()
     if not crew:
+        return False
+    if checker and crew != str(checker):
         return False
     return crew not in {str(builder or ""), str(rescuer or "")}
 
@@ -561,6 +563,7 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
     threshold = max(0.0, min(10.0, threshold))
 
     builders = {str(part.get("id")): part.get("builder_crew") for part in parts}
+    checkers = {str(part.get("id")): part.get("checker_crew") for part in parts}
     rescuers = {str(part.get("id")): part.get("rescue_crew") for part in parts}
     part_ok = all(str(part.get("status") or "built").lower()
                   not in ("failed", "blocked", "error") for part in parts)
@@ -572,11 +575,19 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
     checked = 0
     for item in required:
         part_id = str(item.get("part_id") or "")
+        # A requirement is only verifiable when it names a real, paired part.
+        # Missing/unknown ids used to produce builder=None, which let any
+        # non-empty checked_by string certify itself.
+        if not part_id or part_id not in builders or part_id not in checkers:
+            continue
         builder = builders.get(part_id)
+        checker = checkers.get(part_id)
         rescuer = rescuers.get(part_id)
+        if not builder or not checker:
+            continue
         checks = _requirement_checks(item)
-        if any(_check_ok(check) and _check_crew_ok(check, builder, rescuer)
-               for check in checks):
+        if any(_check_ok(check) and _check_crew_ok(
+                check, builder, rescuer, checker) for check in checks):
             checked += 1
     total_required = max(len(required), int(brief_count or 0))
     r_value = (float(checked) / total_required) if total_required else 0.0

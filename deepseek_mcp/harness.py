@@ -7292,8 +7292,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     for planned in plan_info.get("parts") or []:
                         row = dict(planned)
                         extra = by_id.get(str(planned.get("id"))) or {}
-                        for key in ("builder_crew", "checker_crew", "status",
-                                    "rescued", "rescue_crew"):
+                        # The connector owns crew pairing.  The artifact may
+                        # report build status/rescue state, but it can never
+                        # assign (and therefore self-check) its own crews.
+                        for key in ("status", "rescued", "rescue_crew"):
                             if extra.get(key) not in (None, ""):
                                 row[key] = extra[key]
                         parts.append(row)
@@ -7301,8 +7303,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     pairs = crosscheck_mod.pairing(parts, crew_ids, 1)
                     for part in parts:
                         pair = pairs.get(str(part.get("id")), {})
-                        part.setdefault("builder_crew", pair.get("builder"))
-                        part.setdefault("checker_crew", pair.get("checker"))
+                        part["builder_crew"] = pair.get("builder")
+                        part["checker_crew"] = pair.get("checker")
                     record["parts"] = parts
                     record["pairing"] = {
                         str(pid): {"builder": value.get("builder"),
@@ -8074,6 +8076,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 # v3.14.2 audit: one review, after the crew gate passed.  The
                 # audit augments the normally configured reviewer task with
                 # the connector diff, crew evidence and seeded spot checks.
+                audit_review_active = False
                 if crosscheck_record and cc and cc.get("audit_review"):
                     if not isinstance(run.get("audit"), dict):
                         audit_evidence = crosscheck_mod.evidence_text(
@@ -8117,20 +8120,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             }
                     audit_record = run.get("audit") or {}
                     if audit_record.get("sampled"):
-                        if int(round_no) == 1:
+                        audit_block = audit_mod.review_block(
+                            audit_record,
+                            crew_evidence=(
+                                audit_record.get("crew_evidence") or ""),
+                            test_evidence=(gate_evidence_text or ""))
+                        if audit_block:
                             review_task = (review_task + "\n\n"
-                                           + audit_mod.prompt_block(
-                                               audit_record,
-                                               crew_evidence=(
-                                                   audit_record.get(
-                                                       "crew_evidence") or ""),
-                                               test_evidence=(
-                                                   gate_evidence_text or "")))
-                        else:
-                            review_task = (review_task + "\n\n"
-                                           + audit_mod.reaudit_block(
-                                               audit_record,
-                                               audit_record.get("blocking") or []))
+                                           + audit_block)
+                            audit_review_active = True
                     audit_record["review_round"] = int(round_no)
                 # P3-2: near-free pre-flight through the SAME reviewer path.
                 # A provider that cannot answer a one-word prompt must not be
@@ -8990,8 +8988,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     # real blocking count/defects are untouched.  Never
                     # fabricate 0.0 or a synthetic blocking defect.
                     score_missing = True
-                if isinstance(run.get("audit"), dict) and run["audit"].get(
-                        "sampled"):
+                if (isinstance(run.get("audit"), dict)
+                        and run["audit"].get("sampled")
+                        and audit_review_active):
                     try:
                         audit_done = audit_mod.finish(
                             run["audit"], report_text, cfg)

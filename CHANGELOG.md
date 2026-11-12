@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with a crew that did not build it. Breakers probe edge cases and error
   paths; spec checkers walk each brief requirement. Findings carry
   `file:line` plus command/output evidence and are tagged BLOCKING or minor.
-  Original builders fix, the finding crew confirms.
+  Original builders fix, the finding crew confirms. Crew pairing is
+  connector-owned: artifact-supplied builder/checker names are ignored, and
+  a requirement counts only for a real part checked by its paired checker.
 - **Connector-owned crew score.** Five equally weighted conditions (2.0 each)
   cover connector-run tests, every brief requirement checked by a
   non-building crew with evidence, zero open BLOCKING, every minor fixed or
@@ -38,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from `risk_paths` or `audit_risk_globs` (merged with the defaults).
   `audit_sample_rate` defaults to 1.0. A failed crew claim forces full audits
   for the next five crosscheck jobs. Audit blocking gets one crew fix round
-  and a focused re-audit.
+  and a focused re-audit. A clean audit is not charged a missing-section
+  defect when a later normal review round follows it.
 - **Automatic parallel jobs.** Without a declared `write_set`, the connector
   infers files/dirs and a confidence from the brief, `PLAN.json` and
   `SLICES.md`. Same-repo jobs run in parallel only when the inferred sets are
@@ -48,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `git apply --check`, is never merged blindly: it is re-integrated serially
   with a recorded reason. The `harness_deepseek` arguments `auto_parallel`
   and `auto_parallel_min_confidence` override the connector config for that
-  job; the effective values are frozen into the `pipeline` block and the
-  admission queue item.
+  job; the effective values and the inferred confidence are frozen into the
+  `pipeline` block and the admission queue item, so a queued job cannot lose
+  an opt-out or starve as low-confidence.
 - Tests cover the scoring formula, threshold validation, max-round stop,
   N-part split and crew pairing, rescue, risk detection and sampling,
   audit spot checks, write-set inference, disjoint/overlap scheduling and

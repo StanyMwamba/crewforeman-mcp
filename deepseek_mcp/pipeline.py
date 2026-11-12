@@ -999,20 +999,6 @@ def prepare_args(cfg, args, run=None):
         # metadata it created at admission.
         workspace = _absolute(args.get("_canonical_workspace")
                               or _workspace_from(args, cfg, run))
-        declared = declared_write_set(args, cfg)
-        source = declared.get("source") or "none"
-        try:
-            declared_confidence = float(declared.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            declared_confidence = 0.0
-        auto_parallel = _job_bool(args, cfg, "auto_parallel", True)
-        min_confidence = _job_float(
-            args, cfg, "auto_parallel_min_confidence", 0.85)
-        inferred_ok = (source == "inferred"
-                       and auto_parallel
-                       and declared_confidence >= min_confidence)
-        pre_source = (source in {"arg", "slice", "prompt"} or inferred_ok)
-        check_set = declared.get("write_set") if pre_source else []
         existing = {}
         if isinstance(args.get("_pipeline"), dict):
             existing.update(args["_pipeline"])
@@ -1021,10 +1007,51 @@ def prepare_args(cfg, args, run=None):
         decided = bool(existing.get("decided")
                        or args.get("_pipeline_decided"))
         if decided:
+            # Eligibility, write set and the parallel knobs are decided once
+            # at admission.  Recomputing from a resumed/queued args dict can
+            # lose the raw tool argument and flip an opt-out back on.
+            declared = {
+                "write_set": list(existing.get("write_set") or []),
+                "source": existing.get("write_set_source") or "none",
+                "impl": existing.get("write_set_impl") or "builtin",
+                "confidence": existing.get("write_set_confidence") or 0.0,
+                "basis": existing.get("write_set_basis") or "none",
+                "invalid": [],
+            }
+        else:
+            declared = declared_write_set(args, cfg)
+        source = declared.get("source") or "none"
+        try:
+            declared_confidence = float(declared.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            declared_confidence = 0.0
+        auto_parallel = _job_bool(args, cfg, "auto_parallel", True)
+        min_confidence = _job_float(
+            args, cfg, "auto_parallel_min_confidence", 0.85)
+        if existing.get("auto_parallel") is not None:
+            value = existing["auto_parallel"]
+            auto_parallel = (
+                value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
+                if isinstance(value, str) else bool(value))
+        if existing.get("auto_parallel_min_confidence") is not None:
+            try:
+                min_confidence = float(existing["auto_parallel_min_confidence"])
+            except (TypeError, ValueError):
+                pass
+        inferred_ok = (source == "inferred"
+                       and auto_parallel
+                       and declared_confidence >= min_confidence)
+        pre_source = (source in {"arg", "slice", "prompt"} or inferred_ok)
+        check_set = declared.get("write_set") if pre_source else []
+        if decided:
             # Eligibility is decided once at admission and frozen (§F4.2).
             eligible = bool(existing.get("eligible"))
             reason = existing.get("unavailable_reason")
             info = {"git_version": existing.get("git_version")}
+        elif source == "inferred" and not auto_parallel:
+            eligible, reason, info = False, "auto_parallel_disabled", {}
+        elif source == "inferred" and declared_confidence < min_confidence:
+            eligible, reason, info = False, "inferred_low_confidence", {}
         else:
             eligible, reason, info = _eligibility(cfg, workspace, check_set)
         base_ref = existing.get("base_ref") or queue_base_ref(workspace)
