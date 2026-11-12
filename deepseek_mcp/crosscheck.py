@@ -549,13 +549,23 @@ def _check_ok(item):
     return bool(str(item.get("evidence") or "").strip())
 
 
+def _crew_set(value):
+    """Normalise one crew or a set of crews (rescued parts can have several)."""
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return {str(item or "").strip() for item in value if str(item or "").strip()}
+    text = str(value or "").strip()
+    return {text} if text else set()
+
+
 def _check_crew_ok(check, builder, rescuer, checker=None):
     crew = str(check.get("checked_by") or check.get("crew") or "").strip()
     if not crew:
         return False
     if checker and crew != str(checker):
         return False
-    return crew not in {str(builder or ""), str(rescuer or "")}
+    blocked = {str(builder or "").strip()} | _crew_set(rescuer)
+    blocked.discard("")
+    return crew not in blocked
 
 
 def _requirement_credit(item, builders, checkers, rescuers):
@@ -594,7 +604,21 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
 
     builders = {str(part.get("id")): part.get("builder_crew") for part in parts}
     checkers = {str(part.get("id")): part.get("checker_crew") for part in parts}
-    rescuers = {str(part.get("id")): part.get("rescue_crew") for part in parts}
+    rescuers = {str(part.get("id")): set() for part in parts}
+    for part in parts:
+        rescuers[str(part.get("id"))].update(_crew_set(part.get("rescue_crew")))
+    for rescue_row in rescues or []:
+        if not isinstance(rescue_row, dict):
+            continue
+        crew = str(rescue_row.get("rescue_crew") or "").strip()
+        if not crew:
+            continue
+        part_id = str(rescue_row.get("part_id") or "")
+        if part_id in rescuers:
+            rescuers[part_id].add(crew)
+        elif part_id in ("", "all"):
+            for crews in rescuers.values():
+                crews.add(crew)
     part_ok = all(str(part.get("status") or "built").lower()
                   not in ("failed", "blocked", "error") for part in parts)
 
@@ -881,51 +905,90 @@ def record_round(record, evaluation, execution=None, round_no=1, phase="crossche
 
 
 def apply_rescue(record, rescue, rescued=False):
-    """Record the existing finisher/rescue against the parts it completed."""
+    """Record the finisher/rescue against the parts it actually completed.
+
+    A rescue is ``ok`` only when the finisher completed the task *and* the
+    supplied status is ``ok``; otherwise nothing is marked rescued and the
+    evaluator caps the score.  The production rescue dict carries no failed
+    crew, so unfinished parts are identified by their status and parts that
+    are already built stay untouched.
+    """
     if not rescued and not rescue:
         return record
     record = record or new_record({})
-    reason = ""
-    failed_crew = None
-    rescue_crew = "finisher"
-    rescue_status = "ok" if rescued else "failed"
-    if isinstance(rescue, dict):
-        reason = _truncate(rescue.get("reason") or rescue.get("status") or "", 300)
-        failed_crew = rescue.get("failed_crew") or rescue.get("crew")
-        rescue_crew = str(rescue.get("rescue_crew") or "finisher")
-        rescue_status = "ok" if rescued else str(
-            rescue.get("status") or "failed")
+    data = rescue if isinstance(rescue, dict) else {}
+    raw_reason = data.get("reason")
+    if not raw_reason and not isinstance(rescue, dict):
+        raw_reason = rescue
+    reason = _truncate(raw_reason or data.get("status") or "", 300)
+    failed_crew = str(data.get("failed_crew") or "").strip() or None
+    rescue_crew = str(data.get("rescue_crew") or "").strip() or "finisher"
+    explicit = str(data.get("part_id") or "").strip()
+    status = str(data.get("status") or "").strip().lower()
+    if not status:
+        status = "ok" if rescued else "failed"
+    ok = bool(rescued) and status == "ok"
+    parts = [part for part in (record.get("parts") or [])
+             if isinstance(part, dict)]
+    if explicit:
+        # An explicit target is authoritative: never widen it to other parts.
+        targets = [part for part in parts
+                   if str(part.get("id") or "") == explicit]
+    elif failed_crew:
+        targets = [part for part in parts
+                   if str(part.get("builder_crew") or "") == failed_crew]
+    else:
+        targets = []
+    if not targets and not explicit:
+        targets = [
+            part for part in parts
+            if str(part.get("status") or "").strip().lower()
+            in ("stalled", "failed", "blocked", "error", "planned")
+            and not part.get("rescued")
+        ]
     rows = record.setdefault("rescues", [])
-    matched = False
-    for part in record.get("parts") or []:
-        if failed_crew and part.get("builder_crew") not in (None, failed_crew):
-            continue
-        # A specific part id narrows the rescue to that part.
-        wanted_part = rescue.get("part_id") if isinstance(rescue, dict) else None
-        if wanted_part and str(part.get("id")) != str(wanted_part):
-            continue
-        matched = True
-        if rescued:
-            part["rescued"] = True
-            part["rescue_crew"] = part.get("rescue_crew") or rescue_crew
-        rows.append({
-            "part_id": part.get("id"),
-            "reason": reason or "finisher completed a stalled/timed-out build",
-            "failed_crew": failed_crew,
-            "rescue_crew": part.get("rescue_crew") or rescue_crew,
-            "checker_crew": ((record.get("pairing") or {}).get(
-                str(part.get("id")), {}).get("checker")
-                or part.get("checker_crew")),
-            "status": "ok" if rescued else rescue_status,
-        })
-    if not matched:
+    if not isinstance(rows, list):
+        rows = []
+        record["rescues"] = rows
+    default_reason = reason or "finisher completed a stalled/timed-out build"
+    pairing = record.get("pairing") or {}
+    if targets:
+        for part in targets:
+            part_id = str(part.get("id") or "")
+            if ok:
+                part["rescued"] = True
+                part["rescue_crew"] = rescue_crew
+                # The finisher completed this part; a stale failed/blocked
+                # status must not keep the part_ok cap at 6.0.
+                if str(part.get("status") or "").strip().lower() in (
+                        "failed", "blocked", "error", "stalled"):
+                    part["status"] = "built"
+            rows.append({
+                "part_id": part_id,
+                "scope": "part",
+                "reason": default_reason,
+                "failed_crew": failed_crew,
+                "rescue_crew": rescue_crew,
+                "checker_crew": (pairing.get(part_id, {}).get("checker")
+                                 or part.get("checker_crew")),
+                "status": status,
+            })
+    else:
+        # No part could be identified.  A successful rescue completed the
+        # whole task, so it covers every part; a failed one covers none.
         rows.append({
             "part_id": "all",
-            "reason": reason or "finisher completed a stalled/timed-out build",
+            "scope": "all",
+            "reason": default_reason,
             "failed_crew": failed_crew,
             "rescue_crew": rescue_crew,
-            "status": "ok" if rescued else rescue_status,
+            "checker_crew": None,
+            "status": status,
         })
+        if ok:
+            for part in parts:
+                part["rescued"] = True
+                part["rescue_crew"] = rescue_crew
     # De-duplicate part/round pairs.
     seen = set()
     unique = []

@@ -2780,7 +2780,8 @@ def _workspace_signature(workspace, limit=4000):
     return tuple(sorted(entries))
 
 
-_RESCUE_STOP_REASONS = ("stalled", "time_limit", "loop", "no_balance")
+_RESCUE_STOP_REASONS = ("stalled", "time_limit", "loop", "no_balance",
+                        "network")
 
 
 def _loop_guard_blocks_finisher(stop_reason):
@@ -3773,6 +3774,16 @@ def _is_no_balance(*executions):
         r"Insufficient Balance|exceeded_current_quota_error|insufficient_quota|"
         r"quota_exceeded|\bQUOTA\b|HTTP\s*402|\b402 Payment",
         text, _re.IGNORECASE))
+
+
+def _is_network_failure(execution):
+    """True when a builder died on a transient network/rate-limit error."""
+    if (not isinstance(execution, dict) or execution.get("status") == "ok"
+            or _is_no_balance(execution)):
+        return False
+    text = (str(execution.get("error") or "") + " " +
+            str(execution.get("stderr_tail") or ""))
+    return bool(_TRANSIENT_ERROR_RE.search(text))
 
 
 _KIMI_RE = re.compile(r"kimi|moonshot", re.IGNORECASE)
@@ -6296,6 +6307,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             # parts exactly as it does to a clean build.
             stop_reason = "no_balance"
             run["stop_reason"] = stop_reason
+        elif cc and not stop_reason and _is_network_failure(builder):
+            stop_reason = "network"
+            run["stop_reason"] = stop_reason
         if _loop_guard_blocks_finisher(stop_reason):
             # A hard loop stop is terminal for this phase: no finisher, and no
             # review of the partial/repetitive work.
@@ -6320,7 +6334,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             "builder_error": (builder.get("error") or "")[:1000] or None,
         }
         if (stop_reason in _RESCUE_STOP_REASONS
-                and (candidates or stop_reason == "loop")):
+                and (candidates or stop_reason in ("loop", "no_balance",
+                                                   "network"))):
             elapsed = time.time() - overall_started
             rescue_limit = _rescue_limit(limit, elapsed)
             remaining = job_budget.remaining_seconds()

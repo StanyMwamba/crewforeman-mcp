@@ -94,12 +94,15 @@ condition list.
 ## Rescue
 
 The existing finisher still completes a builder run that stalls, stops early,
-hits a time limit, loops or (in crosscheck mode) loses provider balance. The
-finisher works on the whole workspace, so a whole-run rescue records every
-planned part it completed; an artifact that names a specific `failed_crew` or
-`part_id` is narrowed to those parts. Each row records the failed crew, reason
-and rescue crew, and only a successful rescue marks the part `rescued`. A crew
-that did not build it must still cross-check it; without that evidence
+hits a time limit, loops, loses provider balance or dies on a transient network
+error (the last two in crosscheck mode). The finisher works on the whole
+workspace: the connector narrows the record to an explicit `part_id` or
+`failed_crew`, otherwise to the parts that are not built yet, and reconciles a
+completed part to `built`. A whole-run rescue with no identifiable part records
+`scope="all"` and marks every part it completed. Each row records the failed
+crew (when known), reason, scope and rescue crew, and only a successful rescue
+marks the part `rescued`; a failed one caps the score at 8.0. A crew
+that did not build or rescue the part must still cross-check it; without that evidence
 condition 2 keeps the score below 10.
 
 ## Per-job record

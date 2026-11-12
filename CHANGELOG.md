@@ -26,11 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `crosscheck_threshold` defaults to 10.0 and is validated to 0-10.
   `crosscheck_max_rounds` defaults to 3; an unmet gate stops with
   `status="crosscheck_below_threshold"`.
-- **Rescue inside crosscheck.** The existing finisher completes a stalled or
-  time-limited part, the part is recorded as rescued, and a different crew
-  still checks it. Per-job records include parts, crew assignments, raw and
-  unique findings (real/false alarm, breaker/spec), rounds, score, rescues,
-  time and tokens.
+- **Rescue inside crosscheck.** The existing finisher completes a stalled,
+  timed-out, looped, balance-failed or (in crosscheck mode) transient-network
+  part, the part is recorded as rescued, and a different crew still checks it.
+  An explicit part id or failed crew narrows the record; otherwise unfinished
+  parts are targeted and a completed part is reconciled to `built`. Per-job
+  records include parts, crew assignments, raw and unique findings
+  (real/false alarm, breaker/spec), rounds, score, rescues, time and tokens.
 - **Audit after a passing crew gate.** The job's normally configured reviewer
   runs once with the diff since job start, crew evidence and the connector
   test result. It spot-checks `audit_spot_requirements` (default 3) and
@@ -62,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `fixed`; unknown or `justified` states stay open. Fix confirmation must come
   from the part's paired checker, and requirement coverage is measured against
   the connector's own brief ids. A semantically empty `AUDIT_JSON` fails closed.
-  A failed rescue does not mark a part rescued and caps the score at 8.0.
+  A failed rescue does not mark a part rescued and caps the score at 8.0;
+  successful rescues target the unfinished parts and reconcile their status.
 - **Parallel/integration hardening.** A `PLAN.json` write set is
   pipeline-eligible; explicit declarations are trusted at confidence 1.0; a
   serial peer in another workspace no longer forces this workspace serial. A
