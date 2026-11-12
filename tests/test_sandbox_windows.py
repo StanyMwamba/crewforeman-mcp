@@ -4,12 +4,21 @@ The suite runs on macOS/Linux: every Win32 call is replaced by ``FakeAPI``.
 No test touches a real token, ACL or process.
 """
 
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from deepseek_mcp import sandbox_windows as sw
+
+
+def _diag_lines(text):
+    """Parse the launcher's one-JSON-per-line diagnostics from captured stderr."""
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 class FakeAPI:
@@ -18,6 +27,7 @@ class FakeAPI:
         self.admin = True
         self.fail_per_run = False
         self.assign_ok = True
+        self.last_error = None
         self.wait_result = sw.WAIT_OBJECT_0
         self.exit_code = 0
         self.create_error = None
@@ -111,6 +121,8 @@ class FakeAPI:
 
     def assign_process_to_job(self, job, process):
         self._event("assign_job", job=job, process=process)
+        if not self.assign_ok:
+            self.last_error = 5  # ERROR_ACCESS_DENIED, e.g. a non-breakaway job
         return bool(self.assign_ok)
 
     def resume_thread(self, thread):
@@ -157,7 +169,14 @@ class WindowsLauncherTests(unittest.TestCase):
         api = FakeAPI()
         for key, value in overrides.items():
             setattr(api, key, value)
-        code = sw.run(self.policy, [sys.executable, "-c", "pass"], api=api)
+        # Failure-path tests deliberately exercise the launcher's stderr
+        # diagnostic.  Capture it so a passing test does not print a scary
+        # ``CreateProcessAsUserW failed`` / job-assignment JSON line that CI
+        # log triage can mistake for a real failure (run 43180626798).
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = sw.run(self.policy, [sys.executable, "-c", "pass"], api=api)
+        api.stderr = stderr.getvalue()
         return code, api, sw.last_result()
 
     def test_probe_reports_admin_and_per_run_sid(self):
@@ -219,6 +238,12 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertLess(names.index("assign_job"),
                         names.index("terminate_process"))
         self.assertEqual(result["reason"], "job_assignment_failed")
+        self.assertEqual(result["winerror"], 5)
+        payload = _diag_lines(api.stderr)[-1]
+        self.assertEqual(payload["code"], sw.EXIT_APPLY_FAILED)
+        self.assertEqual(payload["step"], "job_assign")
+        self.assertEqual(payload["winerror"], 5)
+        self.assertIn("AssignProcessToJobObject", payload["error"]["message"])
 
     def test_acl_restored_on_process_error(self):
         failure = OSError("CreateProcessAsUserW failed")
@@ -231,6 +256,11 @@ class WindowsLauncherTests(unittest.TestCase):
         restored_paths = {os.path.normcase(path) for path, _ in api.restored}
         self.assertIn(os.path.normcase(self.workspace), restored_paths)
         self.assertIn(os.path.normcase(self.tmpdir), restored_paths)
+        payload = _diag_lines(api.stderr)[-1]
+        self.assertEqual(payload["code"], sw.EXIT_DSH_FAILED)
+        self.assertEqual(payload["step"], "create_process")
+        self.assertEqual(payload["winerror"], 1314)
+        self.assertEqual(payload["reason"], "privilege_not_held")
 
     def test_unc_rejected(self):
         with self.assertRaises(sw.SandboxError) as caught:
@@ -274,10 +304,47 @@ class WindowsLauncherTests(unittest.TestCase):
     def test_main_wrong_platform_is_125(self):
         if sw._is_windows():
             self.skipTest("host is Windows")
-        self.assertEqual(sw.main(["--policy", "{}", "--", "dsh.exe"]), 125)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = sw.main(["--policy", "{}", "--", "dsh.exe"])
+        self.assertEqual(code, 125)
+        payload = _diag_lines(stderr.getvalue())[-1]
+        self.assertEqual(payload["code"], 125)
+        self.assertEqual(payload["step"], "platform_check")
+        self.assertEqual(payload["reason"], "not_windows")
 
     def test_main_rejects_missing_policy(self):
-        self.assertEqual(sw.main(["--", "dsh.exe"]), sw.EXIT_APPLY_FAILED)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = sw.main(["--", "dsh.exe"])
+        self.assertEqual(code, sw.EXIT_APPLY_FAILED)
+        payload = _diag_lines(stderr.getvalue())[-1]
+        self.assertEqual(payload["code"], sw.EXIT_APPLY_FAILED)
+        self.assertEqual(payload["reason"], "missing_policy")
+
+
+class WindowsAPIJobDiagnosticsTests(unittest.TestCase):
+    """Exercise the real capture, not the FakeAPI's injected last_error."""
+
+    def _api(self, assigned):
+        api = object.__new__(sw.WindowsAPI)
+        api.kernel32 = mock.Mock()
+        api.kernel32.AssignProcessToJobObject.return_value = assigned
+        api.ctypes = mock.Mock()
+        api.ctypes.get_last_error.return_value = 5
+        return api
+
+    def test_failure_keeps_the_real_winerror(self):
+        api = self._api(0)
+        self.assertFalse(api.assign_process_to_job("job", "process"))
+        self.assertEqual(api.last_error, 5)
+        api.ctypes.get_last_error.assert_called_once_with()
+
+    def test_success_clears_stale_winerror(self):
+        api = self._api(1)
+        api.last_error = 5
+        self.assertTrue(api.assign_process_to_job("job", "process"))
+        self.assertIsNone(api.last_error)
 
 
 if __name__ == "__main__":

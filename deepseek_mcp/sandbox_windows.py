@@ -757,7 +757,18 @@ class WindowsAPI:
         return job
 
     def assign_process_to_job(self, job, process):
-        return bool(self.kernel32.AssignProcessToJobObject(job, process))
+        if self.kernel32.AssignProcessToJobObject(job, process):
+            self.last_error = None
+            return True
+        # Keep the real Win32 error instead of reporting a bare False.  A
+        # live ERROR_ACCESS_DENIED (5) from an existing/non-breakaway job is
+        # then distinguishable from the mocked negative-path test, which
+        # injects the false result directly.
+        try:
+            self.last_error = int(self.ctypes.get_last_error())
+        except Exception:
+            self.last_error = None
+        return False
 
     def resume_thread(self, thread):
         return int(self.kernel32.ResumeThread(thread)) != 0xFFFFFFFF
@@ -1377,7 +1388,8 @@ def run(policy, dsh, api=None):
             except Exception:
                 pass
             diag = _diag("job_assign", None, reason="job_assignment_failed",
-                         message="AssignProcessToJobObject returned false")
+                         message="AssignProcessToJobObject returned false",
+                         winerror=getattr(api, "last_error", None))
             return fail(EXIT_APPLY_FAILED, diag)
 
         _stage("resume")
