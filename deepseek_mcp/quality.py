@@ -1262,7 +1262,8 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
                        independent_review=True, render_hint=None,
                        task_type=None, builder_practices=True,
                        project_map_hint=None, plan_block=None,
-                       failure_note=None, extra_sections=None):
+                       failure_note=None, extra_sections=None,
+                       crosscheck=False):
     """Return the full task text sent to ``dsh --profile headless``."""
     parts = [prompt.strip()]
     if plan_block:
@@ -1276,7 +1277,15 @@ def build_harness_task(prompt, subagents, reason, skill=None, quality=True,
         concurrency = DEFAULT_CONCURRENCY
 
     count = int(subagents) if subagents else 0
-    if count > 0:
+    if crosscheck:
+        parts.append(
+            "\n\nWork method: this job uses CROSSCHECK CREWS. Follow the "
+            "`Crosscheck mode` section appended below instead of the generic "
+            "pipelined-waves/sub-leader routine. Split the brief into N >= 2 "
+            "independent parts, build all parts with their builder crews, then "
+            "cross-check every part with a different crew. Do not produce a "
+            "single-candidate wave or a sub-leader summary as the deliverable.")
+    elif count > 0:
         waves = _wave_sizes(count, concurrency)
         wave_text = " + ".join(str(size) for size in waves)
         noun = "subagent" if count == 1 else "subagents"

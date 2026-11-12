@@ -435,7 +435,8 @@ def _plan_write_set(args, workspace):
 def declared_write_set(args, cfg):
     """Resolve the declared write-set using the frozen F4.1 precedence."""
 
-    result = {"write_set": [], "source": "none", "impl": "builtin", "invalid": []}
+    result = {"write_set": [], "source": "none", "impl": "builtin",
+              "invalid": [], "confidence": 0.0, "basis": "none"}
     try:
         workspace = _workspace_from(args, cfg)
         invalid = []
@@ -484,8 +485,33 @@ def declared_write_set(args, cfg):
         invalid.extend(bad)
         if valid:
             result.update({"write_set": valid, "source": "plan",
-                           "impl": "builtin", "invalid": invalid})
+                           "impl": "builtin", "invalid": invalid,
+                           "confidence": 0.93, "basis": "plan"})
             return result
+        # v3.14.2: automatic inference is the last resort.  It is cheap and
+        # pure-Python, and only a confident, disjoint set is allowed to run in
+        # parallel; a low-confidence result keeps the serial path.
+        if _cfg_bool(cfg, "auto_parallel", True):
+            try:
+                from . import writesets as writesets_mod
+                inferred = writesets_mod.infer_write_set(prompt, workspace)
+                inferred_valid, inferred_bad = _normalise_items(
+                    inferred.get("write_set") or [])
+                invalid.extend(inferred_bad)
+                if inferred_valid:
+                    result.update({
+                        "write_set": inferred_valid,
+                        "source": "inferred",
+                        "impl": "auto",
+                        "invalid": invalid,
+                        "confidence": float(
+                            inferred.get("confidence") or 0.0),
+                        "basis": ",".join(inferred.get("sources") or [])
+                        or "inferred",
+                    })
+                    return result
+            except Exception:
+                pass
         result["invalid"] = invalid
         return result
     except Exception:
@@ -660,7 +686,8 @@ def _patch_records(cfg, canonical_workspace, statuses=None):
 
 def _has_pending(cfg, canonical_workspace):
     return bool(_patch_records(cfg, canonical_workspace,
-                               statuses={"pending", "accepted", "manual", "conflict"}))
+                               statuses={"pending", "accepted", "manual",
+                                         "conflict", "serial_reintegration"}))
 
 
 def _update_sidecar(record, **fields):
@@ -951,7 +978,16 @@ def prepare_args(cfg, args, run=None):
         workspace = _absolute(args.get("_canonical_workspace")
                               or _workspace_from(args, cfg, run))
         declared = declared_write_set(args, cfg)
-        pre_source = declared.get("source") in {"arg", "slice", "prompt"}
+        source = declared.get("source") or "none"
+        try:
+            declared_confidence = float(declared.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            declared_confidence = 0.0
+        inferred_ok = (source == "inferred"
+                       and _cfg_bool(cfg, "auto_parallel", True)
+                       and declared_confidence >= _cfg_float(
+                           cfg, "auto_parallel_min_confidence", 0.85))
+        pre_source = (source in {"arg", "slice", "prompt"} or inferred_ok)
         check_set = declared.get("write_set") if pre_source else []
         existing = {}
         if isinstance(args.get("_pipeline"), dict):
@@ -1004,6 +1040,8 @@ def prepare_args(cfg, args, run=None):
             "write_set": declared.get("write_set") or [],
             "write_set_source": declared.get("source") or "none",
             "write_set_impl": declared.get("impl") or "builtin",
+            "write_set_confidence": declared.get("confidence"),
+            "write_set_basis": declared.get("basis"),
             "write_set_widened": bool(existing.get("write_set_widened", False)),
             "write_set_invalid": declared.get("invalid") or [],
             "plan_files_outside_write_set": existing.get("plan_files_outside_write_set") or [],
@@ -1134,6 +1172,7 @@ def note_plan(run, plan_path):
 
 def _exclude_pathspecs(cfg, workspace):
     excludes = [":(exclude)REVIEW.md", ":(exclude)QUALITY_REPORT.md",
+                ":(exclude)PLAN.json", ":(exclude)CROSSCHECK.json",
                 ":(exclude).dsh-pipeline.json",
                 ":(exclude).dsh-tmp-*", ":(exclude)**/.dsh-tmp-*"]
     try:
@@ -1198,6 +1237,14 @@ def capture_patch(run, cfg, workspace):
             diff = ""
             result["reason"] = "patch_too_large"
         files = _diff_files(ws, base, excludes) if complete else []
+        stray = []
+        if (isinstance(pipe, dict) and pipe.get("write_set")
+                and pipe.get("write_set_source") == "inferred"):
+            try:
+                from . import writesets as writesets_mod
+                stray = writesets_mod.stray_files(pipe.get("write_set"), files)
+            except Exception:
+                stray = []
         run_id = _run_id(run) or ("run-" + uuid.uuid4().hex[:8])
         run_id = _safe_id(run_id)
         directory = patch_dir(cfg)
@@ -1228,7 +1275,10 @@ def capture_patch(run, cfg, workspace):
             "complete": bool(complete),
             "base_commit": base,
             "created": now,
-            "status": "pending" if complete else "partial",
+            "status": ("serial_reintegration" if (complete and stray)
+                       else ("pending" if complete else "partial")),
+            "stray_files": list(stray),
+            "integration_reason": "write_set_stray" if stray else None,
             "queue_id": _queue_id(canonical) if canonical else None,
             "worktree": worktree,
             "output_files": output_files,
@@ -1246,8 +1296,15 @@ def capture_patch(run, cfg, workspace):
                              "files": files, "complete": bool(complete),
                              "base_commit": base}
             if pipe.get("eligible"):
-                pipe["install"] = {"status": "pending", "applied": [],
-                                   "reason": None, "conflict": None}
+                if stray:
+                    pipe["stray_files"] = list(stray)
+                    pipe["install"] = {
+                        "status": "serial_reintegration", "applied": [],
+                        "reason": "write_set_stray", "conflict": None,
+                    }
+                else:
+                    pipe["install"] = {"status": "pending", "applied": [],
+                                       "reason": None, "conflict": None}
             if isinstance(run, dict):
                 run["pipeline"] = pipe
         return result
@@ -1273,7 +1330,7 @@ def finalize_run(run, cfg, workspace):
         install = pipe.get("install") if isinstance(pipe.get("install"), dict) else {}
         status = str(install.get("status") or "")
         path = pipe.get("worktree")
-        if status in ("manual", "conflict"):
+        if status in ("manual", "conflict", "serial_reintegration"):
             pipe["worktree_retained"] = True
             if path:
                 _write_marker(path, terminal=True, retained=True, install_status=status)
@@ -1463,7 +1520,7 @@ def _pending_records(cfg, canonical):
     pending = []
     for record in records:
         status = str(record.get("status") or "pending")
-        if status in ("manual", "conflict", "partial"):
+        if status in ("manual", "conflict", "partial", "serial_reintegration"):
             break
         if status in ("pending", "accepted"):
             pending.append(record)
@@ -1516,6 +1573,104 @@ def _copy_artifacts(record, canonical):
     return copied
 
 
+def serial_reintegrate(cfg, canonical_workspace, run_id):
+    """Re-apply one stray/conflicting patch serially on the current tree.
+
+    This is the safe fallback required when a parallel job's actual diff
+    escaped its inferred write set, or when the patch no longer applies to the
+    canonical tree.  It never force-merges: a clean ``git apply`` is tried
+    first, then a three-way apply; otherwise the patch is retained as
+    ``manual`` and the run says why.
+    """
+    result = {"ok": False, "status": "error", "applied": [], "reason": None,
+              "rolled_back": False, "conflict": None, "patches": [run_id],
+              "resolution": None, "stray_files": []}
+    canonical = ""
+    lock_held = False
+    try:
+        canonical = _absolute(canonical_workspace or "")
+        if not canonical or not os.path.isdir(canonical):
+            result.update({"status": "skipped", "reason": "workspace_missing"})
+            return result
+        records = _patch_records(cfg, canonical)
+        record = next((item for item in records
+                       if str(item.get("run_id")) == str(run_id)), None)
+        if not record:
+            result.update({"status": "skipped", "reason": "patch_missing"})
+            return result
+        result["stray_files"] = list(record.get("stray_files") or [])
+        directory = patch_dir(cfg)
+        ok, reason = _verify_record(record, directory)
+        if not ok:
+            result.update(_install_conflict(record, reason))
+            return result
+        if not _acquire_lock(cfg):
+            result.update({"ok": True, "status": "install_locked",
+                           "reason": "install_locked"})
+            return result
+        lock_held = True
+        status_paths = _status_paths(canonical)
+        if status_paths is None:
+            result.update(_dirty_conflict(cfg, canonical, "canonical_dirty",
+                                          "status_failed"))
+            return result
+        allowed = _installed_paths(cfg, canonical)
+        unknown = [path for path in status_paths if not _path_allowed(path, allowed)]
+        if unknown:
+            result.update(_dirty_conflict(cfg, canonical, "canonical_dirty",
+                                          "dirty_paths"))
+            return result
+        patch_file = _record_patch_path(record, directory)
+        rc, _out, err = _git(["apply", "--check", "--", patch_file], canonical)
+        resolution = "apply_clean"
+        if rc != 0:
+            rc3, _out3, err3 = _git(
+                ["apply", "--3way", "--check", "--", patch_file], canonical)
+            if rc3 != 0:
+                result.update(_install_conflict(
+                    record, "apply_check_failed", err3 or err))
+                result["status"] = "manual"
+                result["reason"] = "apply_check_failed"
+                _update_sidecar(record, status="manual",
+                                integration_reason="apply_check_failed",
+                                integration_detail=_clean_text(err3 or err,
+                                                               canonical))
+                return result
+            resolution = "rebase_3way"
+        args = ["apply"]
+        if resolution == "rebase_3way":
+            args.append("--3way")
+        args += ["--", patch_file]
+        rc, _out, err = _git(args, canonical, timeout=180)
+        if rc != 0:
+            result.update(_install_conflict(record, "apply_failed", err))
+            result["status"] = "manual"
+            result["reason"] = "apply_failed"
+            _update_sidecar(record, status="manual",
+                            integration_reason="apply_failed",
+                            integration_detail=_clean_text(err, canonical))
+            return result
+        _git(["add", "-A", "--", "."], canonical)
+        installed = {"ok": True, "status": "installed_serial",
+                     "applied": [str(run_id)], "reason": "write_set_stray",
+                     "resolution": resolution,
+                     "stray_files": result["stray_files"],
+                     "conflict": None}
+        _update_sidecar(record, status="installed",
+                        integration_resolution=resolution,
+                        integration_reason="write_set_stray")
+        result.update(installed)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result.update({"ok": False, "status": "error",
+                       "reason": "reintegrate_failed",
+                       "detail": _clean_text(exc, canonical)})
+        return result
+    finally:
+        if lock_held:
+            _release_lock(cfg)
+
+
 def install_pending(cfg, canonical_workspace, run_id):
     """Verify all accepted patches together, then install (F4.6)."""
 
@@ -1535,6 +1690,14 @@ def install_pending(cfg, canonical_workspace, run_id):
             return result
         directory = patch_dir(cfg)
         pending = _pending_records(cfg, canonical)
+        if pending and str(pending[0].get("status") or "") == "serial_reintegration":
+            record = pending[0]
+            if run_id and str(record.get("run_id")) == str(run_id):
+                rebuilt = serial_reintegrate(cfg, canonical, run_id)
+                return rebuilt
+            return {"ok": True, "status": "serial_reintegration",
+                    "applied": [], "reason": "write_set_stray",
+                    "conflict": None, "stray_files": record.get("stray_files") or []}
         if not pending:
             installed = _patch_records(cfg, canonical, statuses={"installed"})
             if run_id and any(str(r.get("run_id")) == str(run_id) for r in installed):

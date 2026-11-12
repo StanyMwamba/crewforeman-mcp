@@ -23,7 +23,9 @@ import time
 from pathlib import Path
 
 from . import api
+from . import audit as audit_mod
 from . import authority
+from . import crosscheck as crosscheck_mod
 from . import budget as budget_mod
 from . import checkpoints
 from . import credentials
@@ -50,6 +52,7 @@ from . import spend as spend_mod
 from . import status as status_mod
 from . import transport as transport_mod
 from . import work as work_mod
+from . import writesets as writesets_mod
 from . import builder_backup
 from .quality import (DEFAULT_QUALITY_TARGET, build_finisher_task, build_harness_task,
                       build_review_task, build_revision_task,
@@ -4918,10 +4921,36 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     prompt = (args.get("prompt") or "").strip()
     if not prompt:
         raise RuntimeError("prompt is required")
+    # v3.14.2 crosscheck is validated before any paid call and before a run
+    # record is created, so an out-of-range threshold cannot waste a job.
+    try:
+        cc = crosscheck_mod.normalise_config(args, cfg)
+    except crosscheck_mod.CrosscheckConfigError as exc:
+        raise RuntimeError("crosscheck: %s" % exc)
+    if cc:
+        args = dict(args)
+        # A crosscheck job is one crew session plus focused fix rounds; live
+        # scaling would launch an independent second build outside the crew
+        # plan. Audit is the one reviewer, so the normal review path must run.
+        args["subagents"] = cc["subagents"]
+        args["live_scaling"] = False
+        args["independent_review"] = True
+        if cc.get("audit_review"):
+            try:
+                current_rounds = int(args.get("quality_rounds")
+                                     or cfg.get("quality_max_rounds", 3) or 3)
+            except (TypeError, ValueError):
+                current_rounds = 3
+            args["quality_rounds"] = max(2, current_rounds)
     # The binary is operator configuration only; never accept it from a tool
     # argument, where an agent could point this at another executable.
     dsh = Path(os.path.expanduser(cfg.dsh_bin))
     run = new_run("harness", args, prompt, cfg)
+    if cc:
+        run["mode"] = "crosscheck"
+        run["crosscheck_config"] = {
+            key: value for key, value in cc.items() if key != "crew_sizes"
+        }
     if run.get("work_id"):
         try:
             _work_store(cfg).bind_run(
@@ -4998,6 +5027,22 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         path = save_run(run, cfg)
         _finalize_work(run, cfg)
         raise RuntimeError(run["error"] + _saved_note(run, path))
+
+    try:
+        pipe = run.get("pipeline") or {}
+        source = pipe.get("write_set_source")
+        run["parallel"] = {
+            "inferred_write_set": list(pipe.get("write_set") or [])
+            if source in ("inferred", "plan") else [],
+            "confidence": pipe.get("write_set_confidence"),
+            "mode": "parallel" if pipe.get("eligible") else "serial",
+            "reason": ("disjoint_confident" if pipe.get("eligible")
+                       else (pipe.get("unavailable_reason") or "not_pipeline")),
+            "conflicts": [],
+            "resolution": None,
+        }
+    except Exception:
+        pass
 
     # R1: resolve and validate the builder target before the first paid call.
     # The default target is exactly (dsh_provider, dsh_model), so an empty
@@ -5435,6 +5480,30 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         choice.get("task_type"), cfg)
     if failure_details:
         run["failure_notes"] = failure_details
+    crosscheck_extra = None
+    if cc:
+        try:
+            planned = crosscheck_mod.plan_parts(workspace, cfg)
+            planned_parts = planned.get("parts") or []
+            crew_ids = crosscheck_mod.crews_for(
+                max(2, len(planned_parts) or 2), cc)
+            pair_map = crosscheck_mod.pairing(
+                planned_parts, crew_ids, 1) if planned_parts else {}
+            crosscheck_extra = crosscheck_mod.build_contract(
+                cc, planned, pair_map, prompt)
+            run["crosscheck_plan"] = {
+                "status": planned.get("status"),
+                "parts": len(planned_parts),
+                "errors": list(planned.get("errors") or []),
+                "sha256": planned.get("sha256"),
+            }
+        except Exception as exc:
+            run["crosscheck_plan"] = {
+                "status": "error",
+                "errors": [api.redact_secrets(str(exc))[:300]],
+            }
+            crosscheck_extra = crosscheck_mod.build_contract(
+                cc, {"parts": []}, {}, prompt)
     task = build_harness_task(prompt, choice["subagents"], choice["reason"], skill,
                               quality=quality, quality_rounds=rounds,
                               concurrency=child_concurrency,
@@ -5444,7 +5513,10 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                               builder_practices=practices["enabled"],
                               project_map_hint=project_map_hint,
                               plan_block=plan_block,
-                              failure_note=failure_note or None)
+                              failure_note=failure_note or None,
+                              extra_sections=([crosscheck_extra]
+                                              if crosscheck_extra else None),
+                              crosscheck=bool(cc))
     if model_plan_section:
         task = task.rstrip() + "\n\n" + model_plan_section
     # The audit copy of the builder task must not duplicate the private map
@@ -7190,6 +7262,201 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     else:
         run["self_score"] = None
 
+    # ------------------------------------------------------- crosscheck gate
+    crosscheck_record = None
+    crosscheck_failed = False
+    if cc and not gate_blocked:
+        crosscheck_started = time.time()
+        try:
+            gate_module = gate_module if "gate_module" in dir() else _feature_module("gate")
+            record = crosscheck_mod.new_record(cc, run.get("id"))
+            record["job_id"] = run.get("id")
+            plan_info = crosscheck_mod.plan_parts(workspace, cfg)
+            record["plan"] = {
+                "status": plan_info.get("status"),
+                "parts": len(plan_info.get("parts") or []),
+                "errors": list(plan_info.get("errors") or []),
+                "sha256": plan_info.get("sha256"),
+            }
+
+            def _crosscheck_refresh(record, plan_info):
+                artifact = crosscheck_mod.load_artifact(workspace)
+                record = crosscheck_mod.merge_artifact(
+                    record, artifact.get("data") or {})
+                if plan_info.get("parts"):
+                    by_id = {}
+                    for item in record.get("parts") or []:
+                        if isinstance(item, dict) and item.get("id"):
+                            by_id[str(item.get("id"))] = dict(item)
+                    parts = []
+                    for planned in plan_info.get("parts") or []:
+                        row = dict(planned)
+                        extra = by_id.get(str(planned.get("id"))) or {}
+                        for key in ("builder_crew", "checker_crew", "status",
+                                    "rescued", "rescue_crew"):
+                            if extra.get(key) not in (None, ""):
+                                row[key] = extra[key]
+                        parts.append(row)
+                    crew_ids = crosscheck_mod.crews_for(len(parts), cc)
+                    pairs = crosscheck_mod.pairing(parts, crew_ids, 1)
+                    for part in parts:
+                        pair = pairs.get(str(part.get("id")), {})
+                        part.setdefault("builder_crew", pair.get("builder"))
+                        part.setdefault("checker_crew", pair.get("checker"))
+                    record["parts"] = parts
+                    record["pairing"] = {
+                        str(pid): {"builder": value.get("builder"),
+                                   "checker": value.get("checker")}
+                        for pid, value in pairs.items()
+                    }
+                crews = ["crew-%d" % index for index in
+                         range(1, max(2, int(cc.get("crews") or 2)) + 1)]
+                record["crews"] = [
+                    {"id": crew_id,
+                     "built": [str(p.get("id")) for p in record.get("parts") or []
+                               if p.get("builder_crew") == crew_id],
+                     "checked": [str(p.get("id")) for p in record.get("parts") or []
+                                 if p.get("checker_crew") == crew_id]}
+                    for crew_id in crews
+                ]
+                record = crosscheck_mod.apply_rescue(
+                    record, run.get("rescue"), bool(run.get("rescued")))
+                tests = crosscheck_mod.tests_from_gate(gate_record)
+                if tests.get("status") == "smoke_failed":
+                    smoke = crosscheck_mod.run_smoke(workspace)
+                    tests = crosscheck_mod.tests_from_gate(
+                        gate_record, smoke_ok=bool(smoke.get("ok")))
+                    tests["smoke"] = {
+                        "ok": bool(smoke.get("ok")),
+                        "exit": smoke.get("exit"),
+                        "tail": crosscheck_mod._truncate(
+                            smoke.get("tail"), 800),
+                    }
+                record["tests"] = tests
+                brief_reqs = crosscheck_mod.brief_requirements(prompt)
+                record["brief_requirements"] = brief_reqs
+                evaluation = crosscheck_mod.evaluate(
+                    record.get("parts"), record.get("findings"),
+                    record.get("requirements"), tests,
+                    record.get("rescues"),
+                    threshold=cc.get("threshold", 10.0),
+                    brief_count=len(brief_reqs))
+                if plan_info.get("status") != "ok":
+                    evaluation = dict(evaluation)
+                    evaluation["score"] = 0.0
+                    evaluation["passed"] = False
+                    evaluation["reasons"] = list(evaluation.get("reasons") or []) + [
+                        "plan_" + str(plan_info.get("status") or "invalid")]
+                return record, evaluation
+
+            record, evaluation = _crosscheck_refresh(record, plan_info)
+            record = crosscheck_mod.record_round(record, evaluation, None, 1,
+                                                 "build")
+            round_no = 1
+            while crosscheck_mod.loop_decision(
+                    round_no, evaluation, cc) == "fix":
+                if job_budget.time_exceeded():
+                    break
+                round_no += 1
+                fix_task = crosscheck_mod.build_fix_task(
+                    cc, record, evaluation, round_no, prompt)
+                admission = _cost_admit(
+                    run, cfg, cost_ledger, "crosscheck",
+                    max(1, int(run.get("subagents") or 1)),
+                    job_budget.phase_limit(limit), job_budget)
+                if admission and admission.get("error"):
+                    run["status"] = "budget_exceeded"
+                    run["stop_reason"] = "budget"
+                    run["error"] = ("cost admission refused crosscheck round %d: %s"
+                                    % (round_no, admission["error"]))
+                    break
+                if checkpoint:
+                    try:
+                        checkpoint.begin("crosscheck")
+                    except Exception:
+                        pass
+                _persist(run, cfg, "crosscheck-%d" % round_no)
+                if trace:
+                    trace.event("crosscheck", "fix_start", round=round_no,
+                                score=evaluation.get("score"))
+                execution = _execute_once(
+                    cfg, workspace, fix_task,
+                    limit=job_budget.phase_limit(limit),
+                    progress_cb=progress_cb,
+                    label="crosscheck fix %d" % round_no,
+                    exclude_logs=used_logs, policy=revision_policy,
+                    add_dirs=run["add_dirs"],
+                    transport_name=run["transport"],
+                    cancel_check=cancel_check)
+                executions.append(execution)
+                used_logs.update(execution.get("session_logs") or [])
+                _cost_settle(run, cost_ledger, "crosscheck", execution,
+                             job_budget,
+                             operation_id=(admission or {}).get(
+                                 "reservation", {}).get("id"))
+                run["output_files"] = sorted(_union_files(
+                    run.get("output_files") or [],
+                    execution.get("output_files") or []))
+                deliverable_files = _deliverable_files(
+                    workspace, _union_files(
+                        deliverable_files, execution.get("output_files") or []))
+                try:
+                    gate_record = gate_module.run_gate(
+                        cfg, workspace, run, phase="crosscheck",
+                        before=safety.snapshot_workspace(workspace))
+                except Exception as exc:
+                    run["crosscheck_gate_error"] = api.redact_secrets(
+                        str(exc))[:300]
+                    break
+                run["deterministic_gate"] = gate_record
+                record, evaluation = _crosscheck_refresh(record, plan_info)
+                record = crosscheck_mod.record_round(
+                    record, evaluation, execution, round_no, "fix")
+                if execution.get("status") != "ok":
+                    break
+            record = crosscheck_mod.apply_status(record, evaluation)
+            record["round_count"] = len(record.get("rounds") or [])
+            record["seconds"] = round(time.time() - crosscheck_started, 1)
+            record["finished_at"] = time.time()
+            crosscheck_mod.save_artifact(workspace, record)
+            run["crosscheck"] = record
+            run["crosscheck_score"] = evaluation.get("score")
+            run["crosscheck_status"] = record.get("status")
+            run["crosscheck_evaluation"] = evaluation
+            crosscheck_record = record
+            if not cc.get("audit_review"):
+                run["audit"] = {"enabled": False, "ran": False,
+                                "sampled": False,
+                                "reason": "audit_review_false"}
+            if not evaluation.get("passed"):
+                crosscheck_failed = True
+                run["status"] = crosscheck_mod.STATUS_BELOW
+                run["stop_reason"] = "crosscheck_below_threshold"
+                run["review_status"] = "skipped"
+                run["review_passed"] = False
+                run["quality_score"] = None
+                run["error"] = record.get("status_detail")
+                run["status_detail"] = record.get("status_detail")
+                run.setdefault("audit", {
+                    "enabled": bool(cc.get("audit_review")),
+                    "ran": False, "sampled": False,
+                    "reason": "crosscheck_below_threshold",
+                })
+            _persist(run, cfg, "crosscheck")
+        except Exception as exc:
+            crosscheck_failed = True
+            detail = "crosscheck phase failed: %s" % api.redact_secrets(
+                str(exc))[:300]
+            run["crosscheck_error"] = detail
+            run["status"] = "error"
+            run["stop_reason"] = "crosscheck_error"
+            run["review_status"] = "skipped"
+            run["review_passed"] = False
+            run["quality_score"] = None
+            run["error"] = detail
+            run["status_detail"] = detail
+            _persist(run, cfg, "crosscheck")
+
     review_rounds = []
     review_error = None
     review_status = "disabled"
@@ -7253,7 +7520,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             "note": api.redact_secrets(scope_note),
         }
 
-    if independent and not gate_blocked:
+    if independent and not gate_blocked and not crosscheck_failed:
         # Reuse every finished phase. Rounds are a prefix: the first phase
         # that is not ``done`` is where this attempt starts.
         review_rounds = [dict(prior_reviews[number])
@@ -7804,6 +8071,67 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     partial=partial_arg,
                     test_evidence=(review_context.format_test_evidence(
                         test_evidence) if test_evidence else None))
+                # v3.14.2 audit: one review, after the crew gate passed.  The
+                # audit augments the normally configured reviewer task with
+                # the connector diff, crew evidence and seeded spot checks.
+                if crosscheck_record and cc and cc.get("audit_review"):
+                    if not isinstance(run.get("audit"), dict):
+                        audit_evidence = crosscheck_mod.evidence_text(
+                            crosscheck_record)
+                        changed_paths = audit_mod.extract_diff_paths(review_diff)
+                        for name in deliverable_files:
+                            if name not in changed_paths:
+                                changed_paths.append(str(name))
+                        try:
+                            audit_plan = audit_mod.prepare(
+                                cfg, run=run, workspace=workspace, brief=prompt,
+                                changed_paths=changed_paths,
+                                requirements=audit_mod.requirements_for_audit(
+                                    crosscheck_record),
+                                fixes=audit_mod.confirmed_fixes(
+                                    crosscheck_record),
+                                crosscheck_mode=True,
+                                gate_passed=not bool(gate_blocked),
+                                audit_review=cc.get("audit_review"),
+                                sample_rate=cc.get("audit_sample_rate"),
+                                seed=cc.get("audit_seed") or None,
+                                spot_requirements=cc.get(
+                                    "audit_spot_requirements"),
+                                spot_fixes=cc.get("audit_spot_fixes"))
+                            audit_plan["record"]["job_id"] = run.get("id")
+                            audit_plan["record"]["crew_evidence"] = (
+                                audit_evidence)
+                            run["audit"] = audit_plan["record"]
+                            run["audit_plan"] = {
+                                "seed": audit_plan.get("seed"),
+                                "spot_seed": (audit_plan.get("spot") or {}).get(
+                                    "seed"),
+                                "sampled": audit_plan.get("sampled"),
+                            }
+                        except Exception as exc:
+                            run["audit"] = {
+                                "ran": False, "enabled": False,
+                                "sampled": False,
+                                "reason": "audit_prepare_failed",
+                                "error": api.redact_secrets(str(exc))[:300],
+                            }
+                    audit_record = run.get("audit") or {}
+                    if audit_record.get("sampled"):
+                        if int(round_no) == 1:
+                            review_task = (review_task + "\n\n"
+                                           + audit_mod.prompt_block(
+                                               audit_record,
+                                               crew_evidence=(
+                                                   audit_record.get(
+                                                       "crew_evidence") or ""),
+                                               test_evidence=(
+                                                   gate_evidence_text or "")))
+                        else:
+                            review_task = (review_task + "\n\n"
+                                           + audit_mod.reaudit_block(
+                                               audit_record,
+                                               audit_record.get("blocking") or []))
+                    audit_record["review_round"] = int(round_no)
                 # P3-2: near-free pre-flight through the SAME reviewer path.
                 # A provider that cannot answer a one-word prompt must not be
                 # handed the paid review.
@@ -8662,6 +8990,38 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     # real blocking count/defects are untouched.  Never
                     # fabricate 0.0 or a synthetic blocking defect.
                     score_missing = True
+                if isinstance(run.get("audit"), dict) and run["audit"].get(
+                        "sampled"):
+                    try:
+                        audit_done = audit_mod.finish(
+                            run["audit"], report_text, cfg)
+                        audit_blocking = int(
+                            audit_done.get("blocking_count") or 0)
+                        run["audit"]["report_round"] = int(round_no)
+                        if not audit_done.get("ran"):
+                            audit_blocking = max(audit_blocking, 1)
+                            defects.append(
+                                "audit section missing from the reviewer report; "
+                                "the sampled audit must report score, blocking "
+                                "and spot checks")
+                        if audit_blocking:
+                            blocking += audit_blocking
+                            if score is None or score > 7.0:
+                                score = 7.0
+                            for item in audit_done.get("blocking") or []:
+                                text = str(item.get("text") or "audit blocking")
+                                evidence = str(item.get("evidence") or "")
+                                defects.append(
+                                    "audit: %s%s" % (
+                                        text,
+                                        (" | evidence: " + evidence)
+                                        if evidence else ""))
+                            fixes.append(
+                                "fix the audit blocking list; the finding crew "
+                                "re-audits only those items")
+                    except Exception as exc:
+                        run["audit"]["error"] = api.redact_secrets(
+                            str(exc))[:300]
                 entry = {
                     "round": round_no,
                     "kind": "review",
@@ -9183,7 +9543,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                  if review_entries else None)
     run["review_scores"] = [entry.get("score") for entry in review_entries]
 
-    if independent and not gate_blocked:
+    if independent and not gate_blocked and not crosscheck_failed:
         last_review = next((item for item in reversed(review_rounds)
                             if item.get("kind") == "review"), None)
         run["quality_score"] = last_review.get("score") if last_review else None
@@ -9199,8 +9559,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         _report_text, report_path = _read_review(workspace)
         if report_path:
             run["review_report"] = report_path
-    elif gate_blocked:
-        # The gate owns the terminal verdict; no reviewer round was recorded.
+    elif gate_blocked or crosscheck_failed:
+        # The gate/crosscheck owns the terminal verdict; no reviewer round was
+        # recorded.
         run["quality_score"] = None
         run["review_status"] = "skipped"
         run["review_rounds"] = []
@@ -9228,6 +9589,24 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             "one or more builder/reviewer/revision processes had missing or "
             "unreadable session logs")
     run["seconds"] = round(time.time() - overall_started, 1)
+    if isinstance(crosscheck_record, dict):
+        crosscheck_record["usage"] = {
+            "tokens_in": totals.get("tokens_in"),
+            "cache_read_tokens": totals.get("cache_read_tokens"),
+            "tokens_out": totals.get("tokens_out"),
+            "total_tokens": totals.get("total_tokens"),
+            "cost_usd": totals.get("estimated_cost_usd"),
+            "cost_known": totals.get("cost_known"),
+        }
+        crosscheck_record["job_tokens"] = totals.get("total_tokens")
+        crosscheck_record["job_seconds"] = run["seconds"]
+        crosscheck_record["summary"] = crosscheck_mod.summarise_findings(
+            crosscheck_record.get("findings"))
+        try:
+            crosscheck_mod.save_artifact(workspace, crosscheck_record)
+        except Exception:
+            pass
+        run["crosscheck"] = crosscheck_record
     execution_rows = [
         {"label": "builder", "seconds": builder.get("seconds"),
          "cost": builder.get("estimated_cost_usd"), "status": builder.get("status")}
@@ -9265,14 +9644,15 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     reviewer_pending = bool(run.get("reviewer_attention"))
     current_status = run.get("status")
     hard_stop = current_status in ("cancelled", "deadline_exceeded",
-                                   "budget_exceeded", "no_balance", "error")
+                                   "budget_exceeded", "no_balance", "error",
+                                   "crosscheck_below_threshold")
     review_entries = [item for item in review_rounds
                       if item.get("kind") == "review"]
     review_recorded = bool(review_entries)
     run["review_recorded"] = review_recorded if independent else None
     forced_review_error = False
     if (independent and not hard_stop and not gate_blocked
-            and not reviewer_pending):
+            and not crosscheck_failed and not reviewer_pending):
         in_flight = bool(run.get("review_in_flight"))
         unrecorded = (review_status not in ("disabled", "declined")
                       and not review_recorded)
@@ -9446,10 +9826,21 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                              or str(args.get("_canonical_workspace") or ""))
                 install = pipeline_mod.install_pending(
                     cfg, canonical, run.get("id") or "")
+                if (isinstance(install, dict)
+                        and str(install.get("status") or "") ==
+                        "serial_reintegration"):
+                    install = pipeline_mod.serial_reintegrate(
+                        cfg, canonical, run.get("id") or "")
                 if isinstance(install, dict):
                     run["pipeline"]["install"] = install
                     install_status = str(install.get("status") or "")
-                    if install_status in ("conflict", "error"):
+                    if install_status in ("installed_serial", "manual"):
+                        run["pipeline"]["integration"] = {
+                            "resolution": install.get("resolution"),
+                            "reason": install.get("reason"),
+                            "stray_files": install.get("stray_files") or [],
+                        }
+                    if install_status in ("conflict", "error", "manual"):
                         conflict = install.get("conflict") or {}
                         run["status"] = "error"
                         run["stop_reason"] = "install_conflict"
@@ -9475,6 +9866,16 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     str(exc))[:500]
             try:
                 pipeline_mod.finalize_run(run, cfg, workspace)
+            except Exception:
+                pass
+            try:
+                integration = (run.get("pipeline") or {}).get("integration") or {}
+                run["parallel"]["conflicts"] = list(
+                    (run.get("pipeline") or {}).get("stray_files") or [])
+                run["parallel"]["resolution"] = integration.get("resolution")
+                run["parallel"]["install"] = (
+                    (run.get("pipeline") or {}).get("install") or {}).get(
+                        "status")
             except Exception:
                 pass
 

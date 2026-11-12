@@ -176,6 +176,55 @@ TOOLS = [
             "reviewer_provider": {"type": "string", "description": (
                 "Optional per-job reviewer provider name, used with "
                 "reviewer_model.")},
+            "mode": {"type": "string", "enum": ["standard", "crosscheck"],
+                     "description": (
+                         "Job mode. `crosscheck` runs the opt-in crew build/"
+                         "cross-check gate: 2 crews x 4 agents by default, "
+                         "N independent parts with disjoint write sets from "
+                         "PLAN.json, a different checker crew per part, and a "
+                         "connector-computed 0-10 score. Omit to use "
+                         "`default_mode` config (empty/standard keeps existing "
+                         "behaviour exactly).")},
+            "crosscheck_threshold": {"type": "number", "minimum": 0, "maximum": 10,
+                                     "description": (
+                                         "Crew-gate score a crosscheck job must reach "
+                                         "(default 10.0; 10.0 requires all five "
+                                         "connector conditions).")},
+            "crosscheck_crews": {"type": "integer", "minimum": 2, "maximum": 8,
+                                 "description": "Builder/checker crews (default 2)."},
+            "crosscheck_crew_size": {"type": "integer", "minimum": 1, "maximum": 16,
+                                     "description": (
+                                         "Agents per crew when `subagents` is omitted "
+                                         "(default 4). An explicit `subagents` value is "
+                                         "split evenly instead.")},
+            "crosscheck_max_rounds": {"type": "integer", "minimum": 1, "maximum": 10,
+                                      "description": (
+                                          "Initial build/check plus focused fix rounds; "
+                                          "then status crosscheck_below_threshold "
+                                          "(default 3).")},
+            "audit_review": {"type": "boolean", "description": (
+                "One-shot audit by the normally configured reviewer after a passing "
+                "crew gate (default on in crosscheck mode).")},
+            "audit_sample_rate": {"type": "number", "minimum": 0, "maximum": 1,
+                                  "description": (
+                                      "Low-risk audit sampling rate (default 1.0; 0.2 = "
+                                      "1 in 5). Risky jobs are never sampled out.")},
+            "audit_spot_requirements": {"type": "integer", "minimum": 0, "maximum": 20,
+                                        "description": (
+                                            "Requirements the audit re-runs by evidence "
+                                            "(default 3, seeded).")},
+            "audit_spot_fixes": {"type": "integer", "minimum": 0, "maximum": 20,
+                                 "description": (
+                                     "Confirmed fixes the audit re-runs by evidence "
+                                     "(default 2, seeded).")},
+            "auto_parallel": {"type": "boolean", "description": (
+                "Infer a write set when none is declared and allow disjoint, confident "
+                "jobs in the same repo to run in parallel worktrees (default true; "
+                "overlap or low confidence stays serial).")},
+            "auto_parallel_min_confidence": {"type": "number", "minimum": 0, "maximum": 1,
+                                             "description": (
+                                                 "Minimum inferred write-set confidence "
+                                                 "for parallel eligibility (default 0.85).")},
             "quality": {"type": "boolean", "description": (
                 "Run the builder quality loop (default true for real work, false for simple questions).")},
             "quality_rounds": {"type": "integer", "description": (
@@ -246,8 +295,8 @@ TOOLS = [
                               "Repo-relative file prefixes or globs this job expects to "
                               "write, e.g. [\"src/api/\"]. Enables pipeline eligibility: "
                               "a disjoint job may start during another job's review in "
-                              "its own worktree. Omit unless you declare it; without a "
-                              "declaration the job runs serially as before.")},
+                              "its own worktree. Omit to let the connector infer a write "
+                              "set; overlapping or low-confidence jobs stay serial.")},
             "slice": {"type": "string", "description": (
                 "Optional slice name from SLICES.md. Resolved to that slice's Writes "
                 "write-set when no explicit write_set is given.")},

@@ -228,7 +228,7 @@ class PlanTests(unittest.TestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_new_defaults_and_coercion(self):
-        self.assertEqual(SERVER_VERSION, "3.14.1")
+        self.assertEqual(SERVER_VERSION, "3.14.2")
         self.assertEqual(DEFAULTS["builder_model"], "")
         self.assertIs(DEFAULTS["builder_allow_unlisted_models"], False)
         self.assertEqual(DEFAULTS["builder_model_max_slices"], 8)

@@ -5,6 +5,54 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.14.2
+
+3.14.2: opt-in crosscheck crews, a one-shot audit after the crew gate, and automatic parallel jobs.
+
+- **Crosscheck mode.** `mode="crosscheck"` (or config `default_mode`) runs
+  two crews by default, splits the task into at least two independent parts
+  from `PLAN.json` write sets, builds all parts, then cross-checks every part
+  with a crew that did not build it. Breakers probe edge cases and error
+  paths; spec checkers walk each brief requirement. Findings carry
+  `file:line` plus command/output evidence and are tagged BLOCKING or minor.
+  Original builders fix, the finding crew confirms.
+- **Connector-owned crew score.** Five equally weighted conditions (2.0 each)
+  cover connector-run tests, every brief requirement checked by a
+  non-building crew with evidence, zero open BLOCKING, every minor fixed or
+  justified, and every fix confirmed by the finding crew. 10.0 requires all
+  five; lower thresholds use the deterministic partial-credit formula.
+  `crosscheck_threshold` defaults to 10.0 and is validated to 0-10.
+  `crosscheck_max_rounds` defaults to 3; an unmet gate stops with
+  `status="crosscheck_below_threshold"`.
+- **Rescue inside crosscheck.** The existing finisher completes a stalled or
+  time-limited part, the part is recorded as rescued, and a different crew
+  still checks it. Per-job records include parts, crew assignments, raw and
+  unique findings (real/false alarm, breaker/spec), rounds, score, rescues,
+  time and tokens.
+- **Audit after a passing crew gate.** The job's normally configured reviewer
+  runs once with the diff since job start, crew evidence and the connector
+  test result. It spot-checks `audit_spot_requirements` (default 3) and
+  `audit_spot_fixes` (default 2) by re-running evidence commands and reports
+  score, blocking items and crew claims that did not hold. Risk detection
+  never samples the audit out and records `risky: yes/no + why`;
+  `audit_sample_rate` defaults to 1.0. A failed crew claim forces full audits
+  for the next five crosscheck jobs. Audit blocking gets one crew fix round
+  and a focused re-audit.
+- **Automatic parallel jobs.** Without a declared `write_set`, the connector
+  infers files/dirs and a confidence from the brief, `PLAN.json` and
+  `SLICES.md`. Same-repo jobs run in parallel only when the inferred sets are
+  disjoint and confident; overlap, low confidence or a wide brief stays
+  serial. Different workspaces are independent. Each parallel job uses its
+  own worktree. A diff outside the inferred set, or a failed
+  `git apply --check`, is never merged blindly: it is re-integrated serially
+  with a recorded reason.
+- Tests cover the scoring formula, threshold validation, max-round stop,
+  N-part split and crew pairing, rescue, risk detection and sampling,
+  audit spot checks, write-set inference, disjoint/overlap scheduling and
+  stray-diff re-integration, on macOS, Linux and Windows.
+- No behaviour change when `mode` is unset and `default_mode` is empty;
+  explicit `write_set` and pipeline precedence are unchanged.
+
 ## 3.14.1
 
 3.14.1: finish the loop-guard ladder and record its evidence.

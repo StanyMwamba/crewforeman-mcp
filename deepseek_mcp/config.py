@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.14.1"
+SERVER_VERSION = "3.14.2"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -340,6 +340,21 @@ DEFAULTS = {
     "pipeline_max_pending_patches": 8,
     "pipeline_queue_scan": "head",
     "pipeline_patch_retention_days": 3,
+    # v3.14.2 crosscheck/audit/automatic-parallel features.
+    "default_mode": "",
+    "crosscheck_threshold": 10.0,
+    "crosscheck_crews": 2,
+    "crosscheck_crew_size": 4,
+    "crosscheck_max_rounds": 3,
+    "audit_review": None,
+    "audit_sample_rate": 1.0,
+    "audit_spot_requirements": 3,
+    "audit_spot_fixes": 2,
+    "audit_forced_jobs": 5,
+    "audit_seed": 0,
+    "audit_risk_globs": [],
+    "auto_parallel": True,
+    "auto_parallel_min_confidence": 0.85,
     # v3.12.0 S1/S2: builder target, mixed-model plan and model-aware records.
     # Empty string means inherit (builder_* -> dsh_*).
     "builder_model": "",
@@ -666,6 +681,33 @@ ENV_MAP = {
     "DEEPSEEK_PIPELINE_QUEUE_SCAN": "pipeline_queue_scan",
     "DSH_PIPELINE_PATCH_RETENTION_DAYS": "pipeline_patch_retention_days",
     "DEEPSEEK_PIPELINE_PATCH_RETENTION_DAYS": "pipeline_patch_retention_days",
+    # v3.14.2 crosscheck/audit/automatic-parallel keys.
+    "DSH_DEFAULT_MODE": "default_mode",
+    "DEEPSEEK_DEFAULT_MODE": "default_mode",
+    "DSH_CROSSCHECK_THRESHOLD": "crosscheck_threshold",
+    "DEEPSEEK_CROSSCHECK_THRESHOLD": "crosscheck_threshold",
+    "DSH_CROSSCHECK_CREWS": "crosscheck_crews",
+    "DEEPSEEK_CROSSCHECK_CREWS": "crosscheck_crews",
+    "DSH_CROSSCHECK_CREW_SIZE": "crosscheck_crew_size",
+    "DEEPSEEK_CROSSCHECK_CREW_SIZE": "crosscheck_crew_size",
+    "DSH_CROSSCHECK_MAX_ROUNDS": "crosscheck_max_rounds",
+    "DEEPSEEK_CROSSCHECK_MAX_ROUNDS": "crosscheck_max_rounds",
+    "DSH_AUDIT_REVIEW": "audit_review",
+    "DEEPSEEK_AUDIT_REVIEW": "audit_review",
+    "DSH_AUDIT_SAMPLE_RATE": "audit_sample_rate",
+    "DEEPSEEK_AUDIT_SAMPLE_RATE": "audit_sample_rate",
+    "DSH_AUDIT_SPOT_REQUIREMENTS": "audit_spot_requirements",
+    "DEEPSEEK_AUDIT_SPOT_REQUIREMENTS": "audit_spot_requirements",
+    "DSH_AUDIT_SPOT_FIXES": "audit_spot_fixes",
+    "DEEPSEEK_AUDIT_SPOT_FIXES": "audit_spot_fixes",
+    "DSH_AUDIT_FORCED_JOBS": "audit_forced_jobs",
+    "DEEPSEEK_AUDIT_FORCED_JOBS": "audit_forced_jobs",
+    "DSH_AUDIT_SEED": "audit_seed",
+    "DEEPSEEK_AUDIT_SEED": "audit_seed",
+    "DSH_AUTO_PARALLEL": "auto_parallel",
+    "DEEPSEEK_AUTO_PARALLEL": "auto_parallel",
+    "DSH_AUTO_PARALLEL_MIN_CONFIDENCE": "auto_parallel_min_confidence",
+    "DEEPSEEK_AUTO_PARALLEL_MIN_CONFIDENCE": "auto_parallel_min_confidence",
 }
 
 BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "independent_review", "child_progress",
@@ -678,7 +720,7 @@ BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "i
              "health_gate", "allow_first_phase_overrun",
              "reserve_resume_slot", "review_preflight",
              "gate_enabled", "gate_secret_scan", "pipeline_enabled",
-             "pipeline_require_disjoint",
+             "pipeline_require_disjoint", "auto_parallel",
              "loop_guard_enabled", "loop_guard_confirm"}
 INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
              "restart_helper_attempts",
@@ -711,7 +753,9 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "history_model_max", "failure_notes_max_models",
             "failure_notes_model_min_runs", "backup_builder_min_attempts",
             "reviewer_max_preflights", "plan_optional_max_files",
-            "linux_min_abi"}
+            "linux_min_abi", "crosscheck_crews", "crosscheck_crew_size",
+            "crosscheck_max_rounds", "audit_spot_requirements",
+            "audit_spot_fixes", "audit_forced_jobs", "audit_seed"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request"),
              "quality_convergence": ("observe", "auto"),
@@ -737,7 +781,7 @@ ENUM_FALLBACKS = {
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "allowed_workspace_roots", "gate_secret_patterns",
              "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths",
-             "sandbox_extra_writes"}
+             "sandbox_extra_writes", "audit_risk_globs"}
 # Dict-valued keys keep JSON objects intact (never comma-split the text).
 DICT_KEYS = {"slice_models", "model_prices"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
@@ -762,7 +806,8 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "restart_helper_retry_seconds",
               "gate_timeout_seconds", "gate_secret_scan_budget_seconds",
               "loop_guard_poll_seconds",
-              "pipeline_min_remaining_usd",
+              "pipeline_min_remaining_usd", "crosscheck_threshold",
+              "audit_sample_rate", "auto_parallel_min_confidence",
               "backup_builder_max_cost_usd", "sandbox_probe_ttl"}
 PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",

@@ -1366,6 +1366,29 @@ class AdmissionController:
                 pass
         return True
 
+    def _parallel_decision(self, record, active):
+        try:
+            from . import writesets as writesets_mod
+            return writesets_mod.parallel_decision(record, active, self.cfg)
+        except Exception:
+            return {"parallel": False, "reason": "decision_error"}
+
+    def _note_parallel(self, record, decision):
+        if not isinstance(record, dict):
+            return
+        record["parallel"] = bool(decision.get("parallel"))
+        record["parallel_reason"] = decision.get("reason")
+        record["parallel_peers"] = list(decision.get("peers") or [])
+        record["parallel_write_set"] = list(decision.get("write_set") or [])
+        record["parallel_confidence"] = decision.get("confidence")
+        work_id = record.get("work_id")
+        if not work_id:
+            return
+        try:
+            self.store._save_item(str(work_id), record)
+        except Exception:
+            pass
+
     def _may_start(self, record):
         if not self._dependency_ready(record):
             return False
@@ -1382,6 +1405,13 @@ class AdmissionController:
                            if rec.get("pipeline_eligible")]
         if record.get("pipeline_eligible"):
             if any(not rec.get("pipeline_eligible") for rec in active):
+                return False
+            # v3.14.2: an eligible job may run beside another eligible job
+            # only when both write sets are inferred/declared, confident and
+            # disjoint. Unknown, wide or overlapping sets wait for a slot.
+            decision = self._parallel_decision(record, eligible_active)
+            self._note_parallel(record, decision)
+            if not decision.get("parallel"):
                 return False
         else:
             if eligible_active or self._patch_backlog(record) > 0:

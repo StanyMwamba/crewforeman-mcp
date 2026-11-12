@@ -1103,21 +1103,42 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
             canonical = os.path.abspath(os.path.expanduser(str(
                 call_args.get("workspace") or cfg.harness_workspace)))
             declared = pipeline_mod.declared_write_set(call_args, cfg)
-            pre_source = declared.get("source") in ("arg", "slice", "prompt")
+            source = declared.get("source") or "none"
+            try:
+                confidence = float(declared.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            auto_parallel = _cfg_get(cfg, "auto_parallel", True)
+            try:
+                min_confidence = float(_cfg_get(
+                    cfg, "auto_parallel_min_confidence", 0.85))
+            except (TypeError, ValueError):
+                min_confidence = 0.85
+            inferred_ok = (source == "inferred" and bool(auto_parallel)
+                           and confidence >= min_confidence)
+            pre_source = (source in ("arg", "slice", "prompt")
+                          or inferred_ok)
             if not (pre_source and declared.get("write_set")):
-                # No pre-builder declaration: not pipeline-eligible, and do
-                # not run any git probe. This preserves the serial path
+                # No safe pre-builder declaration: not pipeline-eligible, and
+                # do not run any git probe. This preserves the serial path
                 # byte-for-byte (and keeps existing job tests subprocess-free).
+                reason = "no_declared_write_set"
+                if source == "inferred":
+                    reason = ("inferred_low_confidence"
+                              if confidence < min_confidence
+                              else "auto_parallel_disabled")
                 pipeline_info = {
                     "enabled": bool(_cfg_get(cfg, "pipeline_enabled", True)),
                     "eligible": False, "decided": True,
-                    "unavailable_reason": "no_declared_write_set",
+                    "unavailable_reason": reason,
                     "slot": "base", "worktree": None,
                     "canonical_workspace": canonical,
                     "base_ref": None, "base_commit": None,
                     "write_set": list(declared.get("write_set") or []),
-                    "write_set_source": declared.get("source") or "none",
+                    "write_set_source": source,
                     "write_set_impl": declared.get("impl") or "builtin",
+                    "write_set_confidence": confidence,
+                    "write_set_basis": declared.get("basis"),
                     "write_set_invalid": declared.get("invalid") or [],
                     "install": {"status": "n/a", "applied": [],
                                 "reason": None},
@@ -1390,6 +1411,9 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                     "write_set": list(pipeline_info.get("write_set") or []),
                     "write_set_source": pipeline_info.get("write_set_source"),
                     "write_set_impl": pipeline_info.get("write_set_impl"),
+                    "write_set_confidence": pipeline_info.get(
+                        "write_set_confidence"),
+                    "write_set_basis": pipeline_info.get("write_set_basis"),
                     "pipeline_eligible": bool(pipeline_info.get("eligible")),
                     "pipeline_extra": False,
                     "base_commit": pipeline_info.get("base_commit"),

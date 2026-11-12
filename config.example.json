@@ -163,5 +163,16 @@
   "pipeline_min_remaining_usd": 1.0,
   "pipeline_max_pending_patches": 8,
   "pipeline_queue_scan": "head",
-  "pipeline_patch_retention_days": 3
+  "pipeline_patch_retention_days": 3,
+  "default_mode": "",
+  "crosscheck_threshold": 10.0,
+  "crosscheck_crews": 2,
+  "crosscheck_crew_size": 4,
+  "crosscheck_max_rounds": 3,
+  "audit_review": null,
+  "audit_sample_rate": 1.0,
+  "audit_spot_requirements": 3,
+  "audit_spot_fixes": 2,
+  "auto_parallel": true,
+  "auto_parallel_min_confidence": 0.85
 }

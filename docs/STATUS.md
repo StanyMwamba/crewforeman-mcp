@@ -1,4 +1,4 @@
-# Run Status Vocabulary (v3.14.1)
+# Run Status Vocabulary (v3.14.2)
 
 `status.py` defines one flat vocabulary for terminal run status. A status is
 always a lowercase string; there is no enum and no `None`.
@@ -16,12 +16,14 @@ always a lowercase string; there is no enum and no `None`.
 | `budget_exceeded` | Stopped because the cost budget was exhausted. |
 | `gate_failed` | The deterministic gate (F1) failed after its revision cap; the paid reviewer was never called. `review_status` is `skipped` and `quality_score` is `None`. |
 | `stopped` | The loop guard stopped the attempt after repeated work and a re-plan did not recover; the review was skipped. `review_status` is `skipped`. |
+| `crosscheck_below_threshold` | The opt-in crew cross-check gate stayed below `crosscheck_threshold` after `crosscheck_max_rounds`; the audit was skipped, `quality_score` is `None`, and `CROSSCHECK.json` lists the unmet conditions. |
 | `needs_input` | Non-terminal pause: one validated question is waiting for a client answer. The work item is held, not finished. Resume with the option shown by `deepseek_job_status`. |
 
 `SUCCESS_STATUSES` contains `ok`, `ok_rescued`, `ok_unreviewed`,
 `ok_below_gate` (the run produced usable output, even if not fully gated).
 `FAILURE_STATUSES` contains `error`, `no_balance`, `cancelled`,
-`deadline_exceeded`, `budget_exceeded`, `gate_failed`, `stopped`. `needs_input` is in
+`deadline_exceeded`, `budget_exceeded`, `gate_failed`, `stopped`,
+`crosscheck_below_threshold`. `needs_input` is in
 `STATUSES` but in neither set: it is a non-terminal hold. `final_status` never
 returns it.
 

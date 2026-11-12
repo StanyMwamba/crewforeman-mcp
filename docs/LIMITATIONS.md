@@ -1,8 +1,8 @@
-# Known limitations and failure modes (3.14.1)
+# Known limitations and failure modes (3.14.2)
 
 Only limitations that remain in this version are listed here.
 
-## Platform boundaries (3.14.1)
+## Platform boundaries (3.14.2)
 
 Every sentence below is tied to the boundary evidence for that OS. If a gate is
 red, or a claim has not been run yet, the claim is narrowed, never widened.

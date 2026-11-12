@@ -1,6 +1,6 @@
 # CrewForeman [![CI](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml)
 
-CrewForeman 3.14.1 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.14.2 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |
@@ -13,6 +13,8 @@ CrewForeman 3.14.1 is a local stdio MCP server. It runs Harness on your machine,
 Use a reviewer from any vendor - see [docs/REVIEWER.md](docs/REVIEWER.md).
 
 The lead sizes the team and merges the best candidates - see [docs/TEAMS.md](docs/TEAMS.md).
+Opt-in `mode="crosscheck"` builds independent parts with one crew and cross-checks each part with another; the connector scores the gate - see [docs/CROSSCHECK.md](docs/CROSSCHECK.md).
+Jobs without a write set can run in parallel when the inferred sets are disjoint and confident - see [docs/PARALLEL.md](docs/PARALLEL.md).
 
 ## Method
 CrewForeman creates one work item for each brief. If the same work is already running, it returns that run. Otherwise it sizes a team and plans waves, enforcing a deterministic gate (secrets, lint, tests) before any cross-vendor review.

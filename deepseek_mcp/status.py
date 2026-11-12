@@ -22,6 +22,7 @@ STATUSES = (
     "gate_failed",
     "stopped",
     "needs_input",
+    "crosscheck_below_threshold",
 )
 
 # Convenience groupings for clients and dashboards.  A successful status means
@@ -31,7 +32,8 @@ SUCCESS_STATUSES = frozenset(("ok", "ok_rescued", "ok_unreviewed",
                               "ok_below_gate"))
 FAILURE_STATUSES = frozenset(("error", "no_balance", "cancelled",
                               "deadline_exceeded", "budget_exceeded",
-                              "gate_failed", "stopped"))
+                              "gate_failed", "stopped",
+                              "crosscheck_below_threshold"))
 
 STATUS_MEANING = {
     "ok": "finished and, when a review ran, accepted at or above the gate with zero blocking defects.",
@@ -46,6 +48,7 @@ STATUS_MEANING = {
     "gate_failed": "the deterministic gate exhausted its revision budget; the paid reviewer was not called.",
     "stopped": "the loop guard stopped the attempt after repeated work and a re-plan did not recover; the review was skipped.",
     "needs_input": "the job paused on one validated question and is waiting for a client answer; resume it.",
+    "crosscheck_below_threshold": "the crew cross-check score stayed below crosscheck_threshold after the configured rounds; the audit was skipped and the report lists the unmet conditions.",
 }
 
 
@@ -79,6 +82,9 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "error", STATUS_MEANING["error"], None
     if gate_status == "gate_failed":
         return "gate_failed", STATUS_MEANING["gate_failed"], None
+    if gate_status == "crosscheck_below_threshold":
+        return ("crosscheck_below_threshold",
+                STATUS_MEANING["crosscheck_below_threshold"], False)
     if review_status == "declined":
         return ("ok_unreviewed", "review declined by user", False)
     if review_recorded is False and review_status != "disabled":

@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.14.1)
+# Operations: configuration, safety, budgets, traces and retention (v3.14.2)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -558,7 +558,7 @@ patch at the FIFO head is a drain point: later patches stay pending. Set
 `pipeline_install="manual"` to stop canonical installs while inspecting
 patches; set `pipeline_enabled=false` to stop new starts.
 
-## Loop guard (3.14.1)
+## Loop guard (3.14.2)
 
 Builder and finisher phases feed raw Harness events and the workspace digest
 to a deterministic detector (`deepseek_mcp/loop_guard.py`). It counts four
