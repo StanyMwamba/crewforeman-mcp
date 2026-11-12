@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,33 @@ class EventsTestCase(unittest.TestCase):
         self.assertEqual(events.EventLog(self.root / "missing").read_since(0), [])
         self.assertEqual(events.EventLog(self.root / "missing").next_seq(), 0)
 
+    def test_append_fails_closed_when_lock_cannot_open(self):
+        # Raise from __enter__, not from the factory call: the deleted
+        # d24479b fallback caught exactly this TimeoutError and yielded
+        # without the lock, so a call-time exception would not exercise the
+        # regression at all.
+        lock_path = self.log.lock_path
+
+        class FailingLock(object):
+            def __enter__(self):
+                raise TimeoutError("cannot open lock %s" % lock_path)
+
+            def __exit__(self, *exc_info):
+                return False
+
+        # A lock that cannot be opened must never degrade into an unlocked
+        # append: no seq is consumed and nothing reaches the journal.
+        self.log.append("phase", {"n": 1})
+        with mock.patch.object(events.platforms, "file_lock",
+                               return_value=FailingLock()):
+            with self.assertRaises(TimeoutError):
+                self.log.append("phase", {"n": 2})
+        self.assertEqual(len(self.log.read_since(0)), 1)
+        self.assertEqual(self.log.next_seq(), 1)
+        # The lock is usable again once the failure clears.
+        self.log.append("phase", {"n": 3})
+        self.assertEqual(self.log.next_seq(), 2)
+
     # ------------------------------------------------------------- concurrency
     def test_seq_monotonic_under_concurrent_appends(self):
         count_threads, per_thread = 8, 3
@@ -136,6 +164,54 @@ class EventsTestCase(unittest.TestCase):
         self.assertEqual(seqs, list(range(1, count_threads * per_thread + 1)))
         self.assertEqual(len(seqs), len(set(seqs)))
         self.assertEqual(self.log.next_seq(), count_threads * per_thread)
+
+    def test_seq_monotonic_under_16x50_appends(self):
+        # Higher-contention version of the 8x3 test above.  The raw file is
+        # inspected in write order: only an actually held lock can keep both
+        # sequence allocation and the O_APPEND write atomic.
+        count_threads, per_thread = 16, 50
+        total = count_threads * per_thread
+        errors = []
+        barrier = threading.Barrier(count_threads)
+
+        def worker(index):
+            try:
+                barrier.wait(timeout=30)
+                for n in range(per_thread):
+                    self.log.append("progress", {"thread": index, "n": n})
+            except Exception as exc:  # surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,),
+                                    name="event-appender-%d" % index)
+                   for index in range(count_threads)]
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual([t.name for t in threads if t.is_alive()], [],
+                         "appender thread(s) did not finish within 60s")
+        self.assertFalse(errors, "concurrent append raised: %r" % (errors,))
+
+        raw_lines = [line for line in self.log.events_path.read_text(
+            encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(raw_lines), total)
+        seqs = [json.loads(line)["seq"] for line in raw_lines]
+        for line_number, (previous, current) in enumerate(zip(seqs, seqs[1:])):
+            self.assertLess(
+                previous, current,
+                "seq not strictly increasing in file order at lines %d->%d: "
+                "%r -> %r" % (line_number + 1, line_number + 2,
+                              previous, current))
+        self.assertEqual(len(set(seqs)), total)
+        self.assertEqual(set(seqs), set(range(1, total + 1)))
+        self.assertEqual(self.log.next_seq(), total)
+        self.assertEqual(len(self.log.read_since(0)), total)
+        self.assertLess(elapsed, 10.0,
+                        "16x50 appends took %.3fs (limit 10.0s)" % elapsed)
 
     # ---------------------------------------------------------------- rotation
     def test_rotation_preserves_cursor_semantics(self):

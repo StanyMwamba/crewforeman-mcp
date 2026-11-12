@@ -225,7 +225,14 @@ class EventLog(object):
     # -- locking -------------------------------------------------------
     @contextlib.contextmanager
     def _lock(self):
-        """Acquire the per-directory advisory lock.
+        """Acquire the per-directory advisory lock for one append.
+
+        Seq allocation (read ``_max_seq`` then write ``seq + 1``) and rotation
+        are read-modify-write sequences, so they require real mutual
+        exclusion.  If the lock cannot be opened or acquired the append fails
+        with ``TimeoutError`` instead of proceeding unlocked: an unlocked
+        append can duplicate a ``seq`` or rotate underneath another writer,
+        corrupting the journal.
 
         An O_CREAT|O_EXCL existence lock cannot be shared with WorkStore's
         lock file: on Windows a reader can block the holder's unlink, and a
@@ -236,21 +243,8 @@ class EventLog(object):
             self.work_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        lock = platforms.file_lock(self.lock_path, timeout=_LOCK_TIMEOUT)
-        try:
-            lock.__enter__()
-        except TimeoutError as exc:
-            # A filesystem that cannot create the lock must not prevent
-            # journal writes (the append itself is still O_APPEND).  A real
-            # contention timeout must still surface.
-            if "cannot open lock" not in str(exc):
-                raise
+        with platforms.file_lock(self.lock_path, timeout=_LOCK_TIMEOUT):
             yield
-            return
-        try:
-            yield
-        finally:
-            lock.__exit__(None, None, None)
 
     # -- reading -------------------------------------------------------
     @staticmethod

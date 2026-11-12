@@ -16,7 +16,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import weakref
 from pathlib import Path
 
 WINDOWS = "Windows"
@@ -791,9 +793,81 @@ def private_permissions(path, system=None, is_dir=False):
         return False
 
 
+# Same-process lock registry.  The kernel lock alone is not enough: on
+# Windows a second open of the same lock file can fail transiently with
+# PermissionError (sharing violation / delete pending / AV filter), and that
+# happens *before* msvcrt.locking can serialise anything.  A per-path
+# RLock makes same-process callers queue before they touch the file.
+#
+# Weak values keep the registry from growing without bound in a long-lived
+# server.  An entry cannot be reaped while it matters: the holder keeps a
+# strong reference for the whole ``with`` block, and a waiter blocked in
+# ``acquire`` keeps one in its frame.  Creation is guarded, so two threads
+# cannot end up with two different RLocks for one live key.
+_PROCESS_LOCKS = weakref.WeakValueDictionary()
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_OPEN_RETRY_INITIAL = 0.01
+_OPEN_RETRY_MAX = 0.2
+
+
+def _same_process_lock(path):
+    """Return the process-wide RLock shared by every user of *path*."""
+    # Windows paths are case-insensitive: "C:\A\.lock" and "c:\a\.lock" must
+    # map to one lock.  POSIX normcase is the identity, as intended.
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _PROCESS_LOCKS_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
+
+
+def _open_lock_file(path, deadline):
+    """Open the lock file, retrying transient ``PermissionError``.
+
+    A persistent error still surfaces as the built-in ``TimeoutError`` once
+    *deadline* passes (the sleep never runs past it); callers key on that
+    type and message.  Only
+    ``PermissionError`` is retried: ENOENT/ENOTDIR and friends are real.
+    """
+    delay = _OPEN_RETRY_INITIAL
+    while True:
+        try:
+            # 0600: a lock file is private state and must not be group/other
+            # readable just because the process umask is 022.
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        except PermissionError as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError("cannot open lock %s: %s" % (path, exc))
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2.0, _OPEN_RETRY_MAX)
+            continue
+        except OSError as exc:
+            raise TimeoutError("cannot open lock %s: %s" % (path, exc))
+        try:
+            handle = os.fdopen(fd, "a+b")
+        except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise TimeoutError("cannot open lock %s: %s" % (path, exc))
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
+        return handle
+
+
 @contextlib.contextmanager
 def file_lock(path, timeout=10.0, system=None):
     """Bounded exclusive lock: fcntl.flock or msvcrt.locking.
+
+    Two layers: a per-path ``threading.RLock`` serialises threads of this
+    process (so two appenders cannot race even if the OS open would fail
+    transiently), then the advisory OS lock serialises processes.
 
     Raises the built-in ``TimeoutError`` after *timeout* seconds.  The lock
     file itself is kept (unlinking a locked file is racy); callers own the
@@ -806,20 +880,24 @@ def file_lock(path, timeout=10.0, system=None):
         pass
     system = normalize_system(system)
     deadline = time.time() + max(0.0, float(timeout))
+
+    # Same-process serialisation runs BEFORE the open: while a sibling owns
+    # this path it may be mid-rotation, so the file can legitimately be
+    # rename-pending and opening it would race the sibling.  Bounded by the
+    # same deadline so callers still get TimeoutError.
+    process_lock = _same_process_lock(path)
+    remaining = deadline - time.time()
+    if remaining > 0:
+        acquired_process = process_lock.acquire(timeout=remaining)
+    else:
+        acquired_process = process_lock.acquire(False)
+    if not acquired_process:
+        raise TimeoutError("lock timeout: %s" % path)
+
     handle = None
-    try:
-        # 0600: a lock file is private state and must not be group/other
-        # readable just because the process umask is 022.
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-        handle = os.fdopen(fd, "a+b")
-        try:
-            os.chmod(str(path), 0o600)
-        except OSError:
-            pass
-    except OSError as exc:
-        raise TimeoutError("cannot open lock %s: %s" % (path, exc))
     acquired = False
     try:
+        handle = _open_lock_file(path, deadline)
         if system == WINDOWS:
             try:
                 import msvcrt
@@ -890,9 +968,14 @@ def file_lock(path, timeout=10.0, system=None):
             except Exception:
                 pass
         try:
-            handle.close()
+            if handle is not None:
+                handle.close()
         except Exception:
             pass
+        # Last: releasing any earlier would let a sibling thread open the
+        # same path while this thread still holds the OS lock or an open
+        # handle, reintroducing the race this lock exists to prevent.
+        process_lock.release()
 
 
 def secure_tree(root, system=None):

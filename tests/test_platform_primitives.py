@@ -7,7 +7,10 @@ import contextlib
 import ctypes
 import os
 import stat
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -104,6 +107,199 @@ class FileLockTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 with platforms.file_lock(str(parent / "x.lock"), timeout=0.05):
                     pass
+
+
+class FileLockConcurrencyTests(unittest.TestCase):
+    def test_same_process_threads_are_serialized(self):
+        threads = 8
+        iterations = 6
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "threads.lock"
+            guard = threading.Lock()
+            state = {"inside": 0, "max": 0, "entries": 0}
+            errors = []
+
+            def worker():
+                try:
+                    for _ in range(iterations):
+                        with platforms.file_lock(str(path), timeout=10):
+                            with guard:
+                                state["inside"] += 1
+                                inside = state["inside"]
+                                state["entries"] += 1
+                                state["max"] = max(state["max"], inside)
+                            try:
+                                self.assertEqual(inside, 1)
+                                time.sleep(0.002)
+                            finally:
+                                with guard:
+                                    state["inside"] -= 1
+                except BaseException as exc:  # reported below
+                    errors.append(exc)
+
+            started = time.monotonic()
+            workers = [threading.Thread(target=worker)
+                       for _ in range(threads)]
+            for thread in workers:
+                thread.start()
+            for thread in workers:
+                thread.join()
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(errors, [])
+            self.assertEqual(state["entries"], threads * iterations)
+            self.assertEqual(state["max"], 1)
+            self.assertLess(elapsed, 5.0)
+
+    def test_same_process_open_window_is_serialized(self):
+        # The RLock must cover os.open itself.  On Windows a second open of
+        # the same lock file can fail transiently; the OS lock is acquired
+        # only after the open, so it cannot protect that window.  Sleep
+        # inside the patched open to make an unserialized window visible;
+        # unfixed code shows max concurrency > 1 here.
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "open-window.lock"
+            guard = threading.Lock()
+            state = {"active": 0, "max": 0, "opens": 0}
+            real_open = os.open
+
+            def observed_open(file, flags, mode=0o777, *args, **kwargs):
+                with guard:
+                    state["active"] += 1
+                    state["opens"] += 1
+                    state["max"] = max(state["max"], state["active"])
+                try:
+                    time.sleep(0.005)
+                    return real_open(file, flags, mode, *args, **kwargs)
+                finally:
+                    with guard:
+                        state["active"] -= 1
+
+            def worker():
+                with platforms.file_lock(str(path), timeout=10):
+                    time.sleep(0.001)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            with mock.patch.object(platforms.os, "open", new=observed_open):
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            self.assertEqual(state["opens"], len(threads))
+            self.assertEqual(state["max"], 1,
+                             "lock-file open window was not serialized")
+
+    def test_transient_permission_error_on_open_is_retried(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "transient.lock"
+            real_open = os.open
+            attempts = []
+
+            def flaky_open(file, flags, mode=0o777, *args, **kwargs):
+                attempts.append(file)
+                if len(attempts) == 1:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real_open(file, flags, mode, *args, **kwargs)
+
+            patched = mock.Mock(side_effect=flaky_open)
+            acquired = []
+            with mock.patch.object(platforms.os, "open", new=patched):
+                with platforms.file_lock(str(path), timeout=2.0) as handle:
+                    self.assertIsNotNone(handle)
+                    acquired.append(True)
+
+            self.assertEqual(acquired, [True])
+            self.assertEqual(patched.call_count, 2)
+
+    def test_persistent_permission_error_raises_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "persistent.lock"
+
+            def denied_open(file, flags, mode=0o777, *args, **kwargs):
+                raise PermissionError(13, "Permission denied", str(path))
+
+            patched = mock.Mock(side_effect=denied_open)
+            started = time.monotonic()
+            with mock.patch.object(platforms.os, "open", new=patched):
+                with self.assertRaises(TimeoutError) as caught:
+                    with platforms.file_lock(str(path), timeout=0.25):
+                        pass
+            elapsed = time.monotonic() - started
+
+            self.assertIn("cannot open lock", str(caught.exception))
+            self.assertGreaterEqual(elapsed, 0.12)
+            # Budget (0.25s) plus scheduling slack, not 5x.
+            self.assertLess(elapsed, 0.35)
+            self.assertGreaterEqual(patched.call_count, 2)
+
+    def test_process_lock_released_when_open_fails(self):
+        # The outer finally must release the process RLock even when
+        # _open_lock_file raises.  Assert the release call directly: a
+        # same-thread reacquire cannot prove it (RLock is reentrant) and a
+        # later cross-thread probe cannot either, because an unreferenced
+        # leaked lock is reaped from the weak registry.
+        class TrackingLock(object):
+            def __init__(self):
+                self._lock = threading.RLock()
+                self.releases = 0
+
+            def acquire(self, *args, **kwargs):
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self):
+                self.releases += 1
+                return self._lock.release()
+
+        tracker = TrackingLock()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "release.lock"
+            with mock.patch.object(platforms, "_same_process_lock",
+                                   return_value=tracker), \
+                    mock.patch.object(
+                        platforms.os, "open",
+                        side_effect=PermissionError(13, "denied",
+                                                    str(path))):
+                with self.assertRaises(TimeoutError):
+                    with platforms.file_lock(str(path), timeout=0.1):
+                        pass
+        self.assertEqual(tracker.releases, 1,
+                         "process RLock was not released on failed open")
+
+    def test_lock_is_released_when_body_raises(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "raised.lock"
+            with self.assertRaises(RuntimeError):
+                with platforms.file_lock(str(path), timeout=1.0):
+                    raise RuntimeError("boom")
+            # A leaked RLock would make this bounded reacquire time out.
+            with platforms.file_lock(str(path), timeout=1.0) as handle:
+                self.assertIsNotNone(handle)
+
+    def test_windows_branch_uses_msvcrt_lock_and_unlock(self):
+        # The Windows branch cannot run on this host, so inject a fake
+        # msvcrt module and prove the branch still calls locking() at offset
+        # 0 with LK_NBLCK on acquire and LK_UNLCK on release.
+        class FakeMsvcrt(object):
+            LK_NBLCK = 2
+            LK_UNLCK = 0
+
+            def __init__(self):
+                self.calls = []
+
+            def locking(self, fd, mode, nbytes):
+                self.calls.append((mode, nbytes,
+                                   os.lseek(fd, 0, os.SEEK_CUR)))
+
+        fake = FakeMsvcrt()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "windows.lock"
+            with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+                with platforms.file_lock(str(path), timeout=1.0,
+                                         system="Windows") as handle:
+                    self.assertIsNotNone(handle)
+        self.assertEqual(fake.calls,
+                         [(FakeMsvcrt.LK_NBLCK, 1, 0),
+                          (FakeMsvcrt.LK_UNLCK, 1, 0)])
 
 
 class PermissionTests(unittest.TestCase):
