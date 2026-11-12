@@ -657,13 +657,23 @@ def parse_audit(report_text, plan=None):
         except (ValueError, TypeError):
             data = None
     if isinstance(data, dict):
-        result["source"] = "json"
+        score = None
         try:
-            score = float(data.get("score"))
-            if math.isfinite(score):
-                result["score"] = round(max(0.0, min(10.0, score)), 2)
+            value = float(data.get("score"))
+            if math.isfinite(value):
+                score = round(max(0.0, min(10.0, value)), 2)
         except (TypeError, ValueError):
-            pass
+            score = None
+        # Fail closed on an empty or semantically empty object.  A clean audit
+        # still has to report its score plus the evidence lists the prompt
+        # asked for; otherwise it is not a usable audit.
+        has_lists = any(key in data for key in (
+            "blocking", "crew_claims_that_did_not_hold", "spot_checks"))
+        if score is None or not has_lists:
+            result["error"] = "incomplete_audit_json"
+            return result
+        result["source"] = "json"
+        result["score"] = score
         blocking, count = _coerce_blocking(data.get("blocking"))
         result["blocking"] = blocking
         result["blocking_count"] = count

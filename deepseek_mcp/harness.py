@@ -2780,7 +2780,7 @@ def _workspace_signature(workspace, limit=4000):
     return tuple(sorted(entries))
 
 
-_RESCUE_STOP_REASONS = ("stalled", "time_limit", "loop")
+_RESCUE_STOP_REASONS = ("stalled", "time_limit", "loop", "no_balance")
 
 
 def _loop_guard_blocks_finisher(stop_reason):
@@ -6281,7 +6281,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         path = _save_terminal(run, cfg, history_runs, trace, cancel_check)
         raise RuntimeError(message + _saved_note(run, path))
 
-    if builder.get("status") != "ok" and _is_no_balance(builder):
+    if builder.get("status") != "ok" and _is_no_balance(builder) and not cc:
         totals = _sum_executions(executions)
         run.update(totals)
         run["status"] = "no_balance"
@@ -6290,6 +6290,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         raise RuntimeError("%s%s" % (run["error"], _saved_note(run, path)))
 
     if builder.get("status") != "ok":
+        if cc and _is_no_balance(builder) and not stop_reason:
+            # In crosscheck mode the rescue team gets one chance to finish the
+            # work with a balanced provider; the gate then applies to rescued
+            # parts exactly as it does to a clean build.
+            stop_reason = "no_balance"
+            run["stop_reason"] = stop_reason
         if _loop_guard_blocks_finisher(stop_reason):
             # A hard loop stop is terminal for this phase: no finisher, and no
             # review of the partial/repetitive work.
@@ -7342,7 +7348,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     record.get("requirements"), tests,
                     record.get("rescues"),
                     threshold=cc.get("threshold", 10.0),
-                    brief_count=len(brief_reqs))
+                    brief_count=len(brief_reqs),
+                    brief_items=brief_reqs)
                 if plan_info.get("status") != "ok":
                     evaluation = dict(evaluation)
                     evaluation["score"] = 0.0
@@ -8999,6 +9006,18 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         run["audit"]["report_round"] = int(round_no)
                         if not audit_done.get("ran"):
                             audit_blocking = max(audit_blocking, 1)
+                            # Persist the synthetic blocking item so the next
+                            # round carries a focused re-audit block instead of
+                            # an ordinary review with an empty list.
+                            run["audit"]["blocking"] = (
+                                audit_done.get("blocking") or [{
+                                    "id": "AUD-0",
+                                    "text": ("audit section missing from the "
+                                             "reviewer report"),
+                                    "evidence": "",
+                                }])
+                            run["audit"]["blocking_count"] = audit_blocking
+                            run["audit"]["verdict"] = "blocked"
                             defects.append(
                                 "audit section missing from the reviewer report; "
                                 "the sampled audit must report score, blocking "

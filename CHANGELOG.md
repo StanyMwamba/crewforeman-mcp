@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   N-part split and crew pairing, rescue, risk detection and sampling,
   audit spot checks, write-set inference, disjoint/overlap scheduling and
   stray-diff re-integration, on macOS, Linux and Windows.
+- **Gate/audit hardening.** A BLOCKING finding closes only when explicitly
+  `fixed`; unknown or `justified` states stay open. Fix confirmation must come
+  from the part's paired checker, and requirement coverage is measured against
+  the connector's own brief ids. A semantically empty `AUDIT_JSON` fails closed.
+  A failed rescue does not mark a part rescued and caps the score at 8.0.
+- **Parallel/integration hardening.** A `PLAN.json` write set is
+  pipeline-eligible; explicit declarations are trusted at confidence 1.0; a
+  serial peer in another workspace no longer forces this workspace serial. A
+  stray patch now reaches `install_pending`, an apply-check failure is
+  serialised, and a three-way rebase snapshots and rolls back the canonical
+  tree instead of leaving conflict markers.
 - No behaviour change when `mode` is unset and `default_mode` is empty;
   explicit `write_set` and pipeline precedence are unchanged.
 

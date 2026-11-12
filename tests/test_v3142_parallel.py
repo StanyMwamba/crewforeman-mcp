@@ -126,6 +126,16 @@ class DecisionTests(unittest.TestCase):
         decision = writesets.parallel_decision(new, active, self.cfg)
         self.assertTrue(decision["parallel"])
 
+    def test_serial_peer_in_another_workspace_is_independent(self):
+        other = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, True))
+        new = _record(self.ws, ["src/a.py"], 0.92, run_id="new")
+        active = [_record(other, ["src/other.py"], 0.0, eligible=False,
+                          run_id="serial-other")]
+        decision = writesets.parallel_decision(new, active, self.cfg)
+        self.assertTrue(decision["parallel"], decision)
+        self.assertEqual(decision["reason"], "disjoint_confident")
+
     def test_queue_persists_confidence_for_inferred_parallel_job(self):
         store = admission.AdmissionStore(os.path.join(self.ws, "admission"))
         store.enqueue("w1", pipeline={
@@ -296,6 +306,32 @@ class PipelinePrepareTests(unittest.TestCase):
         git("add", "src/a.py")
         git("commit", "-q", "-m", "init")
 
+    def test_plan_write_set_becomes_pipeline_eligible(self):
+        cfg = {"state_dir": os.path.join(self.tmp.name, "state"),
+               "pipeline_enabled": True, "pipeline_isolation": "worktree",
+               "auto_parallel": True,
+               "auto_parallel_min_confidence": 0.85}
+        with open(os.path.join(self.repo, "PLAN.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"write_set": ["src/a.py"]}, handle)
+        subprocess.run(
+            ["git", "-c", "user.email=t@example.com",
+             "-c", "user.name=t", "add", "PLAN.json"],
+            cwd=self.repo, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@example.com",
+             "-c", "user.name=t", "commit", "-q", "-m", "plan"],
+            cwd=self.repo, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        args = {"prompt": "build it", "workspace": self.repo}
+        stub = {"id": "run-plan", "workspace": self.repo,
+                "pipeline": {"slot": "base"}}
+        pipe = pipeline.prepare_args(cfg, args, stub)
+        self.assertEqual(pipe["write_set_source"], "plan")
+        self.assertTrue(pipe["eligible"], pipe.get("unavailable_reason"))
+        self.assertEqual(pipe["write_set"], ["src/a.py"])
+
     def test_inferred_job_becomes_pipeline_eligible(self):
         cfg = {"state_dir": os.path.join(self.tmp.name, "state"),
                "pipeline_enabled": True, "pipeline_isolation": "worktree",
@@ -309,6 +345,32 @@ class PipelinePrepareTests(unittest.TestCase):
         self.assertEqual(pipe["write_set_source"], "inferred")
         self.assertIn("src/a.py", pipe["write_set"])
         self.assertGreaterEqual(pipe["write_set_confidence"], 0.85)
+
+
+class PendingSerialTests(unittest.TestCase):
+    def test_stray_serial_record_reaches_install_pending(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = os.path.join(tmp.name, "ws")
+        os.makedirs(ws)
+        cfg = {"state_dir": os.path.join(tmp.name, "state")}
+        directory = pipeline.patch_dir(cfg)
+        os.makedirs(directory)
+        data = b"diff --git a/a.py b/a.py\n"
+        with open(os.path.join(directory, "r1.patch"), "wb") as handle:
+            handle.write(data)
+        import hashlib
+        pipeline._save_json(os.path.join(directory, "r1.json"), {
+            "run_id": "r1", "patch": "r1.patch",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "queue_id": pipeline._queue_id(ws),
+            "status": "serial_reintegration", "files": ["a.py"],
+            "stray_files": ["a.py"], "created": "2026-01-01T00:00:00Z",
+            "integration_reason": "write_set_stray",
+        })
+        pending = pipeline._pending_records(cfg, ws)
+        self.assertEqual([row.get("run_id") for row in pending], ["r1"])
+        self.assertEqual(pending[0].get("status"), "serial_reintegration")
 
 
 class PipelinePrepareFrozenTests(unittest.TestCase):
@@ -354,6 +416,18 @@ class PipelineInferenceTests(unittest.TestCase):
         self.assertEqual(declared["impl"], "auto")
         self.assertGreaterEqual(declared["confidence"], 0.85)
         self.assertIn("src/a.py", declared["write_set"])
+
+    def test_explicit_write_set_is_fully_confident(self):
+        args = {"prompt": "Edit docs", "workspace": self.tmp.name,
+                "write_set": ["docs/"]}
+        declared = pipeline.declared_write_set(args, {})
+        self.assertEqual(declared["source"], "arg")
+        self.assertEqual(declared["confidence"], 1.0)
+        decision = writesets.parallel_decision(
+            _record(self.tmp.name, declared["write_set"], 1.0, run_id="new"),
+            [], {"auto_parallel": True,
+                 "auto_parallel_min_confidence": 0.85})
+        self.assertTrue(decision["parallel"], decision)
 
     def test_explicit_write_set_still_wins(self):
         args = {"prompt": "Edit `src/a.py`",

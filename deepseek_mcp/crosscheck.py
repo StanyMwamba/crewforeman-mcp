@@ -134,10 +134,13 @@ def _norm_path(value):
 
 
 def _path_key(value):
-    text = _norm_path(value)
-    if os.name == "nt":
-        return text.casefold()
-    return text
+    # Case-fold everywhere.  macOS volumes are commonly case-insensitive and a
+    # case-only collision would let two "independent" parts write one file.
+    return _norm_path(value).casefold()
+
+
+def _glob_prefix(value):
+    return re.split(r"[*?\[]", value, 1)[0].rstrip("/")
 
 
 def _path_lists_overlap(first, second):
@@ -152,6 +155,13 @@ def _path_lists_overlap(first, second):
                 return True
             if a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/"):
                 return True
+            # Glob entries are conservatively treated as overlapping when their
+            # literal prefixes nest; refusing to parallelise is the safe default.
+            if any(ch in a or ch in b for ch in "*?["):
+                pa, pb = _glob_prefix(a), _glob_prefix(b)
+                if (not pa or not pb or pa == pb
+                        or pa.startswith(pb + "/") or pb.startswith(pa + "/")):
+                    return True
     return False
 
 
@@ -233,7 +243,7 @@ def normalise_config(args, cfg):
         "mode": "crosscheck",
         "threshold": round(threshold, 2),
         "max_rounds": max_rounds,
-        "crews": crews,
+        "crews": len(sizes),
         "crew_size": crew_size,
         "subagents": subagents,
         "crew_sizes": sizes,
@@ -258,10 +268,13 @@ def split_subagents(total, crews):
     """Split ``total`` agents evenly across ``crews`` (sizes sum to total)."""
     total = max(2, int(total or 2))
     crews = max(2, int(crews or 2))
+    # Never inflate the caller's agent budget: a crew with no agent is simply
+    # not an active crew for this job.
+    crews = min(crews, total)
     base = total // crews
     extra = total % crews
     sizes = [base + (1 if index < extra else 0) for index in range(crews)]
-    return [max(1, size) for size in sizes]
+    return sizes
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +449,7 @@ def order_parts(parts):
 
 def crews_for(n_parts, cc):
     crews = _as_int((cc or {}).get("crews", DEFAULT_CREWS), DEFAULT_CREWS, 2, 8)
-    return ["crew-%d" % index for index in range(1, min(crews, max(2, n_parts)) + 1)]
+    return ["crew-%d" % index for index in range(1, crews + 1)]
 
 
 def pairing(parts, crew_ids, round_no=1):
@@ -509,9 +522,12 @@ def run_smoke(workspace, timeout=120):
 
 def _severity(item):
     value = str(item.get("severity") or item.get("kind") or "").strip().lower()
-    if value.startswith("block"):
+    if value.startswith(("block", "crit", "major", "high", "error")):
         return SEVERITY_BLOCKING
-    return SEVERITY_MINOR
+    if value.startswith(("minor", "low", "nit", "info", "note", "warn")):
+        return SEVERITY_MINOR
+    # Unknown/missing severity is a blocking finding: fail closed.
+    return SEVERITY_BLOCKING
 
 
 def _finding_status(item):
@@ -542,8 +558,22 @@ def _check_crew_ok(check, builder, rescuer, checker=None):
     return crew not in {str(builder or ""), str(rescuer or "")}
 
 
+def _requirement_credit(item, builders, checkers, rescuers):
+    """True when a requirement row carries evidence from its paired checker."""
+    part_id = str(item.get("part_id") or "")
+    if not part_id or part_id not in builders or part_id not in checkers:
+        return False
+    builder = builders.get(part_id)
+    checker = checkers.get(part_id)
+    if not builder or not checker:
+        return False
+    return any(_check_ok(check) and _check_crew_ok(
+        check, builder, rescuers.get(part_id), checker)
+        for check in _requirement_checks(item))
+
+
 def evaluate(parts, findings, requirements, tests, rescues=None,
-             threshold=None, brief_count=None):
+             threshold=None, brief_count=None, brief_items=None):
     """Compute the connector-owned 0-10 crosscheck score.
 
     Five equally weighted conditions (2.0 each) make 10.0 reachable only when
@@ -572,31 +602,37 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
     t_value = 1.0 if test_status in ("passed", "smoke_passed") else 0.0
 
     required = [item for item in requirements if item.get("required", True) is not False]
+    brief_items = [item for item in (brief_items or [])
+                   if isinstance(item, dict) and item.get("id")]
     checked = 0
-    for item in required:
-        part_id = str(item.get("part_id") or "")
-        # A requirement is only verifiable when it names a real, paired part.
-        # Missing/unknown ids used to produce builder=None, which let any
-        # non-empty checked_by string certify itself.
-        if not part_id or part_id not in builders or part_id not in checkers:
-            continue
-        builder = builders.get(part_id)
-        checker = checkers.get(part_id)
-        rescuer = rescuers.get(part_id)
-        if not builder or not checker:
-            continue
-        checks = _requirement_checks(item)
-        if any(_check_ok(check) and _check_crew_ok(
-                check, builder, rescuer, checker) for check in checks):
-            checked += 1
-    total_required = max(len(required), int(brief_count or 0))
+    if brief_items:
+        # The connector owns the checklist.  Coverage is measured against its
+        # own R1..Rn ids, so invented requirement rows cannot certify a brief.
+        by_id = {}
+        for item in required:
+            by_id.setdefault(str(item.get("id") or ""), []).append(item)
+        for brief in brief_items:
+            for item in by_id.get(str(brief.get("id")), []):
+                if _requirement_credit(item, builders, checkers, rescuers):
+                    checked += 1
+                    break
+        total_required = len(brief_items)
+    else:
+        for item in required:
+            if _requirement_credit(item, builders, checkers, rescuers):
+                checked += 1
+        # A caller may pass only the brief count; never allow a short artifact
+        # to certify a longer brief.
+        total_required = max(len(required), int(brief_count or 0))
     r_value = (float(checked) / total_required) if total_required else 0.0
 
     real = [item for item in findings
             if _finding_status(item) not in ("false_alarm", "duplicate")]
+    # Only an explicitly fixed BLOCKING finding is closed.  Unknown/typo
+    # statuses, "justified" and "wontfix" stay open (fail closed).
     open_blocking = [item for item in real
                      if _severity(item) == SEVERITY_BLOCKING
-                     and _finding_status(item) in ("open", "stale", "unconfirmed")]
+                     and _finding_status(item) != "fixed"]
     b_value = 1.0 if not open_blocking else 0.0
 
     minors = [item for item in real if _severity(item) == SEVERITY_MINOR]
@@ -609,7 +645,13 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
                 text = (just.get("text") if isinstance(just, dict) else just)
                 accepted = (just.get("accepted_by_crew")
                             if isinstance(just, dict) else item.get("accepted_by_crew"))
-                if len(str(text or "").strip()) < 20 or not accepted:
+                finder = str(item.get("found_by_crew") or item.get("found_by") or "")
+                checker = checkers.get(str(item.get("part_id") or ""))
+                # The finding crew (or the part's paired checker) must accept
+                # the justification; a builder-only self-acceptance is not
+                # enough, as documented.
+                if (len(str(text or "").strip()) < 20 or not accepted
+                        or str(accepted) not in {finder, str(checker or "")}):
                     continue
             resolved_minors += 1
     m_value = (float(resolved_minors) / len(minors)) if minors else 1.0
@@ -620,9 +662,19 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
         confirmation = item.get("confirmation")
         if not isinstance(confirmation, dict):
             continue
-        crew = str(confirmation.get("crew") or confirmation.get("confirmed_by") or "")
+        part_id = str(item.get("part_id") or "")
+        checker = checkers.get(part_id) if part_id else None
         finder = str(item.get("found_by_crew") or item.get("found_by") or "")
-        if (confirmation.get("confirmed") is True and crew and crew == finder
+        crew = str(confirmation.get("crew") or confirmation.get("confirmed_by") or "")
+        if not checker:
+            # Cross-cutting finding: the finder must at least be a real checker
+            # crew, never a builder certifying its own work.
+            if not finder or finder not in set(checkers.values()):
+                continue
+        elif finder != str(checker):
+            continue
+        if (confirmation.get("confirmed") is True and crew
+                and crew == finder
                 and str(confirmation.get("evidence") or "").strip()):
             confirmed += 1
     f_value = (float(confirmed) / len(fixed)) if fixed else 1.0
@@ -636,11 +688,13 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
         score = min(round(raw + 1e-9, 2), 9.99)
         if not part_ok:
             score = min(score, 6.0)
-        rescue_rows = [item for item in (rescues or [])
-                       if isinstance(item, dict)
-                       and str(item.get("status") or "").lower() != "ok"]
-        if rescue_rows:
-            score = min(score, 8.0)
+    rescue_rows = [item for item in (rescues or [])
+                   if isinstance(item, dict)
+                   and str(item.get("status") or "").lower() != "ok"]
+    if rescue_rows:
+        # An attempted rescue that did not succeed caps the gate even when the
+        # remaining evidence happens to be green.
+        score = min(score, 8.0)
     reasons = []
     if t_value < 1.0:
         reasons.append("tests_" + test_status)
@@ -654,6 +708,8 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
         reasons.append("fixes_unconfirmed")
     if not part_ok:
         reasons.append("part_failed")
+    if rescue_rows:
+        reasons.append("rescue_failed")
     score = round(max(0.0, min(10.0, score)) + 1e-9, 2)
     return {
         "score": score,
@@ -831,32 +887,44 @@ def apply_rescue(record, rescue, rescued=False):
     record = record or new_record({})
     reason = ""
     failed_crew = None
+    rescue_crew = "finisher"
+    rescue_status = "ok" if rescued else "failed"
     if isinstance(rescue, dict):
         reason = _truncate(rescue.get("reason") or rescue.get("status") or "", 300)
         failed_crew = rescue.get("failed_crew") or rescue.get("crew")
+        rescue_crew = str(rescue.get("rescue_crew") or "finisher")
+        rescue_status = "ok" if rescued else str(
+            rescue.get("status") or "failed")
     rows = record.setdefault("rescues", [])
     matched = False
     for part in record.get("parts") or []:
         if failed_crew and part.get("builder_crew") not in (None, failed_crew):
             continue
+        # A specific part id narrows the rescue to that part.
+        wanted_part = rescue.get("part_id") if isinstance(rescue, dict) else None
+        if wanted_part and str(part.get("id")) != str(wanted_part):
+            continue
         matched = True
-        part["rescued"] = True
-        part["rescue_crew"] = part.get("rescue_crew") or "finisher"
+        if rescued:
+            part["rescued"] = True
+            part["rescue_crew"] = part.get("rescue_crew") or rescue_crew
         rows.append({
             "part_id": part.get("id"),
             "reason": reason or "finisher completed a stalled/timed-out build",
-            "rescue_crew": "finisher",
+            "failed_crew": failed_crew,
+            "rescue_crew": part.get("rescue_crew") or rescue_crew,
             "checker_crew": ((record.get("pairing") or {}).get(
                 str(part.get("id")), {}).get("checker")
                 or part.get("checker_crew")),
-            "status": "ok" if rescued else (rescue or {}).get("status", "unknown"),
+            "status": "ok" if rescued else rescue_status,
         })
     if not matched:
         rows.append({
             "part_id": "all",
             "reason": reason or "finisher completed a stalled/timed-out build",
-            "rescue_crew": "finisher",
-            "status": "ok" if rescued else "unknown",
+            "failed_crew": failed_crew,
+            "rescue_crew": rescue_crew,
+            "status": "ok" if rescued else rescue_status,
         })
     # De-duplicate part/round pairs.
     seen = set()
@@ -937,9 +1005,11 @@ def build_contract(cc, parts_info, pairing_map, prompt):
         "Build this brief as at least %d independent parts with DISJOINT write "
         "sets. The connector will recompute the score from objective evidence; "
         "your self-score and QUALITY_REPORT prose are not used." % part_count,
-        "Crews: %d crews x %d agents (%s subagents total, split %s)."
-        % (cc.get("crews", DEFAULT_CREWS), cc.get("crew_size", DEFAULT_CREW_SIZE),
-           cc.get("subagents", 8), cc.get("crew_sizes")),
+        "Crews: %d active (%d agents total, split %s; configured %d x %d)."
+        % (len(cc.get("crew_sizes") or []) or cc.get("crews", DEFAULT_CREWS),
+           cc.get("subagents", 8), cc.get("crew_sizes"),
+           cc.get("crews", DEFAULT_CREWS),
+           cc.get("crew_size", DEFAULT_CREW_SIZE)),
         "",
         "### PLAN.json (write this first)",
         "Extend PLAN.json with a top-level `parts` list. Each part needs a "
@@ -957,10 +1027,12 @@ def build_contract(cc, parts_info, pairing_map, prompt):
             "- %s: build with %s; cross-check with %s (never its builder)"
             % (part.get("id"), pair.get("builder"), pair.get("checker")))
     if not parts:
+        crews = max(2, int(cc.get("crews") or DEFAULT_CREWS))
         lines.append(
-            "- Pair part index i (0-based) with builder crew-(i mod C + 1) and "
-            "checker crew-(((i + 1) mod C) + 1); with two crews this simply "
-            "alternates. Never let a crew check its own part.")
+            "- With C=%d crews, part index i (0-based) uses builder "
+            "crew-(i mod C + 1) and checker crew-((b + 1 + floor(i / C) "
+            "mod (C - 1)) mod C + 1), where b = i mod C. Never let a crew "
+            "check its own part." % crews)
     lines += [
         "",
         "### Wave 1 - build",
@@ -1011,7 +1083,8 @@ def build_fix_task(cc, record, evaluation, round_no, prompt):
     parts = record.get("parts") or []
     open_items = []
     for item in record.get("findings") or []:
-        if _finding_status(item) in ("open", "stale", "unconfirmed"):
+        if (_severity(item) == SEVERITY_BLOCKING
+                and _finding_status(item) != "fixed"):
             open_items.append(
                 "- %s %s %s:%s: %s (evidence: %s)"
                 % (item.get("id"), _severity(item).upper(), item.get("file"),
@@ -1023,13 +1096,17 @@ def build_fix_task(cc, record, evaluation, round_no, prompt):
         for item in record.get("requirements") or []
         if not str(item.get("checked_by") or "").strip()
     ]
-    unconfirmed = [
-        "- %s: fix needs confirmation from %s"
-        % (item.get("id"), item.get("found_by_crew"))
-        for item in record.get("findings") or []
-        if _finding_status(item) == "fixed"
-        and not (item.get("confirmation") or {}).get("confirmed")
-    ]
+    unconfirmed = []
+    for item in record.get("findings") or []:
+        if _finding_status(item) != "fixed":
+            continue
+        if (item.get("confirmation") or {}).get("confirmed"):
+            continue
+        part_id = str(item.get("part_id") or "")
+        checker = ((record.get("pairing") or {}).get(part_id) or {}).get("checker")
+        unconfirmed.append(
+            "- %s: fix needs confirmation from the paired checker %s"
+            % (item.get("id"), checker or "that did not build the part"))
     unresolved = [
         "- %s: %s" % (item.get("id"), item.get("text"))
         for item in record.get("findings") or []

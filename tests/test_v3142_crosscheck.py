@@ -301,6 +301,83 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(summary["spec"], 1)
 
 
+    def test_unknown_blocking_status_stays_open(self):
+        parts, findings, requirements = self._full()
+        for status in ("resolved", "closed", "wontfix", "done", "justified"):
+            finding = dict(findings[0], status=status)
+            result = crosscheck.evaluate(
+                parts, [finding], requirements, {"status": "passed"},
+                threshold=10.0, brief_count=2)
+            self.assertEqual(result["conditions"]["blocking"], 0.0, status)
+            self.assertEqual(result["score"], 8.0, status)
+            self.assertFalse(result["passed"], status)
+
+    def test_builder_cannot_confirm_its_own_fix(self):
+        parts, findings, requirements = self._full()
+        findings[0]["found_by_crew"] = "crew-1"
+        findings[0]["confirmation"] = {"crew": "crew-1", "confirmed": True,
+                                       "evidence": "self check"}
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["fixes"], 0.0)
+        self.assertEqual(result["score"], 8.0)
+
+    def test_connector_brief_ids_must_be_covered(self):
+        parts, findings, requirements = self._full()
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_items=[{"id": "R1"}, {"id": "R2"}])
+        self.assertEqual(result["conditions"]["requirements"], 1.0)
+        self.assertEqual(result["score"], 10.0)
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_items=[{"id": "R1"}, {"id": "R3"}])
+        self.assertEqual(result["conditions"]["requirements"], 0.5)
+        self.assertLess(result["score"], 10.0)
+
+    def test_small_subagent_budget_is_not_inflated(self):
+        self.assertEqual(crosscheck.split_subagents(2, 5), [1, 1])
+        self.assertEqual(sum(crosscheck.split_subagents(3, 5)), 3)
+        cc = crosscheck.normalise_config(
+            {"mode": "crosscheck", "subagents": 2,
+             "crosscheck_crews": 5}, {})
+        self.assertEqual(cc["subagents"], 2)
+        self.assertEqual(sum(cc["crew_sizes"]), 2)
+        self.assertEqual(cc["crews"], 2)
+
+    def test_rescue_keeps_failed_and_rescue_crew(self):
+        record = crosscheck.new_record({"threshold": 10.0})
+        record["parts"] = [
+            _part("p1", ["a.py"], builder="crew-1", checker="crew-2"),
+            _part("p2", ["b.py"], builder="crew-2", checker="crew-1"),
+        ]
+        record["pairing"] = {"p1": {"checker": "crew-2"},
+                             "p2": {"checker": "crew-1"}}
+        record = crosscheck.apply_rescue(
+            record, {"reason": "stall", "failed_crew": "crew-1",
+                     "rescue_crew": "crew-3"}, rescued=True)
+        self.assertTrue(record["parts"][0].get("rescued"))
+        self.assertEqual(record["parts"][0]["rescue_crew"], "crew-3")
+        self.assertEqual(record["rescues"][0]["failed_crew"], "crew-1")
+        self.assertEqual(record["rescues"][0]["rescue_crew"], "crew-3")
+
+    def test_failed_rescue_marks_no_part_rescued_and_caps_score(self):
+        record = crosscheck.new_record({"threshold": 10.0})
+        record["parts"] = [_part("p1", ["a.py"])]
+        record = crosscheck.apply_rescue(
+            record, {"status": "finisher_error"}, rescued=False)
+        self.assertFalse(record["parts"][0].get("rescued"))
+        self.assertEqual(record["rescues"][0]["status"], "finisher_error")
+        result = crosscheck.evaluate(
+            record["parts"], [], [_requirement("R1")],
+            {"status": "passed"}, record["rescues"], threshold=10.0,
+            brief_count=1)
+        self.assertLessEqual(result["score"], 8.0)
+        self.assertIn("rescue_failed", result["reasons"])
+
+
+
 class RoundTests(unittest.TestCase):
     def test_fix_then_stop_at_max_rounds(self):
         cc = {"max_rounds": 3, "threshold": 10.0}

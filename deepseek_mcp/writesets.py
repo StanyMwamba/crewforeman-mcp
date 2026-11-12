@@ -424,11 +424,14 @@ def parallel_decision(record, active, cfg=None):
     for peer in active or []:
         if not isinstance(peer, dict) or peer is record:
             continue
+        # Different workspaces are independent: a serial (non-pipeline) job in
+        # another repo must not turn this workspace's job serial.
+        peer_workspace = _workspace(peer)
+        if workspace and peer_workspace and peer_workspace != workspace:
+            continue
         if not bool(peer.get("pipeline_eligible")):
             return {"parallel": False, "reason": "peer_serial",
                     "write_set": write_set, "confidence": confidence}
-        if _workspace(peer) != workspace:
-            continue
         if not record_auto_parallel(peer, cfg):
             return {"parallel": False, "reason": "peer_serial",
                     "write_set": write_set, "confidence": confidence}
@@ -456,6 +459,11 @@ def stray_files(write_set, changed_files, extra_allowed=()):
     for path in changed_files or []:
         normal = normalise_rel(path)
         if not normal:
+            # Unknown/absolute paths cannot be proven inside the write set, so
+            # treat them as stray rather than silently dropping them.
+            text = str(path or "").strip().replace("\\", "/")
+            if text:
+                stray.append(text)
             continue
         if not path_covered(normal, allowed):
             stray.append(normal)

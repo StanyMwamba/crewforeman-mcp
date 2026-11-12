@@ -1232,6 +1232,14 @@ class AdmissionController:
                      if str(item).strip()]
         if not write_set:
             return False
+        try:
+            from . import writesets as writesets_mod
+            if (writesets_mod._record_confidence(record)
+                    < writesets_mod.record_min_confidence(record, self.cfg)):
+                return False
+            workspace = writesets_mod._workspace(record)
+        except Exception:
+            workspace = ""
         if self._slots() is None or self._slots() > 0:
             return False
         try:
@@ -1254,6 +1262,9 @@ class AdmissionController:
             return False
         if bool(_cfg_value(self.cfg, "pipeline_require_disjoint", True)):
             for other in active:
+                peer_ws = writesets_mod._workspace(other)
+                if workspace and peer_ws and peer_ws != workspace:
+                    continue
                 if self._write_sets_overlap(write_set,
                                             other.get("write_set") or []):
                     return False
@@ -1410,10 +1421,21 @@ class AdmissionController:
             active = self.store.active()
         except Exception:
             return False
-        eligible_active = [rec for rec in active
+        try:
+            from . import writesets as writesets_mod
+            workspace = writesets_mod._workspace(record)
+            # An unknown workspace is not evidence of a different repo: keep
+            # the conservative serial path unless both sides are known.
+            same_workspace = [
+                rec for rec in active
+                if not workspace
+                or writesets_mod._workspace(rec) in ("", workspace)]
+        except Exception:
+            same_workspace = active
+        eligible_active = [rec for rec in same_workspace
                            if rec.get("pipeline_eligible")]
         if record.get("pipeline_eligible"):
-            if any(not rec.get("pipeline_eligible") for rec in active):
+            if any(not rec.get("pipeline_eligible") for rec in same_workspace):
                 return False
             # v3.14.2: an eligible job may run beside another eligible job
             # only when both write sets are inferred/declared, confident and

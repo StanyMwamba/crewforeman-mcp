@@ -92,11 +92,14 @@ class SchemaTests(unittest.TestCase):
                     "crosscheck_crew_size", "crosscheck_max_rounds",
                     "audit_review", "audit_sample_rate",
                     "audit_spot_requirements", "audit_spot_fixes",
-                    "auto_parallel", "auto_parallel_min_confidence"):
+                    "risk_paths", "auto_parallel",
+                    "auto_parallel_min_confidence"):
             self.assertIn(key, props, key)
         self.assertEqual(set(props["mode"]["enum"]), {"standard", "crosscheck"})
         self.assertEqual(props["crosscheck_threshold"]["maximum"], 10)
         self.assertEqual(props["crosscheck_threshold"]["minimum"], 0)
+        self.assertEqual(props["risk_paths"]["type"], "array")
+        self.assertEqual(props["risk_paths"]["items"]["type"], "string")
 
     def test_config_defaults(self):
         self.assertEqual(config.DEFAULTS["crosscheck_threshold"], 10.0)

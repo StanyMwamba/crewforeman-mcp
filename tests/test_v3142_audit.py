@@ -271,6 +271,24 @@ class PromptParseTests(unittest.TestCase):
         result = audit.parse_audit("Quality score: 9.0\nBlocking defects: 0")
         self.assertFalse(result["ran"])
 
+    def test_empty_or_garbage_audit_json_fails_closed(self):
+        for block in ('{}', '{"foo": "bar"}', '{"score": null, "blocking": []}',
+                      '{"score": 10}'):
+            result = audit.parse_audit("<!-- AUDIT_JSON %s -->" % block, {})
+            self.assertFalse(result["ran"], block)
+            self.assertIsNone(result["score"], block)
+        done = audit.finish({"job_id": "j"}, "<!-- AUDIT_JSON {} -->", None)
+        self.assertFalse(done["ran"])
+        self.assertEqual(done["verdict"], "not_reported")
+
+    def test_clean_audit_json_still_requires_evidence_lists(self):
+        result = audit.parse_audit(
+            '<!-- AUDIT_JSON {"score": 10, "blocking": [], '
+            '"crew_claims_that_did_not_hold": [], "spot_checks": []} -->', {})
+        self.assertTrue(result["ran"])
+        self.assertEqual(result["score"], 10.0)
+        self.assertEqual(result["blocking_count"], 0)
+
     def test_finish_sets_forced_rate_after_failed_claim(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

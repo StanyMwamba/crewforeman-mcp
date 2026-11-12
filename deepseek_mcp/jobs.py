@@ -1137,7 +1137,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                             0.85), 0.85)
             inferred_ok = (source == "inferred" and auto_parallel
                            and confidence >= min_confidence)
-            pre_source = (source in ("arg", "slice", "prompt")
+            pre_source = (source in ("arg", "slice", "prompt", "plan")
                           or inferred_ok)
             if not (pre_source and declared.get("write_set")):
                 # No safe pre-builder declaration: not pipeline-eligible, and

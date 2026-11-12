@@ -2,9 +2,10 @@
 
 Parallelism is automatic, not declared. When a Harness job is submitted
 without `write_set`, the connector infers one from the brief, `PLAN.json` and
-`SLICES.md`. It runs the job in parallel only when the inferred set is
-confident and disjoint from every running job in the same repo. Otherwise the
-job stays serial, exactly as before.
+`SLICES.md`. A declared `write_set` or slice is trusted at confidence 1.0, and
+a `PLAN.json` set at 0.93 is eligible. The job runs in parallel only when its
+set is confident and disjoint from every running job in the same repo.
+Otherwise it stays serial, exactly as before.
 
 ## Inference
 
@@ -45,10 +46,10 @@ For a queued job in a workspace that already has a running pipeline job:
 | a running peer has no/low-confidence set | serial, reason `peer_unknown_write_set` or `peer_low_confidence` |
 | disjoint and confident | parallel, reason `disjoint_confident` |
 
-Different workspaces are independent: the overlap test only compares jobs
-with the same canonical workspace. A job that is not eligible for the
-pipeline still blocks parallel builders, and an ineligible active job keeps
-the safe serial path.
+Different workspaces are independent: the overlap and serial-peer tests only
+compare jobs with the same canonical workspace. An ineligible active job in
+another workspace neither blocks nor forces this job serial; a same-workspace
+ineligible peer still keeps the safe serial path.
 
 Each parallel job runs in its own detached git worktree based on the queue
 base commit. The canonical tree is never written by the builder.
@@ -63,8 +64,10 @@ the actual changed files with the inferred write set.
 - A file outside the set marks the patch `serial_reintegration` with the stray
   file list. It is not merged blindly. The connector re-runs that job's
   integration serially on the current canonical tree: a clean `git apply`
-  first, then a three-way apply as a rebase. The resolution
-  (`apply_clean` or `rebase_3way`) and the reason are recorded.
+  first, then a three-way apply as a rebase. The paths and index state are
+  snapshotted first, so a failed rebase is rolled back and never leaves
+  conflict markers or unmerged entries. The resolution (`apply_clean` or
+  `rebase_3way`) and the reason are recorded.
 - If neither applies, the patch is retained as `manual`, the worktree is
   retained, and the run reports the conflict; the canonical tree is unchanged.
 - A failed `git apply --check` follows the same serial path.

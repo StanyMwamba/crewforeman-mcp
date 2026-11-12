@@ -171,8 +171,10 @@ class PipelineTests(unittest.TestCase):
         self._patch("c1", "base.txt", "one\n")
         _run2, _cap2, _wt2 = self._patch("c2", "base.txt", "two\n")
         result = pipeline.install_pending(self.cfg, str(self.ws), "c2")
-        self.assertEqual(result["status"], "conflict", result)
-        self.assertEqual(result["conflict"]["conflicting_patch"], "c2")
+        # 3.14.2 defers a combined-queue apply failure to the serial
+        # re-integration path instead of dropping the patch as a hard conflict.
+        self.assertEqual(result["status"], "serial_reintegration", result)
+        self.assertIsNone(result["conflict"])
         self.assertEqual(result["applied"], [])
         self.assertEqual((self.ws / "base.txt").read_text(encoding="utf-8"), "base\n")
         self.assertEqual(self._git("status", "--porcelain"), "")

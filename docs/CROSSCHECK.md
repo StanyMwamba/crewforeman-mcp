@@ -68,10 +68,10 @@ points each:
 | # | Condition | Fraction |
 |---|---|---|
 | 1 | Connector-run tests | 1.0 when the gate test check is `ok` (a bounded compile smoke is accepted only when no test suite is detected), else 0.0 |
-| 2 | Every brief requirement checked | checked requirements divided by the larger of the recorded requirement count and the brief checklist count; a requirement needs a real paired part, evidence, and its assigned checker (never the builder or rescuer) |
-| 3 | Zero open BLOCKING | 1.0 when no real BLOCKING finding is open, stale or unconfirmed, else 0.0 |
-| 4 | Every minor fixed or justified | fixed or justified minors divided by all real minors; a justification needs at least 20 characters and the finding crew's acceptance |
-| 5 | Every fix confirmed by the finding crew | confirmed fixes divided by fixed findings; confirmation must come from the crew that found it and carry evidence |
+| 2 | Every brief requirement checked | connector `R1..Rn` ids covered by the artifact, divided by the connector's checklist size; each row needs a real paired part, evidence, and its assigned checker (never the builder or rescuer) |
+| 3 | Zero open BLOCKING | 1.0 only when every real BLOCKING finding is explicitly `fixed`; unknown, `justified`, `wontfix` and unconfirmed states stay open |
+| 4 | Every minor fixed or justified | fixed or justified minors divided by all real minors; a justification needs at least 20 characters and acceptance by the finding crew or the part's paired checker |
+| 5 | Every fix confirmed by the finding crew | confirmed fixes divided by fixed findings; the finder must be the part's paired checker and the confirmation must come from that crew with evidence |
 
 ```
 raw   = 2.0 * (tests + requirements + blocking + minors + fixes)
@@ -93,10 +93,13 @@ condition list.
 
 ## Rescue
 
-The existing finisher still completes a crew or part that stalls, stops
-early, hits a time limit or loses balance. The part is recorded in `rescues`
-with the failed crew, reason and rescue crew, and it is marked `rescued`. A
-crew that did not build it must still cross-check it; without that evidence
+The existing finisher still completes a builder run that stalls, stops early,
+hits a time limit, loops or (in crosscheck mode) loses provider balance. The
+finisher works on the whole workspace, so a whole-run rescue records every
+planned part it completed; an artifact that names a specific `failed_crew` or
+`part_id` is narrowed to those parts. Each row records the failed crew, reason
+and rescue crew, and only a successful rescue marks the part `rescued`. A crew
+that did not build it must still cross-check it; without that evidence
 condition 2 keeps the score below 10.
 
 ## Per-job record

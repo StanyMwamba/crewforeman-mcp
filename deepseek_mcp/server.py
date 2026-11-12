@@ -217,6 +217,12 @@ TOOLS = [
                                  "description": (
                                      "Confirmed fixes the audit re-runs by evidence "
                                      "(default 2, seeded).")},
+            "risk_paths": {"type": "array", "items": {"type": "string"},
+                           "description": (
+                               "Extra risky path globs for audit risk detection. "
+                               "Merged with the built-in sandbox/secret/job-control/"
+                               "install/workflow globs; risky jobs are never sampled "
+                               "out and keep the configured reviewer.")},
             "auto_parallel": {"type": "boolean", "description": (
                 "Infer a write set when none is declared and allow disjoint, confident "
                 "jobs in the same repo to run in parallel worktrees (default true; "

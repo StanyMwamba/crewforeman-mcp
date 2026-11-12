@@ -468,6 +468,7 @@ def declared_write_set(args, cfg):
             invalid.extend(bad)
             if valid:
                 result.update({"write_set": valid, "source": "arg", "impl": "builtin",
+                               "confidence": 1.0, "basis": "declared",
                                "invalid": invalid})
                 return result
 
@@ -480,14 +481,16 @@ def declared_write_set(args, cfg):
                 invalid.extend(bad)
                 if valid:
                     result.update({"write_set": valid, "source": "slice",
-                                   "impl": "part_b", "invalid": invalid})
+                                   "impl": "part_b", "confidence": 1.0,
+                                   "basis": "declared", "invalid": invalid})
                     return result
             parsed = _parse_slices_text(text)
             valid, bad = _normalise_items(_select_slice_files(parsed, slice_name))
             invalid.extend(bad)
             if valid:
                 result.update({"write_set": valid, "source": "slice",
-                               "impl": "builtin", "invalid": invalid})
+                               "impl": "builtin", "confidence": 1.0,
+                               "basis": "declared", "invalid": invalid})
                 return result
 
         prompt = _arg(args, "prompt", "") or ""
@@ -500,7 +503,8 @@ def declared_write_set(args, cfg):
             invalid.extend(bad)
             if valid:
                 result.update({"write_set": valid, "source": "prompt",
-                               "impl": "builtin", "invalid": invalid})
+                               "impl": "builtin", "confidence": 1.0,
+                               "basis": "declared", "invalid": invalid})
                 return result
 
         valid, bad = _normalise_items(_plan_write_set(args, workspace))
@@ -1041,7 +1045,7 @@ def prepare_args(cfg, args, run=None):
         inferred_ok = (source == "inferred"
                        and auto_parallel
                        and declared_confidence >= min_confidence)
-        pre_source = (source in {"arg", "slice", "prompt"} or inferred_ok)
+        pre_source = (source in {"arg", "slice", "prompt", "plan"} or inferred_ok)
         check_set = declared.get("write_set") if pre_source else []
         if decided:
             # Eligibility is decided once at admission and frozen (§F4.2).
@@ -1294,8 +1298,7 @@ def capture_patch(run, cfg, workspace):
             result["reason"] = "patch_too_large"
         files = _diff_files(ws, base, excludes) if complete else []
         stray = []
-        if (isinstance(pipe, dict) and pipe.get("write_set")
-                and pipe.get("write_set_source") == "inferred"):
+        if isinstance(pipe, dict) and pipe.get("write_set"):
             try:
                 from . import writesets as writesets_mod
                 stray = writesets_mod.stray_files(pipe.get("write_set"), files)
@@ -1576,7 +1579,12 @@ def _pending_records(cfg, canonical):
     pending = []
     for record in records:
         status = str(record.get("status") or "pending")
-        if status in ("manual", "conflict", "partial", "serial_reintegration"):
+        if status == "serial_reintegration":
+            # A stray/conflicting patch must reach the serial path; it is not
+            # a terminal conflict and must not disappear from the queue.
+            pending.append(record)
+            break
+        if status in ("manual", "conflict", "partial"):
             break
         if status in ("pending", "accepted"):
             pending.append(record)
@@ -1629,6 +1637,67 @@ def _copy_artifacts(record, canonical):
     return copied
 
 
+def _snapshot_files(root, record):
+    """Snapshot the paths a serial patch may touch (worktree + index state)."""
+    names = []
+    for key in ("files", "stray_files"):
+        for item in record.get(key) or []:
+            rel = _safe_rel(item)
+            if rel and rel not in names:
+                names.append(rel)
+    snap = {"files": {}, "staged": []}
+    for rel in names:
+        full = os.path.join(root, rel)
+        try:
+            if os.path.isfile(full):
+                with open(full, "rb") as handle:
+                    data = handle.read()
+                snap["files"][rel] = (True, data, os.stat(full).st_mode)
+            else:
+                snap["files"][rel] = (False, b"", 0)
+        except OSError:
+            snap["files"][rel] = (None, b"", 0)
+    rc, out, _err = _git(["diff", "--cached", "--name-only", "--"] + names, root)
+    if rc == 0:
+        snap["staged"] = [line.strip() for line in out.splitlines()
+                          if line.strip()]
+    return snap
+
+
+def _restore_files(root, snap):
+    """Best-effort rollback of a failed serial apply; returns True on success."""
+    files = (snap or {}).get("files") or {}
+    names = list(files)
+    ok = True
+    # Clear any unmerged/staged index entries left by a failed 3-way apply.
+    if names:
+        _git(["reset", "-q", "--"] + names, root)
+    for rel, (exists, data, mode) in files.items():
+        if exists is None:
+            continue
+        full = os.path.join(root, rel)
+        try:
+            if exists:
+                parent = os.path.dirname(full)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(full, "wb") as handle:
+                    handle.write(data)
+                try:
+                    os.chmod(full, mode & 0o777)
+                except OSError:
+                    pass
+            elif os.path.exists(full):
+                os.unlink(full)
+        except OSError:
+            ok = False
+    staged = [rel for rel in names if rel in ((snap or {}).get("staged") or [])]
+    if staged:
+        rc, _out, _err = _git(["add", "--"] + staged, root)
+        ok = ok and rc == 0
+    return ok
+
+
 def serial_reintegrate(cfg, canonical_workspace, run_id):
     """Re-apply one stray/conflicting patch serially on the current tree.
 
@@ -1677,6 +1746,8 @@ def serial_reintegrate(cfg, canonical_workspace, run_id):
                                           "dirty_paths"))
             return result
         patch_file = _record_patch_path(record, directory)
+        reason = str(record.get("integration_reason") or "write_set_stray")
+        snap = _snapshot_files(canonical, record)
         rc, _out, err = _git(["apply", "--check", "--", patch_file], canonical)
         resolution = "apply_clean"
         if rc != 0:
@@ -1698,23 +1769,33 @@ def serial_reintegrate(cfg, canonical_workspace, run_id):
             args.append("--3way")
         args += ["--", patch_file]
         rc, _out, err = _git(args, canonical, timeout=180)
+        if rc == 0:
+            # A 3-way apply can report success while leaving unmerged paths in
+            # some git versions; never accept that into the canonical tree.
+            urc, uout, _uerr = _git(
+                ["diff", "--name-only", "--diff-filter=U"], canonical)
+            if urc != 0 or uout.strip():
+                rc = 1
+                err = (uout.strip().splitlines() or ["unmerged paths"])[0]
         if rc != 0:
+            rolled_back = _restore_files(canonical, snap)
             result.update(_install_conflict(record, "apply_failed", err))
             result["status"] = "manual"
             result["reason"] = "apply_failed"
+            result["rolled_back"] = bool(rolled_back)
             _update_sidecar(record, status="manual",
                             integration_reason="apply_failed",
                             integration_detail=_clean_text(err, canonical))
             return result
         _git(["add", "-A", "--", "."], canonical)
         installed = {"ok": True, "status": "installed_serial",
-                     "applied": [str(run_id)], "reason": "write_set_stray",
+                     "applied": [str(run_id)], "reason": reason,
                      "resolution": resolution,
                      "stray_files": result["stray_files"],
                      "conflict": None}
         _update_sidecar(record, status="installed",
                         integration_resolution=resolution,
-                        integration_reason="write_set_stray")
+                        integration_reason=reason)
         result.update(installed)
         return result
     except Exception as exc:  # noqa: BLE001
@@ -1746,14 +1827,17 @@ def install_pending(cfg, canonical_workspace, run_id):
             return result
         directory = patch_dir(cfg)
         pending = _pending_records(cfg, canonical)
-        if pending and str(pending[0].get("status") or "") == "serial_reintegration":
-            record = pending[0]
-            if run_id and str(record.get("run_id")) == str(run_id):
+        serial_record = next(
+            (row for row in pending
+             if str(row.get("status") or "") == "serial_reintegration"), None)
+        if serial_record is not None:
+            if run_id and str(serial_record.get("run_id")) == str(run_id):
                 rebuilt = serial_reintegrate(cfg, canonical, run_id)
                 return rebuilt
             return {"ok": True, "status": "serial_reintegration",
                     "applied": [], "reason": "write_set_stray",
-                    "conflict": None, "stray_files": record.get("stray_files") or []}
+                    "conflict": None,
+                    "stray_files": serial_record.get("stray_files") or []}
         if not pending:
             installed = _patch_records(cfg, canonical, statuses={"installed"})
             if run_id and any(str(r.get("run_id")) == str(run_id) for r in installed):
@@ -1829,8 +1913,16 @@ def install_pending(cfg, canonical_workspace, run_id):
                     ["apply", "--whitespace=nowarn", patch_file], temp
                 )
             if rc != 0:
-                result.update(_install_conflict(record, "install_conflict", err))
-                _update_sidecar(record, status="conflict", conflict_reason="install_conflict")
+                _update_sidecar(record, status="serial_reintegration",
+                                integration_reason="apply_check_failed",
+                                integration_detail=_clean_text(err, temp))
+                result.update({
+                    "ok": True, "status": "serial_reintegration",
+                    "applied": [], "reason": "apply_check_failed",
+                    "conflict": None,
+                    "patches": [str(r.get("run_id")) for r in pending],
+                    "stray_files": record.get("stray_files") or [],
+                })
                 return result
             applied_temp.append(record)
 
