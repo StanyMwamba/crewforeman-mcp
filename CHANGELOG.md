@@ -5,6 +5,87 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.15.0
+
+3.15.0 adds MiMo Code (`mimo`, v0.1.17) as a second-vendor worker: builder,
+independent reviewer, crosscheck crew or backup when DeepSeek is quarantined
+or failing. MiMo children run under per-run permission files instead of
+blanket skip flags, with MiMo-aware concurrency detection, recorded limit
+backoffs and per-vendor usage and cost accounting. The test suite no longer
+writes run records into the real `~/DeepSeek-MCP/runs`.
+
+- **MiMo Code is a first-class second-vendor worker.** The adapter runs
+  `mimo run "<task>" --format json --dir <folder> -m <provider/model>`
+  (plus `--variant`, `-s <session>` to resume, `--attach <url>`), parses the
+  JSONL event stream (`text`, `step_start`, `step_finish` with `tokens`
+  {total,input,output,reasoning,cache}, `tool_use`, `error` with
+  `error.data.message`/`statusCode`) and maps it to CrewForeman progress,
+  events, the final answer, changed files and vendor-correct remedies: 401
+  auth errors say to run `mimo providers login` for the `xiaomi` provider
+  (or set `MIMO_API_KEY`), 429/limit errors name the concurrency ceiling,
+  and network errors say to check connectivity and retry. `mimo serve` plus
+  `mimo run --attach <url>` support many parallel agents behind one server
+  with a full lifecycle (start, ready check, stop, cleanup on crash), and
+  the `READY` preflight ping works for MiMo candidates like any other
+  vendor. Build/review/crosscheck default to `xiaomi/mimo-v2.6-pro`;
+  probes and readiness pings use `xiaomi/mimo-v2.6-flash`.
+- **Per-run `mimocode.jsonc` permissions replace blanket skip flags.**
+  Every MiMo child gets a per-run `mimocode.jsonc` in its workspace whose
+  `permission` globs are mapped from the sandbox presets: `read-only`
+  denies `edit` and mutating `bash` (a read-only reviewer cannot write),
+  `workspace-write` allows edits but denies `git push*`, `gh *`,
+  `git config --global*`, `sudo *`, `rm -rf /*`,
+  `*--dangerously-skip-permissions*` and friends, and
+  `danger-full-access` is the documented opt-in.
+  `--dangerously-skip-permissions` is never the default and `--yolo` is
+  never passed; the flag appears only behind the explicit
+  `mimo_skip_permissions` opt-in (env `DSH_MIMO_SKIP_PERMISSIONS` /
+  `DEEPSEEK_MIMO_SKIP_PERMISSIONS`), documented as dangerous. The file is
+  per run; the user's global `~/.config/mimocode/mimocode.jsonc` is never
+  rewritten.
+- **Roles and routing pick MiMo per seat.** `builder_provider`,
+  `reviewer_provider` and `crosscheck_crew_provider` accept `mimo`, with
+  `crosscheck_crew_model` naming the checker model. The crosscheck checker
+  crew is enforced to be a different vendor from the builder: an explicit
+  same-vendor choice raises `CrosscheckCrewVendorConflict`, and auto
+  selection picks the other vendor (Xiaomi (MiMo) when the builder is
+  DeepSeek, and the reverse). MiMo is also an accepted backup builder and
+  backup reviewer target when DeepSeek is quarantined or failing, and the
+  review preflight ping routes through the MiMo adapter. Defaults are
+  `mimo_default_model` (`xiaomi/mimo-v2.6-pro`) for build/review/crosscheck
+  and `mimo_probe_model` (`xiaomi/mimo-v2.6-flash`) for probes.
+- **MiMo concurrency detection and the DSH probe-cache fix.** The MiMo
+  limit is `workflow.maxConcurrentAgents` read (never written) from the
+  global `~/.config/mimocode/mimocode.jsonc` and the project
+  `mimocode.jsonc`, falling back to MiMo's documented default
+  `min(16, 2 x CPU cores)`; the effective value is the maximum of the
+  values seen, and `mimo_max_concurrent_agents` overrides it. A limit or
+  429 error records a backoff event under the state directory and suggests
+  a reduced concurrency (for example `limit // 2`). Root cause of the DSH
+  probe bug: a failed probe (`probe produced no readable result`) wrote
+  the generic fallback into the seven-day detection cache exactly like a
+  successful detection, so one transient failure pinned `source: fallback`
+  for every later job and the probe never re-ran. A probe failure is no
+  longer cached as a success; the record carries the probe error and the
+  next job re-probes.
+- **Per-vendor usage and cost accounting.** Every phase records input,
+  cache-read, output and reasoning tokens plus estimated USD per vendor
+  and model. Built-in MiMo prices (USD per 1M tokens) are `mimo-v2.6-pro`
+  input 0.435, cache hit 0.0036, output 0.87, and `mimo-v2.6-flash` input
+  0.14, output 0.28; `mimo_prices` overrides them per model. A model with
+  no price row keeps `cost_known=false` and a `null` cost - unknown cost
+  is never zero-filled. Run records, job status and the spend/waste
+  reports gain a `by_vendor` split, so MiMo and DeepSeek spend are visible
+  side by side.
+- **The suite cannot write into the real home state root any more.**
+  Fixtures called `load_config(env=...)` with a hand-built environment;
+  an explicit `env` dict hides the isolation overlay from config
+  resolution, so `log_dir` fell back to the real `~/DeepSeek-MCP/runs`
+  and `store.save_run` wrote fake `Write one note.` run records into the
+  operator's home. Every fixture now pins its state, runs and jobs roots
+  inside a per-test temporary directory, and a guard test fails if any
+  test touches the real home state root (or the repository `runs/` tree).
+
 ## 3.14.3
 
 3.14.3 is a reliability release: five run-killing defects found in real jobs,
