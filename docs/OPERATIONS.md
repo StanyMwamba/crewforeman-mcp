@@ -875,15 +875,15 @@ the whole child tree without signalling the MCP server itself.
   is **progress-gated**: when the cap is reached but progress arrived within
   `stall_cap_grace_seconds` (default 120), the deadline is extended by
   `stall_cap_extension_seconds` (default 300) instead of killing the work.
-  Extensions are bounded by the progress-aware absolute per-phase cap
+  Extensions are bounded by the absolute per-phase cap
   `phase_absolute_cap_seconds` (default `7200`; the 3.14.x
   `stall_cap_hard_max_seconds` key is a backwards-compatible alias used only
-  when the new key is not explicitly set). At the cap, a phase that produced
-  progress within `stall_cap_grace_seconds` rolls forward by
-  `stall_cap_extension_seconds` instead of dying, so only a genuinely silent
-  phase fires the absolute cap. Set the cap to `0` (or `null`) to disable only
-  the absolute cap. It is disabled automatically while `job_max_seconds` is
-  `0`. The progress-gated `stall_max_seconds` cap is scaled per phase by
+  when the new key is not explicitly set). For a bounded job this cap is
+  unconditional: progress can extend `stall_max_seconds`, but it cannot carry
+  a phase past `phase_absolute_cap_seconds`. Set the cap to `0` (or `null`)
+  to disable only the absolute cap. It is disabled automatically while
+  `job_max_seconds` is `0`, so an unlimited job is bounded only by the
+  progress-gated `stall_max_seconds` cap and the silent-phase stall timer. The progress-gated `stall_max_seconds` cap is scaled per phase by
   `cap_reviewer_multiplier` (1.5), `cap_revision_multiplier` (1.25) and
   `cap_finisher_multiplier` (0.5). Set a multiplier to 0 to disable that cap
   for the phase; `stall_seconds=0` disables only the silence timer.
@@ -1367,15 +1367,16 @@ default to be unlimited. Progress-gated stall detection (`stall_seconds`,
 
 ### `phase_absolute_cap_seconds`
 
-`phase_absolute_cap_seconds` is the absolute per-phase watchdog cap. It is
-**progress-aware**: when the cap is reached but the phase produced progress
-within `stall_cap_grace_seconds`, the cap is rolled forward by
-`stall_cap_extension_seconds` instead of killing the phase, so only a
-genuinely silent phase fires it. It defaults to `7200` when `job_max_seconds`
-is positive, and it is **disabled when `job_max_seconds` is `0`** (unlimited),
-regardless of this key. Set it to `null` or `0` to disable only the absolute
-cap for a bounded job. `stall_max_seconds` remains the normal progress-gated
-process cap, and `stall_seconds` still stops a truly silent phase.
+`phase_absolute_cap_seconds` is the absolute per-phase watchdog cap. For a
+bounded job (`job_max_seconds` positive) it is a true ceiling: a phase is
+stopped at this deadline even if it is still producing progress. Progress can
+extend the normal `stall_max_seconds` cap, but not this one. It defaults to
+`7200` when `job_max_seconds` is positive, and it is **disabled when
+`job_max_seconds` is `0`** (unlimited), regardless of this key, so a
+progressing unlimited phase is stopped only by the silent-phase stall timer.
+Set it to `null` or `0` to disable the absolute cap for a bounded job. The
+`stall_max_seconds` cap remains progress-gated, and `stall_seconds` still
+stops a truly silent phase.
 `stall_cap_hard_max_seconds` is the backwards-compatible alias, used only when
 the new key is not explicitly set. Environment aliases are
 `DSH_PHASE_ABSOLUTE_CAP_SECONDS` and `DEEPSEEK_PHASE_ABSOLUTE_CAP_SECONDS`.

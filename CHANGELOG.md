@@ -47,11 +47,11 @@ that stops crosscheck false alarms from being counted.
   `config.example.json` no longer pins `job_max_seconds`; its
   `phase_absolute_cap_seconds` entry is the documented default and is ignored
   when `job_max_seconds` is `0`. The new `phase_absolute_cap_seconds` is the
-  progress-aware absolute per-phase watchdog cap: it defaults to `7200` when
-  `job_max_seconds` is positive and is disabled while `job_max_seconds` is
-  `0`, so an unlimited job is never killed by a 7200 s ceiling while it is
-  progressing. At the cap a phase with recent progress rolls forward instead
-  of dying, so only a genuinely silent phase is stopped; the 3.14.x
+  absolute per-phase watchdog cap: it defaults to `7200` when
+  `job_max_seconds` is positive and is a true ceiling for that bounded job
+  (progress extends the normal `stall_max_seconds` cap, not this one); it is
+  disabled while `job_max_seconds` is `0`, so an unlimited job is never
+  killed by a 7200 s ceiling while it is progressing. The 3.14.x
   `stall_cap_hard_max_seconds` key remains a backwards-compatible alias.
 - **Commit-identity gate.** New `deepseek_mcp/git_identity.py` sets the
   repo-local identity from config `git_identity` (default

@@ -2306,11 +2306,11 @@ class _StallWatch(object):
     reviewer and both revision rounds were killed at 900.2/900.3 s while their
     child sessions and output files were demonstrably growing.
 
-    The absolute ceiling is progress-aware in the same way: at the ceiling a
-    phase that produced progress within the grace window rolls the ceiling
-    forward instead of dying.  Only a genuinely silent phase fires the ceiling.
-    An unlimited job passes ``hard_max_seconds=None`` so no absolute cap exists
-    at all; the silent-phase watchdog remains the only timer.
+    The absolute ceiling is *not* progress-gated: for a bounded job it fires at
+    its deadline even while progress continues, which is what "absolute" means
+    and the documented 3.14.x default.  An unlimited job passes
+    ``hard_max_seconds=None`` so no absolute cap exists at all; the
+    progress-gated ``stall_max_seconds`` and the silent-phase watchdog remain.
     """
 
     def __init__(self, stall_seconds, clock=None, max_seconds=None,
@@ -2330,8 +2330,8 @@ class _StallWatch(object):
         self._cap_extensions = 0
         self._cap_deadline = (self._started + float(max_seconds)
                               if max_seconds is not None else None)
-        # Progress may extend the cap only up to this absolute ceiling.  The
-        # ceiling itself rolls forward while progress is recent.
+        # Progress may extend the progress-gated cap only up to this absolute
+        # ceiling.  For a bounded job the ceiling itself is unconditional.
         self._hard_deadline = (self._started + float(hard_max_seconds)
                                if hard_max_seconds is not None else None)
         self._elapsed = None
@@ -2373,27 +2373,20 @@ class _StallWatch(object):
             if not cap_due and not hard_due:
                 return None
             if hard_due:
-                if (now - self._last) <= self.grace_seconds:
-                    # The phase is demonstrably progressing.  Roll the
-                    # absolute ceiling forward instead of killing work; this
-                    # is required for an unlimited job and is the sane default
-                    # even inside a finite job.
-                    self._hard_deadline = now + self.extension_seconds
-                    if (self._cap_deadline is not None
-                            and self._cap_deadline < self._hard_deadline):
-                        self._cap_deadline = self._hard_deadline
-                    self._cap_extensions += 1
-                    return None
-                # Silent for the whole grace window: this is the only case
-                # where the absolute ceiling fires.
+                # A configured absolute ceiling is unconditional for a bounded
+                # job: progress may extend the progress-gated ``stall_max``
+                # deadline, but it cannot push the phase past its ceiling.
+                # An unlimited job passes ``hard_max_seconds=None``, so this
+                # branch is unreachable there and only the silent-phase stall
+                # watchdog can stop a progressing phase.
                 return self._fire_cap(now, hard=True)
             if (now - self._last) <= self.grace_seconds:
                 # Still progressing: extend instead of destroying the work.
                 candidate = now + self.extension_seconds
                 if (self._hard_deadline is not None
                         and candidate >= self._hard_deadline):
-                    # Clamp the extension to the ceiling; a poll there either
-                    # rolls the ceiling forward (recent progress) or fires it.
+                    # Clamp the extension to the ceiling; the next poll fires
+                    # the unconditional ceiling.
                     self._cap_deadline = self._hard_deadline
                     self._cap_extensions += 1
                     return None

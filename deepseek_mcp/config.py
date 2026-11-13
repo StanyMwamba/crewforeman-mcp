@@ -117,11 +117,11 @@ DEFAULTS = {
     "stall_max_seconds": 1800.0,
     "stall_cap_grace_seconds": 120.0,
     "stall_cap_extension_seconds": 300.0,
-    # Absolute per-phase ceiling.  It is progress-aware: if the phase produced
-    # progress within stall_cap_grace_seconds at the deadline, the ceiling is
-    # rolled forward by stall_cap_extension_seconds instead of killing it.
-    # None/0 disables only the ceiling, not the progress-gated cap.  An
-    # unlimited whole-job budget (job_max_seconds 0/None) never applies it.
+    # Absolute per-phase ceiling for a bounded job.  It is unconditional: a
+    # phase is stopped at this deadline even while it is still progressing
+    # (progress can extend stall_max_seconds, not this ceiling).  None/0
+    # disables the ceiling, leaving the progress-gated cap.  An unlimited
+    # whole-job budget (job_max_seconds 0/None) never applies it.
     "phase_absolute_cap_seconds": 7200.0,
     # Backwards-compatible alias for phase_absolute_cap_seconds.  It is used
     # only when the new key is not explicitly set.

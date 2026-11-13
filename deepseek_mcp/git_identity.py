@@ -617,6 +617,16 @@ def _destination_ref(repo, src, dst, kind):
     return ""
 
 
+def _is_ancestor(repo, ancestor, descendant):
+    """True when *ancestor* is reachable from *descendant* (fast-forward)."""
+
+    if not ancestor or not descendant:
+        return False
+    rc, _out, _err = _git(
+        repo, ["merge-base", "--is-ancestor", str(ancestor), str(descendant)])
+    return rc == 0
+
+
 def _advertised_old(repo, remote, dst_ref):
     """Old destination sha from ``git ls-remote``, or ``""`` when unknown.
 
@@ -652,7 +662,8 @@ def _advertised_old(repo, remote, dst_ref):
             matches.append(sha)
     if len(matches) != 1:
         return ""
-    return _resolve_commit(repo, matches[0])
+    old = _resolve_commit(repo, matches[0])
+    return old or ""
 
 
 def _refspec_ranges(repo, remote, refspec, delete_mode):
@@ -697,15 +708,20 @@ def _refspec_ranges(repo, remote, refspec, delete_mode):
             # The push is materialised as <scanned-sha>:<dst_ref>; without a
             # destination ref we would have to re-resolve a mutable name.
             raise GitIdentityError("refspec_destination_unresolved:%s" % spec)
+        old_sha = _advertised_old(repo, remote, dst_ref)
+        if old_sha and not _is_ancestor(repo, old_sha, head_sha):
+            # A non-fast-forward would be rejected by git, but the gate must
+            # still scan what a forced/rewound destination would receive.
+            old_sha = ""
         ranges.append({
             "refspec": spec,
             "src": src,
             "dst": dst,
             "dst_ref": dst_ref,
             "head": head_sha,
-            # An unknown advertised old value scans the whole history of the
-            # local commit instead of trusting a stale tracking ref.
-            "base": _advertised_old(repo, remote, dst_ref) or "",
+            # An unknown or divergent advertised old value scans the whole
+            # history of the local commit instead of trusting a stale ref.
+            "base": old_sha or "",
         })
     if not ranges and not deletions:
         raise GitIdentityError("no_refspec")

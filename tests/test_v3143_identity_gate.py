@@ -174,6 +174,31 @@ class PushRangeTests(GateTestBase):
         self.assertEqual(self.bare_refs(), [],
                          "a blocked side ref must not reach the remote")
 
+    def test_divergent_advertised_old_falls_back_to_full_history(self):
+        # A remote rewound/advanced to a locally known but divergent commit
+        # makes rev-list old..head not equal the sent set.  The gate must not
+        # trust it: the range becomes the full history and still catches a
+        # foreign commit.
+        base = self.commit_connector("base")
+        rc, _out, err = git_identity.push_with_gate(
+            CFG, self.repo, "origin", "main:main", base=base)
+        self.assertEqual(rc, 0, err)
+        self.git("checkout", "-b", "ahead")
+        ahead = self.commit_connector("ahead")
+        self.git("checkout", "main")
+        moved = _run(["push", str(self.bare), "ahead:refs/heads/main"],
+                     self.repo)
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.commit_as("foreign", "Outsider", "outsider@example.org")
+        ranges, _deletions = git_identity._refspec_ranges(
+            self.repo, "origin", "main:main", False)
+        self.assertEqual(ranges[0]["base"], "",
+                         "a divergent advertised old must scan full history")
+        report = git_identity.check_push(
+            CFG, repo=str(self.repo), base=ranges[0]["base"],
+            head=ranges[0]["head"], remote="origin")
+        self.assertFalse(report["ok"], report)
+
     def test_every_refspec_in_a_list_is_gated(self):
         base = self.commit_connector("base")
         self.git("checkout", "-b", "side")

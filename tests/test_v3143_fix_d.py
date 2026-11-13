@@ -1,4 +1,4 @@
-"""FIX D: configurable, progress-aware phase absolute cap.
+"""FIX D: configurable phase absolute cap, disabled for unlimited jobs.
 
 The 3.14.3 unlimited-job fix must not re-introduce a 7200 s ceiling for a
 phase whose whole-job limit is None/0.  ``phase_absolute_cap_seconds`` is the
@@ -138,7 +138,9 @@ class ProgressAwareCeilingTests(unittest.TestCase):
         self.assertTrue(watch.cap_hit())
         self.assertFalse(watch.cap_hard())
 
-    def test_active_progress_at_the_absolute_ceiling_extends_it(self):
+    def test_active_progress_at_a_bounded_absolute_ceiling_still_fires(self):
+        # For job_max_seconds > 0 the documented default is unchanged: the
+        # absolute phase ceiling is unconditional even while progress flows.
         now = [0.0]
         watch = harness._StallWatch(
             None, clock=lambda: now[0], max_seconds=10.0,
@@ -146,11 +148,8 @@ class ProgressAwareCeilingTests(unittest.TestCase):
             hard_max_seconds=250.0)
         now[0] = 250.0
         watch.touch("child", "still growing")
-        self.assertIsNone(watch.poll())
-        self.assertFalse(watch.cap_hit())
-        # No progress after the extension: silence for the grace window fires.
-        now[0] = 351.0
         self.assertEqual(watch.poll(), "cap")
+        self.assertTrue(watch.cap_hit())
         self.assertTrue(watch.cap_hard())
 
 
