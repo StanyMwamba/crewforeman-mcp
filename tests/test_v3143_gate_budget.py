@@ -56,13 +56,10 @@ class GateBudgetWiringTests(unittest.TestCase):
         self.state = os.path.join(self.ws, "state")
 
     def _run_gate(self, **cfg_overrides):
-        path = os.path.join(self.ws, "pkg", "mod.py")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("VALUE = 1\n")
-        before = gate._snapshot(self.ws)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("VALUE = 2\n")
+        # Deterministic, platform-independent baseline: a synthetic snapshot
+        # diff is enough to make this a product change, and it avoids relying
+        # on the temp-directory scanner (Windows may exclude its TEMP root).
+        before = {"pkg/mod.py": "before"}
         values = {
             "gate_enabled": True,
             "gate_max_output_chars": 4000,
@@ -76,8 +73,10 @@ class GateBudgetWiringTests(unittest.TestCase):
             captured["remaining"] = deadline - time.monotonic()
             return _ok_check()
 
-        with mock.patch.object(gate, "_secret_check",
-                               return_value=_ok_check("secrets")), \
+        with mock.patch.object(
+                gate, "_snapshot", return_value={"pkg/mod.py": "after"}), \
+                mock.patch.object(gate, "_secret_check",
+                                  return_value=_ok_check("secrets")), \
                 mock.patch.object(gate, "_lint_check",
                                   return_value=_ok_check("lint")), \
                 mock.patch.object(gate, "_tests_check",
