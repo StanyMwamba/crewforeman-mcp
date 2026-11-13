@@ -31,6 +31,10 @@ CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 CACHE_FILENAME = "harness-concurrency.json"
 PROBE_AGENTS = 16
 PROBE_MARKER = "CONCURRENCY_PROBE"
+# Mirrors harness.parse_event FINAL_TYPES: the harness --json stream uses
+# several final-ish event types, and the answer may live under several keys.
+FINAL_EVENT_TYPES = ("final", "result", "done", "completion", "completed")
+ANSWER_KEYS = ("text", "answer", "message", "content", "result", "output")
 
 
 def _now():
@@ -314,10 +318,58 @@ return {maxActive, started, failures};
     )
 
 
+def _content_text(value):
+    """Flatten a harness answer field that may be str, list, or dict."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return _content_text(value.get("text") or value.get("content")
+                             or value.get("answer"))
+    return ""
+
+
+def _event_answer_text(event):
+    """Best-effort answer text from one harness ``--json`` event.
+
+    Mirrors harness.parse_event: the text may live under text/answer/
+    message/content/result/output at the top level or inside ``data``.
+    """
+    if not isinstance(event, dict):
+        return ""
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    for source in (event, data):
+        for key in ANSWER_KEYS:
+            text = _content_text(source.get(key))
+            if text.strip():
+                return text
+    return ""
+
+
 def _extract_probe_result(text):
-    """Find a JSON object containing maxActive/started/failures in text."""
+    """Find a JSON object containing maxActive/started/failures in text.
+
+    Handles both a bare JSON object in prose and one escaped inside a string
+    value of a JSON event line (``{"type":"text","text":"{...}"}``), which is
+    how streamed assistant text carries the probe answer in ``--json`` mode.
+    """
     if not text:
         return None
+    found = _scan_probe_json(text)
+    if found is not None:
+        return found
+    return _scan_embedded_probe_json(text)
+
+
+def _scan_probe_json(text):
+    """Return the first bare JSON object in text that carries probe keys."""
     decoder = json.JSONDecoder()
     for index, char in enumerate(text):
         if char != "{":
@@ -326,12 +378,63 @@ def _extract_probe_result(text):
             value, _end = decoder.raw_decode(text[index:])
         except Exception:
             continue
-        if isinstance(value, dict) and any(
-                key in value for key in ("maxActive", "max_active",
-                                         "max_concurrent", "max_concurrent_children",
-                                         "concurrency")):
+        if _looks_like_probe_result(value):
             return value
     return None
+
+
+def _looks_like_probe_result(value):
+    return isinstance(value, dict) and any(
+        key in value for key in ("maxActive", "max_active",
+                                 "max_concurrent", "max_concurrent_children",
+                                 "concurrency"))
+
+
+def _scan_embedded_probe_json(text, depth=2):
+    """Find probe JSON escaped inside the string values of JSON in text."""
+    if depth <= 0:
+        return None
+    for value in _decoded_json_values(text):
+        for string in _string_values(value):
+            if "{" not in string:
+                continue
+            found = _scan_probe_json(string)
+            if found is not None:
+                return found
+            found = _scan_embedded_probe_json(string, depth - 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _decoded_json_values(text):
+    """Yield JSON values decoded from text (the whole text or each line)."""
+    try:
+        value = json.loads(text)
+    except Exception:
+        value = None
+    if value is not None:
+        yield value
+        return
+    for line in text.splitlines():
+        try:
+            yield json.loads(line)
+        except Exception:
+            continue
+
+
+def _string_values(value):
+    """Yield every string inside a decoded JSON value, however nested."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            for text in _string_values(item):
+                yield text
+    elif isinstance(value, list):
+        for item in value:
+            for text in _string_values(item):
+                yield text
 
 
 def _probe_value(result):
@@ -379,14 +482,21 @@ def _run_probe_process(cfg, n):
         # The workspace is only for the probe's one JSON file; leave it in
         # place on failure for diagnostics, remove it on success below.
         pass
-    final = None
+    answer_texts = []
+    other_texts = []
     for line in (proc.stdout or "").splitlines():
         try:
             event = json.loads(line)
         except Exception:
             continue
-        if isinstance(event, dict) and str(event.get("type")) == "final":
-            final = event.get("text") or event.get("answer")
+        text = _event_answer_text(event)
+        if not text:
+            continue
+        typ = str(event.get("type") or "").lower() if isinstance(event, dict) else ""
+        if typ in FINAL_EVENT_TYPES:
+            answer_texts.append(text)
+        else:
+            other_texts.append(text)
     result = None
     probe_file = workspace / "concurrency-probe.json"
     if probe_file.is_file():
@@ -395,7 +505,11 @@ def _run_probe_process(cfg, n):
         except Exception:
             result = None
     if result is None:
-        result = _extract_probe_result(final or "")
+        # Last final-ish answer first, then any other streamed text.
+        for text in list(reversed(answer_texts)) + list(reversed(other_texts)):
+            result = _extract_probe_result(text)
+            if result is not None:
+                break
     if result is None:
         result = _extract_probe_result(proc.stdout or "")
     if result is None:
@@ -495,18 +609,20 @@ def detect(cfg, force_probe=False, probe_runner=None, now=None, allow_probe=True
                 "probe_error": probe.get("error")}
 
     # Last resort: documented value even if force_probe was requested and the
-    # probe failed, then the generic fallback.
+    # probe failed, then the generic fallback.  A probe that produced no
+    # result is never cached as authoritative truth: the soft default is
+    # returned for this call only (source stays "documented"/"fallback", never
+    # "probe"), so the next detect() re-probes instead of pinning the failure
+    # for the whole cache lifetime.
     if documented.get("limit"):
         value = int(documented["limit"])
         source = "documented"
     else:
         value = FALLBACK_CONCURRENCY
         source = "fallback"
-    record = write_cache(cfg, value, source, version,
-                         probe={"probe_error": probe.get("error")})
     return {"limit": value, "source": source, "cached": False,
             "harness_version": version, "probe_error": probe.get("error"),
-            "detected_at": record.get("detected_at")}
+            "detected_at": _iso()}
 
 
 def get_concurrency(cfg, **kwargs):
