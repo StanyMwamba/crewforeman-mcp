@@ -48,6 +48,10 @@ _SCP_RE = re.compile(
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# A merge conflict is shown as a combined diff: @@@ with one -range per parent
+# and multiple marker columns on each content line.
+_COMBINED_HUNK_RE = re.compile(
+    r"^@{3,}(?: -\d+(?:,\d+)?)+ \+(\d+)(?:,\d+)? @{3,}")
 
 # Content rules.  The synthetic example@example.com / user@example.com
 # placeholders are deliberately allowed (all of example.com/org/net).
@@ -889,6 +893,40 @@ def _effective_remote_url(repo, url):
     return lines[0]
 
 
+def _push_rewritten_urls(repo, url):
+    """URLs produced by ``url.<base>.pushInsteadOf`` for a push of *url*.
+
+    ``git ls-remote --get-url`` expands ``insteadOf`` but not the separate
+    ``pushInsteadOf`` rule that only applies to pushes.  The gate must see the
+    actual push destination, so the longest matching pushInsteadOf rewrite is
+    added as a candidate; every candidate must agree or no exception applies.
+    """
+
+    text = str(url or "").strip()
+    if not text:
+        return []
+    rc, out, _err = _git(
+        repo, ["config", "--get-regexp", r"^url\..*\.pushinsteadof$"])
+    if rc != 0 or not out.strip():
+        return []
+    matches = []
+    for line in out.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) != 2:
+            continue
+        key, prefix = fields[0], fields[1]
+        if not key.startswith("url.") or not key.endswith(".pushinsteadof"):
+            continue
+        if not prefix or not text.startswith(prefix):
+            continue
+        base = key[len("url."):-len(".pushinsteadof")]
+        matches.append((len(prefix), base + text[len(prefix):]))
+    if not matches:
+        return []
+    matches.sort(key=lambda item: -item[0])
+    return [matches[0][1]]
+
+
 def _remote_candidates(repo, remote):
     """Return the remote locations for exact matching (never a bare label).
 
@@ -905,8 +943,12 @@ def _remote_candidates(repo, remote):
     if text and _looks_like_location(text):
         values.append(text)
         values.append(_effective_remote_url(repo, text))
+        values.extend(_push_rewritten_urls(repo, text))
     if text:
-        values.extend(_remote_urls(repo, text, push=True))
+        push_urls = _remote_urls(repo, text, push=True)
+        values.extend(push_urls)
+        for value in push_urls:
+            values.extend(_push_rewritten_urls(repo, value))
     seen = set()
     result = []
     for value in values:
@@ -1059,16 +1101,38 @@ def _added_lines(diff_text):
     """
     line_no = 0
     in_hunk = False
+    combined_parents = 0
     for line in diff_text.splitlines():
         if line.startswith("diff --"):
             in_hunk = False
+            combined_parents = 0
             continue
         match = _HUNK_RE.match(line)
+        combined = False
+        if not match:
+            match = _COMBINED_HUNK_RE.match(line)
+            combined = bool(match)
         if match:
             line_no = int(match.group(1))
             in_hunk = True
+            combined_parents = (
+                len(re.findall(r" -\d", line.split(" +", 1)[0]))
+                if combined else 0)
             continue
         if not in_hunk:
+            continue
+        if combined:
+            if line.startswith("\\"):
+                continue
+            markers = line[:combined_parents]
+            if "+" in markers:
+                # Scan the content after the marker columns; the line number
+                # is approximate in a combined hunk but violations only need
+                # a stable locator.
+                yield line_no, line[combined_parents:]
+                line_no += 1
+            elif line_no:
+                line_no += 1
             continue
         if line.startswith("+"):
             yield line_no, line[1:]

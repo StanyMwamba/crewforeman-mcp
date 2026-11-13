@@ -838,6 +838,32 @@ class RemoteMatchingTests(GateTestBase):
             git_identity.exception_for_remote(EXCEPTION_CFG, self.repo,
                                               "split"), "")
 
+    def test_pushinsteadof_rewrite_cannot_borrow_exception(self):
+        self.git("config", "url.file:///tmp/cf-push-target/.pushInsteadOf",
+                 "https://github.com/example-org/")
+        self._add("fork", "https://github.com/example-org/Cypraea.git")
+        self.assertEqual(
+            git_identity.exception_for_remote(
+                EXCEPTION_CFG, self.repo, "fork"), "",
+            "a pushInsteadOf rewrite to another destination must not borrow "
+            "the exception granted to the literal URL")
+
+    def test_combined_merge_diff_content_is_scanned(self):
+        diff = (
+            "diff --cc contact.txt\n"
+            "index 1111111,2222222..3333333\n"
+            "--- a/contact.txt\n"
+            "+++ b/contact.txt\n"
+            "@@@ -1,2 -1,2 +1,3 @@@\n"
+            "  context\n"
+            "++contact: personal@" "example.invalid\n")
+        violations = []
+        git_identity._scan_added_diff(diff, "abc", {}, violations)
+        self.assertTrue(
+            any(item.get("rule") == "email" for item in violations),
+            "a combined merge hunk must not hide added content: %r"
+            % (violations,))
+
     def test_direct_url_is_a_candidate_but_only_exact(self):
         exact = "https://github.com/example-org/Cypraea.git"
         self.assertEqual(
