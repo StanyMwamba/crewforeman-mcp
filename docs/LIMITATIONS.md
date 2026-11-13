@@ -92,13 +92,23 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
 - **Real `mimo` is never exercised in CI.** The suite drives fake `mimo`
   programs only (recorded JSONL event streams, auth/limit/network errors,
   slow and silent runs, serve/attach) on macOS, Ubuntu and Windows under
-  Python 3.9 and 3.15. A real `mimo` v0.1.17 behaviour that differs from
-  the recorded contract - event schema, flags, serve URL, health endpoint -
-  is not proven by CI and needs an adapter update first.
-- **Serve/attach protocol assumptions.** `mimo serve` is assumed to expose
-  a `/healthz` ready check and `mimo run --attach <url>` to speak the same
-  JSONL event stream as a direct run; the server lifecycle (start, ready
-  check, stop, cleanup on crash) is built on that v0.1.17 contract.
+  Python 3.9 and 3.15. The serve/attach CLI and health facts below were
+  verified by hand against real `mimo` v0.1.17 and the fakes reproduce
+  them; anything not listed there - for example the JSONL event schema of
+  a long run - is not proven by CI and needs an adapter update first.
+- **Serve/attach contract (verified on `mimo` v0.1.17).** `mimo serve`
+  takes `--hostname <h>` (default 127.0.0.1) and `--port <n>` (0 =
+  OS-assigned) - there is no `--host` flag - and prints
+  `mimocode server listening on http://127.0.0.1:<port>` on stdout;
+  readiness is `GET /global/health` returning 2xx (`/healthz` answers
+  503 and is not a ready check). The server is unsecured unless
+  `MIMOCODE_SERVER_PASSWORD` is in its environment; CrewForeman generates
+  a per-server password, passes it only via that env var to `mimo serve`
+  and to every `mimo run --attach <url>` (never in argv, never recorded),
+  and sends HTTP basic auth on health probes. `--dir` stays the absolute
+  workspace path (it is the path on the remote server when attaching).
+  Still assumed: `--attach` runs speak the same JSONL event stream as a
+  direct run.
 - **`mimocode.jsonc` is MiMo's permission system, not an OS sandbox.** The
   per-run file scopes what the MiMo worker may do inside its own rules; the
   OS file-write boundary (Seatbelt / Landlock / restricted token) is a
