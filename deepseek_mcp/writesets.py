@@ -118,7 +118,8 @@ def normalise_rel(path, workspace=None):
         return ""
     if workspace:
         root = os.path.normcase(os.path.realpath(str(workspace))).replace("\\", "/")
-        candidate = os.path.normcase(os.path.realpath(text)) if os.path.isabs(text) else ""
+        candidate = (os.path.normcase(os.path.realpath(text)).replace("\\", "/")
+                     if os.path.isabs(text) else "")
         if candidate and candidate.startswith(root.rstrip("/") + "/"):
             # Strip the separator too: "/root/src/a.py" -> "src/a.py".
             text = candidate[len(root):].lstrip("/")
