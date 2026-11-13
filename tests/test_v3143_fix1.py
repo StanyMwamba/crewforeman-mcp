@@ -3,9 +3,12 @@
 Run from the repo root with:  python -m pytest test_candidate.py -q
 """
 import io
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 for _cand in (_HERE, _HERE.parents[0] / "repo",
@@ -14,7 +17,9 @@ for _cand in (_HERE, _HERE.parents[0] / "repo",
         sys.path.insert(0, str(_cand))
         break
 
-from deepseek_mcp import harness, jobs, status  # noqa: E402
+from deepseek_mcp import harness, jobs, safety, status  # noqa: E402
+from deepseek_mcp.config import load_config  # noqa: E402
+from tests.fakes import base_env, write_fake_dsh  # noqa: E402
 
 
 class ClosedHandleRetryTests(unittest.TestCase):
@@ -106,3 +111,35 @@ class GateDegradedTerminalStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopDrainIntegrationTest(unittest.TestCase):
+    """The stop path must drain a child that is still flushing."""
+
+    def test_stop_keeps_draining_until_the_child_exits(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        dsh = write_fake_dsh(root / "dsh")
+        env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
+        cfg = load_config(config_path=root / "config.json", env=env)
+        child_env = dict(env)
+        child_env.update({
+            "FAKE_DSH_MODE": "drain",
+            "FAKE_DSH_DRAIN_SECONDS": "1.2",
+        })
+        with mock.patch.dict(os.environ, child_env, clear=False):
+            result = harness._execute_once_impl(
+                cfg, workspace, "drain after stop", limit=0.4,
+                policy=safety.resolve({}, cfg), dsh_bin=str(dsh))
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertEqual(result["answer"], "drain complete")
+        self.assertGreaterEqual(result["events"], 3,
+                                "events written after the stop were lost")
+        self.assertNotIn("flush on a closed handle", result["error"] or "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

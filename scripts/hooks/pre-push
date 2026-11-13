@@ -31,13 +31,9 @@ while read local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue          # branch deletion
     base="$remote_sha"
     case "$base" in
-        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base="" ;;
     esac
-    if [ -z "$base" ]; then
-        echo "pre-push: cannot determine a base for $local_ref; refusing." >&2
-        status=1
-        continue
-    fi
+    # An empty base scans the full pushed history (new branch, no origin/main).
     if ! "$PYTHON" -m deepseek_mcp.git_identity \
             --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
         status=1

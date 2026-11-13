@@ -49,7 +49,8 @@ that stops crosscheck false alarms from being counted.
   on the remote name, `owner/repo` or full URL, so a lookalike remote cannot
   borrow the exception, and no personal address is hardcoded. The connector
   installs the `pre-push` hook on the first commit/rebase it creates (an
-  operator's own hook is left alone) and exposes
+  operator's own hook is preserved as `pre-push.local` and runs first) and
+  exposes
   `git_identity.push_with_gate` for connector-controlled pushes. CLI:
   `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`

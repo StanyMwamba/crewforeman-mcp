@@ -227,6 +227,23 @@ if mode == "tree":
     emit({"type": "tool_call", "name": "bash"})
     time.sleep(30)
     sys.exit(0)
+if mode == "drain":
+    # A child that ignores SIGTERM and keeps writing after the connector's
+    # stop reason: the stop path must keep draining stdout until it exits.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    emit({"type": "session", "version": 4, "id": "drain-session",
+          "cwd": str(workspace.resolve())})
+    deadline = time.time() + float(os.environ.get("FAKE_DSH_DRAIN_SECONDS", "1.2"))
+    seq = 0
+    while time.time() < deadline:
+        seq += 1
+        emit({"type": "tool_call", "name": "bash", "seq": seq})
+        time.sleep(0.1)
+    emit({"type": "final", "text": "drain complete"})
+    # Non-zero makes the deliberate stop observable after the drain; a zero
+    # exit with a final answer is correctly relabelled a normal completion.
+    sys.exit(3)
 if mode == "error":
     emit({"type": "error", "message": os.environ.get("FAKE_DSH_ERROR_MESSAGE", "fake dsh failure")})
     sys.exit(1)

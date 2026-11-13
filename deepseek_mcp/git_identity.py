@@ -78,6 +78,13 @@ def _git(repo, args, timeout=120):
     env.setdefault("LC_ALL", "C")
     for name in _IDENTITY_ENV:
         env.pop(name, None)
+    # ``GIT_CONFIG_COUNT``/``KEY_n``/``VALUE_n`` can inject a competing
+    # user.email or core.hooksPath without touching any config file.
+    for name in list(env):
+        if (name == "GIT_CONFIG_COUNT"
+                or name.startswith("GIT_CONFIG_KEY_")
+                or name.startswith("GIT_CONFIG_VALUE_")):
+            env.pop(name, None)
     try:
         proc = subprocess.run(
             ["git"] + [str(a) for a in args],
@@ -212,7 +219,18 @@ _PRE_PUSH_HOOK = r"""#!/bin/sh
 # commit or rebase.  It scans the commit METADATA (author and committer
 # name+email) and the added file content of every pushed commit, and blocks
 # the push when anything is outside the allowlist.
+#
+# An operator's previous hook is preserved as ``pre-push.local`` in this
+# directory and runs first; it is never discarded.
 zero="0000000000000000000000000000000000000000"
+HOOK_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+refs="$HOOK_DIR/.pre-push-refs.$$"
+trap 'rm -f "$refs"' EXIT HUP INT TERM
+cat > "$refs" || exit 1
+status=0
+if [ -x "$HOOK_DIR/pre-push.local" ]; then
+    "$HOOK_DIR/pre-push.local" "$@" < "$refs" || status=1
+fi
 PYTHON="${CF_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
     for candidate in python3 python; do
@@ -226,24 +244,25 @@ if [ -z "$PYTHON" ]; then
     echo "pre-push: no python interpreter found; refusing." >&2
     exit 1
 fi
+CF_PYTHONPATH="__CF_SOURCE__"
+if [ -n "${PYTHONPATH:-}" ]; then
+    CF_PYTHONPATH="$CF_PYTHONPATH__CF_SEP__$PYTHONPATH"
+fi
+export PYTHONPATH="$CF_PYTHONPATH"
 remote="$1"
-status=0
 while read local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue
     base="$remote_sha"
     case "$base" in
-        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base="" ;;
     esac
-    if [ -z "$base" ]; then
-        echo "pre-push: cannot determine a base for $local_ref; refusing." >&2
-        status=1
-        continue
-    fi
+    # An empty base scans the full pushed history (new branch, no origin/main);
+    # refusing would make an ordinary push impossible.
     if ! "$PYTHON" -m deepseek_mcp.git_identity \
             --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
         status=1
     fi
-done
+done < "$refs"
 if [ "$status" -ne 0 ]; then
     echo "pre-push: blocked by the CrewForeman privacy/identity gate." >&2
 fi
@@ -252,12 +271,11 @@ exit "$status"
 
 
 def ensure_pre_push_hook(repo, cfg=None):
-    """Install the pre-push gate in *repo*; keep an operator's own hook.
+    """Install the pre-push gate in *repo* without discarding an operator hook.
 
-    Returns ``(ok, detail)``.  A repository that already carries a different
-    pre-push hook is left untouched (``existing_hook_kept``) so the connector
-    never overwrites an operator's gate; the shipped hook remains available
-    at ``scripts/hooks/pre-push`` and is documented in OPERATIONS.md.
+    A previous ``pre-push`` hook is moved to ``pre-push.local`` (once) and the
+    installed gate runs it first, so the connector never silently bypasses an
+    operator's policy.  Returns ``(ok, detail)``.
     """
 
     rc, out, err = _git(repo, ["rev-parse", "--git-path", "hooks"])
@@ -269,23 +287,36 @@ def ensure_pre_push_hook(repo, cfg=None):
     if not os.path.isabs(hooks):
         hooks = os.path.join(str(repo), hooks)
     path = os.path.join(hooks, "pre-push")
+    local = path + ".local"
+    source = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hook = (_PRE_PUSH_HOOK.replace("__CF_SOURCE__", source)
+            .replace("__CF_SEP__", os.pathsep))
     try:
         os.makedirs(hooks, exist_ok=True)
         existing = ""
+        chained = False
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 existing = handle.read()
         if existing and _PRE_PUSH_MARKER not in existing:
-            return True, "existing_hook_kept"
-        if existing.strip() == _PRE_PUSH_HOOK.strip():
-            return True, "already_installed"
+            if os.path.exists(local):
+                with open(local, "r", encoding="utf-8",
+                          errors="replace") as handle:
+                    previous = handle.read()
+                if previous != existing:
+                    return False, "existing_hook_conflict"
+            else:
+                os.replace(path, local)
+            chained = True
+        if existing.strip() == hook.strip():
+            return True, "chained" if chained else "already_installed"
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(_PRE_PUSH_HOOK)
+            handle.write(hook)
         try:
             os.chmod(path, 0o755)
         except OSError:
             pass
-        return True, "installed"
+        return True, "chained" if chained else "installed"
     except OSError as exc:
         return False, "hook_install_failed:%s" % (exc,)
 

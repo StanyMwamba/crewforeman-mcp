@@ -246,14 +246,28 @@ class GitIdentityTest(unittest.TestCase):
         text = hook.read_text(encoding="utf-8")
         self.assertIn("CrewForeman pre-push gate (auto-installed)", text)
         self.assertIn("deepseek_mcp.git_identity", text)
+        # The installed hook must be able to import the package even when the
+        # clone is not the connector checkout and the package is not installed.
+        self.assertIn(str(REPO_ROOT), text)
 
-    def test_existing_operator_hook_is_never_overwritten(self):
+    def test_existing_operator_hook_is_chained_not_discarded(self):
         hook = self.repo / ".git" / "hooks" / "pre-push"
         hook.parent.mkdir(parents=True, exist_ok=True)
-        hook.write_text("#!/bin/sh\necho operator-hook\n", encoding="utf-8")
+        operator = "#!/bin/sh\necho operator-hook\n"
+        hook.write_text(operator, encoding="utf-8")
         self.commit("first")
-        self.assertEqual(hook.read_text(encoding="utf-8"),
-                         "#!/bin/sh\necho operator-hook\n")
+        self.assertEqual((hook.parent / "pre-push.local").read_text(
+            encoding="utf-8"), operator)
+        text = hook.read_text(encoding="utf-8")
+        self.assertIn("CrewForeman pre-push gate (auto-installed)", text)
+        self.assertIn("pre-push.local", text)
+
+    def test_core_hooks_path_is_honoured(self):
+        self.git("config", "core.hooksPath", ".githooks")
+        self.commit("first")
+        hook = self.repo / ".githooks" / "pre-push"
+        self.assertTrue(hook.is_file())
+        self.assertFalse((self.repo / ".git" / "hooks" / "pre-push").exists())
 
     def test_push_with_gate_blocks_foreign_then_allows_connector_identity(self):
         bare = self.root / "remote.git"
@@ -323,6 +337,37 @@ class GitIdentityTest(unittest.TestCase):
                                          head="HEAD", remote="upstream")
         self.assertTrue(report["ok"], report["messages"])
         self.assertEqual(report["exception"], "example-org/Cypraea")
+
+    def test_exception_remote_still_scans_content(self):
+        base = self.commit("base", "base.txt")
+        self.git("remote", "add", "upstream",
+                 "https://github.com/example-org/Cypraea.git")
+        self.commit("secret", "notes.txt",
+                    "api_" + "key = " + chr(34) + "sk-"
+                    + "abcdefghijklmnopqrstuvwxyz012345" + chr(34) + "\n")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["upstream"]}
+        report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
+                                         head="HEAD", remote="upstream")
+        self.assertFalse(report["ok"], "an exception must not skip content")
+        self.assertIn("api_key", {v.get("rule")
+                                  for v in report["violations"]})
+
+    def test_git_config_count_cannot_inject_an_identity(self):
+        self.write("env.txt", "x")
+        self.git("add", "-A")
+        leak = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "user.email",
+            "GIT_CONFIG_VALUE_0": "injected@example.org",
+        }
+        with mock.patch.dict(os.environ, leak, clear=False):
+            rc, _out, err = git_identity.commit_with_identity(
+                CFG, self.repo, "config injection")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.ident(),
+                         ["crewforeman-mcp", "noreply@example.com",
+                          "crewforeman-mcp", "noreply@example.com"])
 
     def test_metadata_gate_blocks_foreign_author_name(self):
         base = self.commit("base", "base.txt")

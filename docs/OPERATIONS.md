@@ -1400,18 +1400,23 @@ identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
 Matching is **exact**, not a substring: an entry may be the remote name
 (`origin`), `owner/repo`, or a full URL (with or without `.git`). A substring
 match would let an entry such as `owner/repo` exempt an unrelated
-`evil.example/fork-of-owner/repo` push target. No personal address is built
-in anywhere.
+`evil.example/fork-of-owner/repo` push target. Prefer `owner/repo` or a full
+URL over a bare remote name: an entry of `origin` exempts every push to that
+remote's identity metadata (its content is still secret-scanned). No personal
+address is built in anywhere.
 
 ```bash
 python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \
     --remote origin        # exit 1 blocks the push
 ```
 
-The connector installs `scripts/hooks/pre-push` automatically the first time
-it creates a commit or rebase in a clone, so later `git push` runs the gate
-even if `core.hooksPath` was never configured. An operator's existing
-`pre-push` hook is never overwritten. To install it by hand instead:
+The connector installs the gate automatically the first time it creates a
+commit or rebase in a clone, so later `git push` runs the gate even if
+`core.hooksPath` was never configured. An operator's existing `pre-push` hook
+is preserved as `pre-push.local` and runs first; the gate never discards it.
+The hook embeds the connector package path, so it works even when the clone
+is not the connector checkout. To install the checked-in hook by hand
+instead:
 
 ```bash
 git config core.hooksPath scripts/hooks
