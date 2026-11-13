@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from deepseek_mcp import admission, jobs
 from deepseek_mcp.admission import (
@@ -20,6 +21,11 @@ from deepseek_mcp.admission import (
     PRIORITY_RESUME,
 )
 from deepseek_mcp.config import load_config
+
+
+class _Cfg(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def _cfg(root, **overrides):
@@ -42,7 +48,7 @@ def _cfg(root, **overrides):
         "depends_on_policy": "success",
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return _Cfg(**values)
 
 
 class DependsOnPolicyTests(unittest.TestCase):
@@ -137,6 +143,30 @@ class DependsOnPolicyTests(unittest.TestCase):
         self.assertIn(parked["status"], ("failed", "error"))
         self.assertTrue(parked.get("parked_on_dependency"))
         return parked
+
+    def test_start_job_resume_revives_parked_dependent(self):
+        ctrl = self._controller()
+        self._parked_dependent(ctrl)
+        submitted = {}
+
+        def fake_submit(work_id, **kwargs):
+            submitted.update(kwargs)
+            return {"state": "queued", "position": 0}
+
+        with mock.patch.object(jobs, "_admission_controller",
+                               return_value=ctrl), \
+                mock.patch.object(ctrl, "submit", side_effect=fake_submit), \
+                mock.patch.object(ctrl, "start") as start:
+            jobs.start_job(
+                "resume_deepseek",
+                {"run_id": "dep", "prompt": "x", "wait_seconds": 0},
+                cfg=self.cfg, wait=0)
+        new_run = submitted.get("run_id")
+        self.assertTrue(new_run)
+        record = self.store._load_item("child")
+        self.assertEqual(record["status"], "queued")
+        self.assertEqual(record["depends_on"], new_run)
+        self.assertTrue(start.called, "the revived dependent was not started")
 
     def test_resume_revives_parked_dependent(self):
         ctrl = self._controller()
