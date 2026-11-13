@@ -466,7 +466,7 @@ def exception_for_remote(cfg, repo, remote):
 
 def _rev_list(repo, base, head):
     if not head:
-        return []
+        raise GitIdentityError("missing_head")
     if base:
         rc, out, err = _git(repo, ["rev-list", "--reverse", base + ".." + head])
     else:
@@ -649,6 +649,17 @@ def check_push(cfg=None, repo=".", base="", head="HEAD", remote=None):
         "messages": [],
     }
     try:
+        # A gate must fail closed on an unresolvable head: an empty range used
+        # to report OK with zero commits scanned.
+        if not str(head or "").strip():
+            raise GitIdentityError("missing_head")
+        rc, out, err = _git(
+            repo, ["rev-parse", "--verify", str(head) + "^{commit}"])
+        if rc != 0 or not out.strip():
+            raise GitIdentityError(
+                (err or "head_not_resolvable").strip())
+        head = out.strip()
+        report["head"] = head
         report["metadata"] = commit_metadata(repo, base, head)
         exception = exception_for_remote(cfg, repo, remote)
         report["exception"] = exception

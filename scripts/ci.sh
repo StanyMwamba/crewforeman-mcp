@@ -38,6 +38,24 @@ echo "interpreter: $(command -v "$PYTHON")"
 echo "== static CI contract =="
 "$PYTHON" tools/ci_hygiene.py || fail "ci_hygiene.py failed"
 
+echo "== commit identity gate =="
+GATE_BASE="${GATE_BASE:-}"
+if [ -z "$GATE_BASE" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
+    GATE_BASE=origin/main
+fi
+if [ -n "$GATE_BASE" ]; then
+    case "$GATE_BASE" in
+        0000000000000000000000000000000000000000)
+            GATE_BASE=$(git rev-list --max-parents=0 HEAD) ;;
+    esac
+    if ! git cat-file -e "${GATE_BASE}^{commit}" 2>/dev/null; then
+        GATE_BASE=$(git rev-list --max-parents=0 HEAD)
+    fi
+    PYTHONPATH="$REPO_ROOT" "$PYTHON" -m deepseek_mcp.git_identity \
+        --repo "$REPO_ROOT" --base "$GATE_BASE" --head HEAD --remote origin \
+        || fail "commit identity/content gate failed"
+fi
+
 echo "== install package =="
 "$PYTHON" -m pip install --disable-pip-version-check --no-input . \
     || fail "pip install . failed"

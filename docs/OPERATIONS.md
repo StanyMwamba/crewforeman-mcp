@@ -1425,9 +1425,12 @@ git config core.hooksPath scripts/hooks
 Connector-controlled release tooling calls
 `git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)` (wrapped
 by `scripts/ship_push.py`) and never a bare `git push`: it runs the same gate
-and returns before the push on any violation. That helper is the hard gate; the Git hook is cooperative and, like every Git hook, can be
-skipped with `git push --no-verify`, so release/publish tooling must call
-`push_with_gate` rather than a bare `git push`.
+and returns before the push on any violation. That helper is the hard local
+gate; the Git hook is cooperative and, like every Git hook, can be skipped
+with `git push --no-verify`. GitHub Actions therefore runs the same CLI gate
+over the pushed range before the test matrix, so a bypassed local hook still
+cannot land an off-allowlist commit or content on `main`. Release/publish
+tooling must call `push_with_gate` rather than a bare `git push`.
 `scripts/hooks/pre-push` runs the same gate for each pushed ref, using the
 remote's advertised sha as the base (or the merge-base for a new branch). It
 scans metadata and content and exits non-zero on any violation.

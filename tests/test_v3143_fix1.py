@@ -114,6 +114,33 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class GateClosedHandleIntegrationTest(unittest.TestCase):
+    """A closed-handle gate revision degrades through the real run record."""
+
+    def test_run_harness_degrades_instead_of_erroring(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        dsh = write_fake_dsh(root / "dsh")
+        env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
+        cfg = load_config(config_path=root / "config.json", env=env)
+        error = ValueError('session "s": flush on a closed handle')
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch("deepseek_mcp.gate.run_gate", side_effect=error):
+            _text, run, _path = harness.run_harness({
+                "prompt": "small task", "subagents": 0, "quality": True,
+                "independent_review": True, "quality_rounds": 1,
+                "workspace": str(workspace),
+            }, cfg)
+        self.assertEqual(run["status"], "ok_unreviewed", run.get("error"))
+        self.assertEqual(run["stop_reason"], "gate_error")
+        self.assertEqual(run["review_status"], "skipped")
+        self.assertIn("flush on a closed handle", run["gate_error"])
+        self.assertTrue(run["gate_warning"])
+
+
 class StopDrainIntegrationTest(unittest.TestCase):
     """The stop path must drain a child that is still flushing."""
 

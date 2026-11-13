@@ -54,7 +54,8 @@ that stops crosscheck false alarms from being counted.
   operator's own hook is preserved as `pre-push.local` and runs first) and
   exposes
   `git_identity.push_with_gate` and `scripts/ship_push.py` for
-  connector-controlled pushes. CLI:
+  connector-controlled pushes; the GitHub Actions workflow runs the same gate
+  over the pushed range before the test matrix. CLI:
   `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
   builders get the OS boundary when the platform can provide it; a per-job

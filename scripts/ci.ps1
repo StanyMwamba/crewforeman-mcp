@@ -53,6 +53,31 @@ try {
     & $Python tools/ci_hygiene.py
     if ($LASTEXITCODE -ne 0) { Fail "ci_hygiene.py failed" }
 
+    Write-Host "== commit identity gate =="
+    $gateBase = $env:GATE_BASE
+    if (-not $gateBase) {
+        & git rev-parse --verify origin/main *> $null
+        if ($LASTEXITCODE -eq 0) { $gateBase = 'origin/main' }
+    }
+    if ($gateBase) {
+        if ($gateBase -eq ('0' * 40)) {
+            $gateBase = (& git rev-list --max-parents=0 HEAD).Trim()
+        }
+        & git cat-file -e ("{0}^{{commit}}" -f $gateBase) *> $null
+        if ($LASTEXITCODE -ne 0) {
+            $gateBase = (& git rev-list --max-parents=0 HEAD).Trim()
+        }
+        $savedPythonPath = $env:PYTHONPATH
+        try {
+            $env:PYTHONPATH = $RepoRoot
+            & $Python -m deepseek_mcp.git_identity --repo $RepoRoot `
+                --base $gateBase --head HEAD --remote origin
+            if ($LASTEXITCODE -ne 0) { Fail "commit identity/content gate failed" }
+        } finally {
+            $env:PYTHONPATH = $savedPythonPath
+        }
+    }
+
     Write-Host "== install package =="
     & $Python -m pip install --disable-pip-version-check --no-input .
     if ($LASTEXITCODE -ne 0) { Fail "pip install . failed" }

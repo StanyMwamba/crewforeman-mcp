@@ -187,6 +187,16 @@ class GitIdentityTest(unittest.TestCase):
             hook_path = worktree / hook_path
         self.assertTrue((hook_path / "pre-push").is_file())
 
+    def test_missing_or_unresolvable_head_fails_closed(self):
+        base = self.commit("base", "base.txt")
+        for head in ("", "refs/heads/does-not-exist"):
+            with self.subTest(head=head):
+                report = git_identity.check_push(
+                    CFG, repo=str(self.repo), base=base, head=head)
+                self.assertFalse(report["ok"], report)
+                self.assertTrue(any(v.get("kind") == "error"
+                                    for v in report["violations"]), report)
+
     def test_metadata_gate_blocks_foreign_author_email(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")
