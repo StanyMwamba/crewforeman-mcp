@@ -6,6 +6,7 @@
     "email": "noreply@example.com"
   },
   "git_identity_exceptions": [],
+  "git_identity_max_scan_commits": 10000,
   "state_root": "",
   "daily_alert_usd": 2.0,
   "daily_limit_usd": null,

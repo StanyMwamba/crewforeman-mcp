@@ -55,7 +55,7 @@ _CONTENT_RULES = (
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # One `git show` per pushed commit; a bounded, fail-closed cap keeps a push
 # from turning the hook into an unbounded history walk.
-MAX_SCAN_COMMITS = 2000
+MAX_SCAN_COMMITS = 10000
 # Domains that only ever carry synthetic placeholders in this project.
 _PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net",
                         "localhost")
@@ -124,6 +124,16 @@ def _cfg_get(cfg, key, default=None):
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return default
+
+
+def _scan_cap(cfg=None):
+    """Maximum commits one gate run will inspect; configurable, fail closed."""
+    try:
+        value = int(_cfg_get(cfg, "git_identity_max_scan_commits",
+                             MAX_SCAN_COMMITS))
+    except (TypeError, ValueError):
+        value = MAX_SCAN_COMMITS
+    return max(1, value)
 
 
 def identity_from_config(cfg=None):
@@ -476,11 +486,16 @@ def _rev_list(repo, base, head):
     return out.split()
 
 
-def commit_metadata(repo, base, head):
+def commit_metadata(repo, base, head, cfg=None):
     """Author and committer metadata for every commit in ``base..head``."""
 
     commits = []
-    for sha in _rev_list(repo, base, head):
+    shas = _rev_list(repo, base, head)
+    if len(shas) > _scan_cap(cfg):
+        raise GitIdentityError(
+            "too_many_commits:%d (raise git_identity_max_scan_commits)"
+            % len(shas))
+    for sha in shas:
         rc, out, err = _git(
             repo,
             ["show", "-s", "--no-color",
@@ -507,7 +522,7 @@ def scan_metadata(repo, base, head, cfg=None):
     allowed = allowed_emails(cfg)
     names = allowed_names(cfg)
     violations = []
-    for commit in commit_metadata(repo, base, head):
+    for commit in commit_metadata(repo, base, head, cfg):
         for role in ("author", "committer"):
             name = commit[role + "_name"]
             email = _normalise_email(commit[role + "_email"])
@@ -606,11 +621,12 @@ def scan_content(repo, base, head, cfg=None):
     commits = _rev_list(repo, base, head)
     # A new branch can carry a long history; bound the work and fail closed
     # rather than silently scanning only part of it.
-    if len(commits) > MAX_SCAN_COMMITS:
+    if len(commits) > _scan_cap(cfg):
         return [{
             "kind": "error", "sha": "", "role": "", "name": "",
             "email": "",
-            "detail": "too_many_commits:%d" % len(commits),
+            "detail": ("too_many_commits:%d (raise "
+                       "git_identity_max_scan_commits)" % len(commits)),
         }]
     for sha in commits:
         rc, out, err = _git(
@@ -660,7 +676,7 @@ def check_push(cfg=None, repo=".", base="", head="HEAD", remote=None):
                 (err or "head_not_resolvable").strip())
         head = out.strip()
         report["head"] = head
-        report["metadata"] = commit_metadata(repo, base, head)
+        report["metadata"] = commit_metadata(repo, base, head, cfg)
         exception = exception_for_remote(cfg, repo, remote)
         report["exception"] = exception
         if not exception:

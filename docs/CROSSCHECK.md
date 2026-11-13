@@ -183,8 +183,10 @@ survive; API keys do not), a hard 10 s cap, and a process-group kill on
 timeout. `HOME`, `USERPROFILE`, `APPDATA` and the XDG directories point at a
 fresh temporary directory, and common secret files (`.env`, keys,
 `credentials*`, `.ssh`, `.dsh`) are left out of the copy, so the default
-profile stores are not exposed. This is **not** a security sandbox: a repro
-that names an absolute path outside the copy can still read it, and the
+profile stores are not exposed. A copy that is too large (over 256 MiB) or
+cannot be read fails closed: the affected findings are unverified and no
+command runs in the operator's tree. This is **not** a security sandbox: a
+repro that names an absolute path outside the copy can still read it, and the
 command runs with the operator's network access. Treat crosscheck findings as
 input from your own crews and run the job in a workspace that does not hold
 secrets. The copy is removed afterwards so a repro cannot mutate the

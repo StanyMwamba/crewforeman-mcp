@@ -187,6 +187,18 @@ class GitIdentityTest(unittest.TestCase):
             hook_path = worktree / hook_path
         self.assertTrue((hook_path / "pre-push").is_file())
 
+    def test_scan_cap_is_configurable_and_fails_closed(self):
+        base = self.commit("base", "base.txt")
+        self.commit("second", "second.txt")
+        self.commit("third", "third.txt")
+        cfg = dict(CFG)
+        cfg["git_identity_max_scan_commits"] = 1
+        report = git_identity.check_push(
+            cfg, repo=str(self.repo), base=base, head="HEAD")
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any("too_many_commits" in str(v.get("detail"))
+                            for v in report["violations"]), report)
+
     def test_missing_or_unresolvable_head_fails_closed(self):
         base = self.commit("base", "base.txt")
         for head in ("", "refs/heads/does-not-exist"):

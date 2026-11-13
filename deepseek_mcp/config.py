@@ -64,12 +64,14 @@ _DSH_DEFAULT = ("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/c
 # Generic, portable defaults. Every path is overridable.
 DEFAULTS = {
     # Commit identity for every connector-created commit/rebase. The
-    # pre-push privacy gate allows this email (plus noreply@example.com);
-    # and any email-shaped git_identity_exceptions entry).
+    # pre-push privacy gate allows this email (plus noreply@example.com).
     "git_identity": {"name": "crewforeman-mcp", "email": "noreply@example.com"},
-    # Remote names/URL substrings that keep their own repo-local identity,
-    # e.g. "owner/repo" (example only; empty means no exceptions).
+    # Remotes that keep their own repo-local identity, matched exactly as
+    # "owner/repo" or a full URL (bare remote names are ignored).
     "git_identity_exceptions": [],
+    # Maximum commits one identity/content gate run inspects.  A larger range
+    # fails closed with a clear message; raise this only for a real repo.
+    "git_identity_max_scan_commits": 10000,
     "builder_practices": True,
     # depends_on policy: "success" (default) waits for a successful
     # dependency; "finished" starts after any terminal state (error included).
@@ -820,6 +822,7 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "review_context_max_chars", "review_preflight_timeout",
               "restart_helper_retry_seconds",
               "gate_timeout_seconds", "gate_secret_scan_budget_seconds",
+              "git_identity_max_scan_commits",
               "loop_guard_poll_seconds",
               "pipeline_min_remaining_usd", "crosscheck_threshold",
               "audit_sample_rate", "auto_parallel_min_confidence",

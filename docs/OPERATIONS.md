@@ -1396,6 +1396,10 @@ Exception entries are remotes, never emails; an email-shaped exception does
 not widen the global allowlist. An exception remote is exempt from the
 metadata check but its added content is still scanned.
 
+`git_identity_max_scan_commits` (default 10000) bounds one gate run. A larger
+range fails closed with `too_many_commits` instead of scanning part of the
+history; raise it only for a repository that really has that much history.
+
 `git_identity_exceptions` lists remotes that keep their own repo-local
 identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
 Matching is **exact**, not a substring: an entry must be `owner/repo` or a

@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from deepseek_mcp import crosscheck
 
@@ -441,6 +442,23 @@ class CrosscheckReproGateTest(unittest.TestCase):
         self.assertEqual(len(kept), 1, filtered)
         self.assertIn("env=False key=False",
                       kept[0]["repro_result"]["output"])
+
+    def test_copy_failure_fails_closed_without_running_in_place(self):
+        victim = Path(self.ws) / "victim.txt"
+        victim.write_text("original", encoding="utf-8")
+        item = self.finding(
+            executable=True,
+            repro={"command": python_command(
+                "import pathlib; pathlib.Path('victim.txt').write_text('mutated')"),
+                "output": "mutated"})
+        with mock.patch.object(crosscheck.shutil, "copytree",
+                               side_effect=OSError("disk full")):
+            kept, filtered, stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(kept, [])
+        self.assertEqual(filtered[0]["false_alarm_reason"],
+                         "repro_copy_failed")
+        self.assertEqual(stats["false_alarm_filtered"], 1)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "original")
 
     def test_too_short_expected_output_is_dropped(self):
         item = self.finding(executable=True,

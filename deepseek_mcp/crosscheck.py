@@ -710,6 +710,7 @@ def _repro_timeout(timeout):
     return min(max(value, 0.1), REPRO_TIMEOUT)
 
 
+_REPRO_COPY_MAX_BYTES = 256 * 1024 * 1024
 _REPRO_COPY_IGNORE = (
     ".git", "__pycache__", "*.pyc", ".dsh-tmp-tests", ".pytest_cache",
     "node_modules", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
@@ -718,18 +719,32 @@ _REPRO_COPY_IGNORE = (
 )
 
 
+def _tree_bytes(root, cap):
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                return cap + 1
+            if total > cap:
+                return total
+    return total
+
+
 def _repro_workspace_copy(workspace):
-    """Return ``(path, cleanup)`` for a disposable copy of *workspace*.
+    """Return ``(path, cleanup)`` for a disposable copy, or ``(None, noop)``.
 
     Model-authored findings must not be able to mutate the operator's tree.
-    The copy keeps relative repro paths working; ``.git`` and test scratch
-    directories are skipped so the copy stays small.  If copying fails, the
-    original path is used and the caller still gets the isolated HOME and
-    scrubbed environment.
+    The copy keeps relative repro paths working; ``.git``, caches and common
+    secret files are skipped, and an oversized or unreadable tree fails
+    closed instead of silently running the command in place.
     """
     root = os.path.abspath(str(workspace or ""))
     if not root or not os.path.isdir(root):
-        return str(workspace or ""), (lambda: None)
+        return None, (lambda: None)
+    if _tree_bytes(root, _REPRO_COPY_MAX_BYTES) > _REPRO_COPY_MAX_BYTES:
+        return None, (lambda: None)
     parent = ""
     try:
         parent = tempfile.mkdtemp(prefix="cf-repro-")
@@ -738,10 +753,10 @@ def _repro_workspace_copy(workspace):
             root, target, symlinks=True,
             ignore=shutil.ignore_patterns(*_REPRO_COPY_IGNORE))
         return target, (lambda: shutil.rmtree(parent, ignore_errors=True))
-    except Exception:  # noqa: BLE001 - fall back to the original path
+    except Exception:  # noqa: BLE001 - fail closed, never run in place
         if parent:
             shutil.rmtree(parent, ignore_errors=True)
-        return root, (lambda: None)
+        return None, (lambda: None)
 
 
 def _repro_run(command, cwd, timeout):
@@ -936,12 +951,28 @@ def verify_findings(findings, workspace, runner=None, timeout=REPRO_TIMEOUT):
     # runner (tests, future remote runner) keeps the path it was given.
     repro_workspace = workspace
     cleanup = lambda: None
+    copy_failed = False
     if runner is None:
         repro_workspace, cleanup = _repro_workspace_copy(workspace)
+        copy_failed = repro_workspace is None
     try:
         for item in rows:
             if _finding_status(item) == "false_alarm":
                 filtered.append(item)
+                continue
+            if copy_failed:
+                row = dict(item)
+                row["status"] = "false_alarm"
+                row["repro_status"] = "unverified"
+                row["repro_verified"] = False
+                row["filtered_by"] = "connector_repro"
+                row["false_alarm_reason"] = "repro_copy_failed"
+                row["repro_result"] = {
+                    "status": "unverified",
+                    "reason": "repro_copy_failed",
+                    "output": "",
+                }
+                filtered.append(row)
                 continue
             ident = _repro_cache_key(item)
             if ident not in cache:
