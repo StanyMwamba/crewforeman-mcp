@@ -341,9 +341,21 @@ def _read_tail(path, limit=3000):
     return text[-limit:]
 
 
+MIMO_SERVER_DEFAULT_USERNAME = "mimocode"
+
+
+def _server_username():
+    """Basic-auth user the real ``mimo serve`` expects (verified on 0.1.17).
+
+    The CLI reads ``MIMOCODE_SERVER_USERNAME`` and defaults to ``mimocode``;
+    an empty username is answered 401.
+    """
+    return os.environ.get("MIMOCODE_SERVER_USERNAME") or MIMO_SERVER_DEFAULT_USERNAME
+
+
 def _basic_auth_header(password):
-    """``Authorization: Basic base64(":" + password)`` (empty username)."""
-    raw = (":" + str(password)).encode("utf-8")
+    """``Authorization: Basic base64(user + ":" + password)``, user ``mimocode``."""
+    raw = (_server_username() + ":" + str(password)).encode("utf-8")
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -364,7 +376,7 @@ def _health_request(url, password=None, timeout=1.0):
     is not ready -- the probe fails closed.  ``None`` means no HTTP response
     at all (connection-level failure), which lets :meth:`MimoServer.ready`
     try its documented TCP last resort.  When *password* is set the request
-    carries ``Authorization: Basic`` with an empty username (harmless when
+    carries ``Authorization: Basic`` with the ``mimocode`` username (harmless when
     the server ignores it, required when it demands it).
     """
     request = urllib.request.Request(str(url).rstrip("/") + _HEALTH_PATH)
@@ -903,7 +915,7 @@ class MimoServer:
 
         ``/healthz`` returns 503 on the real CLI and is never a readiness
         signal.  With a password set every probe sends ``Authorization:
-        Basic`` for the empty user; 401/403 -- like any non-2xx -- reports
+        Basic`` for user ``mimocode``; 401/403 -- like any non-2xx -- reports
         not-ready and :meth:`start` retries within ``ready_timeout``.
         Last resort only: when the HTTP request is entirely unreachable
         (no response at all), a bare TCP connect is tried -- that proves a

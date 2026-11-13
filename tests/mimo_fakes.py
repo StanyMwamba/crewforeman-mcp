@@ -31,8 +31,8 @@ HTTP surface of ``mimo serve`` (stdlib server on 127.0.0.1 only):
 - anything else          -> 404.
 
 When ``MIMOCODE_SERVER_PASSWORD`` is set (non-empty) in the serve process,
-EVERY HTTP request must carry ``Authorization: Basic base64(":" + password)``
-(empty username, password part matching) or it is answered 401.  Without the
+EVERY HTTP request must carry ``Authorization: Basic base64("mimocode:" + password)``
+(username ``MIMOCODE_SERVER_USERNAME`` or ``mimocode`` as in the real CLI, password matching) or it is answered 401.  Without the
 env var no auth is required (the real CLI's unsecured case).  When
 ``mimo run --attach <url>`` runs with ``MIMOCODE_SERVER_PASSWORD`` set, the
 fake records its PRESENCE (never the value) as ``"password_env": true`` in
@@ -279,7 +279,8 @@ def run_serve(opts):
             except Exception:
                 return False
             user, sep, supplied = decoded.partition(":")
-            return sep == ":" and user == "" and supplied == password
+            expected_user = os.environ.get("MIMOCODE_SERVER_USERNAME") or "mimocode"
+            return sep == ":" and user == expected_user and supplied == password
 
         def _send(self, status, body, write_body):
             self.send_response(status)

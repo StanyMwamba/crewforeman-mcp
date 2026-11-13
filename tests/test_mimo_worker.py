@@ -121,7 +121,7 @@ if positional and positional[0] == "serve":
             except Exception:
                 return False
             user, sep, supplied = decoded.partition(":")
-            return sep == ":" and user == "" and supplied == password
+            return sep == ":" and user == "mimocode" and supplied == password
 
         def _send(self, status, body):
             self.send_response(status)
@@ -284,7 +284,7 @@ class MimoWorkerCase(unittest.TestCase):
         request = urllib.request.Request(url)
         if password:
             request.add_header("Authorization", "Basic " + base64.b64encode(
-                (":" + password).encode("utf-8")).decode("ascii"))
+                ("mimocode:" + password).encode("utf-8")).decode("ascii"))
         try:
             response = urllib.request.urlopen(request, timeout=5)
             try:

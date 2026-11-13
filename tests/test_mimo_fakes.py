@@ -42,7 +42,7 @@ def parse_jsonl(text):
     return events
 
 
-def fetch(url, password=None, username=""):
+def fetch(url, password=None, username="mimocode"):
     """GET *url*; return ``(status, body)`` without raising on 4xx/5xx."""
     request = urllib.request.Request(url)
     if password is not None:
@@ -461,13 +461,13 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                  password="wrong")
             self.assertEqual(status, 401, "wrong password must be 401")
             status, body = fetch(served.url + "/global/health",
-                                 password=server_pw, username="someone")
+                                 password=server_pw, username="")
             self.assertEqual(status, 401,
-                             "non-empty username must be 401 (empty only)")
+                             "empty username must be 401 (real CLI expects mimocode)")
             status, body = fetch(served.url + "/global/health",
                                  password=server_pw)
             self.assertEqual(status, 200,
-                             'basic auth of ":" + password must be 200')
+                             'basic auth of "mimocode:" + password must be 200')
             self.assertEqual(body, b"ok")
             # The gate covers every request, not just the health endpoint.
             status, body = fetch(served.url + "/nope")
