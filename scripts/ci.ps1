@@ -55,6 +55,9 @@ try {
 
     Write-Host "== commit identity gate =="
     $gateBase = $env:GATE_BASE
+    if (-not $gateBase -and $env:GITHUB_ACTIONS -eq 'true') {
+        Fail "GATE_BASE is unset in CI; refusing to skip the identity gate"
+    }
     if (-not $gateBase) {
         & git rev-parse --verify origin/main *> $null
         if ($LASTEXITCODE -eq 0) { $gateBase = 'origin/main' }

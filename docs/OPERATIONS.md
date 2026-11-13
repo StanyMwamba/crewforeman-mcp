@@ -1403,11 +1403,13 @@ history; raise it only for a repository that really has that much history.
 
 `git_identity_exceptions` lists remotes that keep their own repo-local
 identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
-Matching is **exact**, not a substring: an entry must be `owner/repo` or a
-full URL (with or without `.git`). A substring match would let an entry such
-as `owner/repo` exempt an unrelated `evil.example/fork-of-owner/repo` push
-target, and a bare remote name is a local label that can be re-pointed at
-another URL, so bare names such as `origin` are ignored. An exception is
+Matching is **exact**, not a substring: an entry must be `owner/repo` (a
+GitHub.com shorthand only) or a full URL (with or without `.git`). A
+substring match would let an entry such as `owner/repo` exempt an unrelated
+`evil.example/fork-of-owner/repo` push target, and a bare remote name is a
+local label that can be re-pointed at another URL, so bare names such as
+`origin` are ignored. On GitHub Enterprise, GitLab or any other host, use the
+full URL. An exception is
 resolved from a configured remote name; a direct-URL `git push` does not
 borrow it. No personal address is built in anywhere.
 

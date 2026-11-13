@@ -453,9 +453,11 @@ def exception_for_remote(cfg, repo, remote):
         path = _remote_path(raw)
         if path:
             candidates.add(path)
-            # owner/repo is the last two path segments (GitHub/GitLab style).
+            # ``owner/repo`` is a GitHub.com shorthand.  Do not let it match
+            # the same path on an unrelated host; other hosts must use a
+            # full URL (or a host-qualified entry).
             segments = [part for part in path.split("/") if part]
-            if len(segments) >= 2:
+            if len(segments) >= 3 and segments[0] == "github.com":
                 candidates.add("/".join(segments[-2:]))
     for entry in entries:
         needle = entry.strip().lower().rstrip("/")

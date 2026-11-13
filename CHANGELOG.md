@@ -46,9 +46,9 @@ that stops crosscheck false alarms from being counted.
   in `base..head`) as well as added file contents. Any identity outside the allowlist blocks the push.
   `git_identity_exceptions` lists remotes that keep their own identity (for
   example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
-  on `owner/repo` or the full URL (a bare remote name is ignored), so a
-  lookalike remote or a re-pointed label cannot borrow the exception, and no
-  personal address is hardcoded. Exception entries are remotes only; an
+  on `owner/repo` (GitHub.com shorthand) or the full URL (a bare remote name
+  is ignored), so a lookalike host or a re-pointed label cannot borrow the
+  exception, and no personal address is hardcoded. Exception entries are remotes only; an
   email-shaped entry never widens the global identity allowlist. The connector
   installs the `pre-push` hook on the first commit/rebase it creates (an
   operator's own hook is preserved as `pre-push.local` and runs first) and

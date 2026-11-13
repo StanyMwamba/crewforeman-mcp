@@ -291,6 +291,18 @@ class GitIdentityTest(unittest.TestCase):
         self.assertFalse(report["ok"], report)
         self.assertEqual(report["exception"], "")
 
+    def test_owner_repo_shorthand_is_github_only(self):
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign")
+        self.git("remote", "add", "lookalike",
+                 "https://evil.example/example-org/Cypraea.git")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["example-org/Cypraea"]}
+        report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
+                                         head="HEAD", remote="lookalike")
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exception"], "")
+
     def test_bare_remote_name_is_not_an_exception(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")

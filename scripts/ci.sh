@@ -40,6 +40,9 @@ echo "== static CI contract =="
 
 echo "== commit identity gate =="
 GATE_BASE="${GATE_BASE:-}"
+if [ -z "$GATE_BASE" ] && [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    fail "GATE_BASE is unset in CI; refusing to skip the identity gate"
+fi
 if [ -z "$GATE_BASE" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
     GATE_BASE=origin/main
 fi
