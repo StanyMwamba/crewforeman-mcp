@@ -23,9 +23,12 @@ for reporting and never double-billed).  Cost is unknown -- never 0 -- when
 usage is missing or the model has no price entry.
 """
 
+import base64
 import json
 import os
 import queue
+import re
+import secrets
 import shutil
 import signal
 import socket
@@ -97,6 +100,15 @@ _SENTINEL = object()
 _MAX_OUTPUT_FILES = 100
 _OUTPUT_SLACK = 2.0
 _POLL_SECONDS = 0.1
+
+# ``mimo serve`` prints this plain stdout line once it is listening (literal
+# prefix; the host part matches --hostname).  With ``--port 0`` it is the only
+# way to learn the OS-assigned port.
+_READY_LINE_RE = re.compile(r"mimocode server listening on\s+(https?://\S+)")
+
+# Health probe: GET <url>/global/health must answer 2xx.  /healthz returns
+# 503 on the real CLI and is never a readiness signal.
+_HEALTH_PATH = "/global/health"
 
 
 def _cfg_get(cfg, key, default=None):
@@ -329,6 +341,57 @@ def _read_tail(path, limit=3000):
     return text[-limit:]
 
 
+def _basic_auth_header(password):
+    """``Authorization: Basic base64(":" + password)`` (empty username)."""
+    raw = (":" + str(password)).encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def _scrub_secret(text, secret):
+    """Strip *secret* from *text* so it can never leak into results."""
+    if not secret or text is None:
+        return text
+    try:
+        return str(text).replace(str(secret), "***")
+    except Exception:
+        return text
+
+
+def _health_request(url, password=None, timeout=1.0):
+    """Probe ``GET <url>/global/health`` once.
+
+    True only for a 2xx response.  Any other HTTP answer (401/403 included)
+    is not ready -- the probe fails closed.  ``None`` means no HTTP response
+    at all (connection-level failure), which lets :meth:`MimoServer.ready`
+    try its documented TCP last resort.  When *password* is set the request
+    carries ``Authorization: Basic`` with an empty username (harmless when
+    the server ignores it, required when it demands it).
+    """
+    request = urllib.request.Request(str(url).rstrip("/") + _HEALTH_PATH)
+    if password:
+        request.add_header("Authorization", _basic_auth_header(password))
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return None
+    try:
+        response.read()
+        status = getattr(response, "status", None)
+        if status is None:
+            status = response.getcode()
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    try:
+        return 200 <= int(status) < 300
+    except (TypeError, ValueError):
+        return False
+
+
 def _kill_process(proc):
     if proc is None or proc.poll() is not None:
         return
@@ -461,15 +524,25 @@ def _estimate_cost(entry, tokens_in, cache_read, tokens_out):
 def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
             label="builder", progress_cb=None, sandbox="workspace-write",
             attach_url=None, cancel_check=None, timeout=None,
-            mimo_bin=None, live_usage_cb=None):
+            mimo_bin=None, live_usage_cb=None, server_password=None):
     """Run one ``mimo run`` job and return a harness-compatible result dict.
 
     Streams JSONL events off stdout, accumulates step usage, scans the
     workspace for changed files, classifies vendor errors and honours
     ``timeout`` / ``cancel_check``.  Temp files honour TMPDIR.
+
+    ``server_password`` reaches the child only through the
+    ``MIMOCODE_SERVER_PASSWORD`` env var (never argv) so attach runs can
+    authenticate to ``mimo serve``.  The password is scrubbed out of every
+    string this function returns and is never recorded anywhere.
     """
     started = time.time()
     workspace = Path(workspace)
+    secret = str(server_password) if server_password else ""
+    child_env = None
+    if secret:
+        child_env = os.environ.copy()
+        child_env["MIMOCODE_SERVER_PASSWORD"] = secret
     model = (model or _cfg_get(cfg, "mimo_default_model") or DEFAULT_MODEL)
     variant = variant or _cfg_get(cfg, "mimo_variant") or None
     if not variant:
@@ -510,7 +583,7 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=stderr_handle,
-                text=True, bufsize=1, **_popen_kwargs())
+                env=child_env, text=True, bufsize=1, **_popen_kwargs())
         except OSError as exc:
             try:
                 stderr_handle.close()
@@ -518,7 +591,8 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
                 pass
             return _result(
                 status="error", answer=None, exit_code=None,
-                error="failed to start mimo: %s" % exc, tools=tools,
+                error=_scrub_secret("failed to start mimo: %s" % exc, secret),
+                tools=tools,
                 events_count=events_count, outputs=[], started=started,
                 stderr_tail="", tokens=tokens, saw_usage=False,
                 model=model, cfg=cfg, preset=preset, stalled=False,
@@ -669,6 +743,9 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
     if stop_reason is None:
         stop_reason = "ok" if status == "ok" else "error"
     stalled = bool(timed_out and events_count == 0)
+    final_text = _scrub_secret(final_text, secret)
+    stderr_tail = _scrub_secret(stderr_tail, secret)
+    error_text = _scrub_secret(error_text, secret)
     return _result(
         status=status, answer=final_text, exit_code=exit_code,
         error=error_text, tools=tools, events_count=events_count,
@@ -739,8 +816,14 @@ class MimoServer:
     """Lifecycle for ``mimo serve`` plus ``mimo run --attach <url>``.
 
     The server process gets its own session/process group so cleanup can
-    never kill the parent.  ``port=0`` picks a free port up front and passes
-    it explicitly.
+    never kill the parent.  ``port=0`` means OS-assigned: the bound port is
+    learned from the ``mimocode server listening on http://host:port`` line
+    the CLI prints on stdout (the only way to learn it), while an explicit
+    port may construct the URL directly -- the parsed line still wins when
+    present.  A random per-server password is generated at :meth:`start`,
+    handed to the child only through the ``MIMOCODE_SERVER_PASSWORD`` env
+    var (never argv) and exposed as :attr:`password` so attach runs can
+    authenticate.  The password is never logged or included in error text.
     """
 
     def __init__(self, cfg, *, mimo_bin=None, host="127.0.0.1", port=0,
@@ -751,56 +834,93 @@ class MimoServer:
         self.host = str(host or "127.0.0.1")
         self.port = int(port or 0)
         self.ready_timeout = float(ready_timeout)
+        self.password = None
         self._proc = None
         self._url = None
+        self._ready_url = None
         self._stderr_path = None
 
     def start(self):
         """Spawn ``mimo serve`` and return the attach url; raises on failure."""
         if self._proc is not None:
             raise RuntimeError("MimoServer already started")
-        port = self.port or _free_port(self.host)
-        argv = [str(self.mimo_bin), "serve", "--host", self.host,
-                "--port", str(port)]
+        self.password = secrets.token_urlsafe(24)
+        argv = [str(self.mimo_bin), "serve", "--hostname", self.host,
+                "--port", str(self.port)]
+        env = os.environ.copy()
+        env["MIMOCODE_SERVER_PASSWORD"] = self.password
         self._stderr_path = _stderr_path()
         stderr_handle = open(self._stderr_path, "w", encoding="utf-8")
         try:
             self._proc = subprocess.Popen(
-                argv, stdout=subprocess.DEVNULL, stderr=stderr_handle,
-                **_popen_kwargs())
+                argv, stdout=subprocess.PIPE, stderr=stderr_handle, env=env,
+                text=True, bufsize=1, **_popen_kwargs())
         finally:
             stderr_handle.close()
-        self._url = "http://%s:%s" % (self.host, port)
+        self._ready_url = None
+        thread = threading.Thread(
+            target=self._pump_stdout, args=(self._proc.stdout,), daemon=True)
+        thread.start()
+        fallback = ("http://%s:%s" % (self.host, self.port)
+                    if self.port else None)
+        self._url = None
         deadline = time.time() + self.ready_timeout
         while time.time() < deadline:
-            if self.ready():
-                return self._url
             if self._proc.poll() is not None:
                 break
+            if self._ready_url:
+                self._url = self._ready_url
+            elif fallback:
+                self._url = fallback
+            if self._url and self.ready():
+                return self._url
             time.sleep(0.05)
-        tail = _read_tail(self._stderr_path, 500)
+        tail = _scrub_secret(_read_tail(self._stderr_path, 500), self.password)
+        target = self._url or fallback or "http://%s:%s" % (self.host,
+                                                            self.port)
         self.stop()
         self.cleanup()
         raise RuntimeError("mimo serve did not become ready on %s%s" % (
-            self._url, (": " + tail.strip()) if tail.strip() else ""))
+            target, (": " + tail.strip()) if tail.strip() else ""))
 
-    def ready(self):
-        """True when GET <url>/healthz answers below 500 (TCP fallback)."""
-        if self._proc is None or self._proc.poll() is not None:
-            return False
-        url = self._url or "http://%s:%s" % (self.host, self.port)
-        healthz = url.rstrip("/") + "/healthz"
+    def _pump_stdout(self, stream):
+        """Drain serve stdout and capture the ``listening on`` ready line."""
         try:
-            response = urllib.request.urlopen(healthz, timeout=1.0)
-            try:
-                response.read()
-            finally:
-                response.close()
-            return True
-        except urllib.error.HTTPError as exc:
-            return exc.code < 500
+            for raw in iter(stream.readline, ""):
+                match = _READY_LINE_RE.search(raw)
+                if match:
+                    self._ready_url = match.group(1)
         except Exception:
             pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def ready(self):
+        """True when ``GET <url>/global/health`` returns 2xx.
+
+        ``/healthz`` returns 503 on the real CLI and is never a readiness
+        signal.  With a password set every probe sends ``Authorization:
+        Basic`` for the empty user; 401/403 -- like any non-2xx -- reports
+        not-ready and :meth:`start` retries within ``ready_timeout``.
+        Last resort only: when the HTTP request is entirely unreachable
+        (no response at all), a bare TCP connect is tried -- that proves a
+        listener exists, not that the server is healthy.
+        """
+        if self._proc is None or self._proc.poll() is not None:
+            return False
+        url = self._url
+        if not url and self.port:
+            url = "http://%s:%s" % (self.host, self.port)
+        if not url:
+            return False
+        status = _health_request(url, self.password, timeout=1.0)
+        if status is not None:
+            return status
+        # HTTP entirely unreachable: TCP connect as the documented last
+        # resort (degraded signal -- listener present, health unknown).
         try:
             sock = socket.create_connection((self.host, self._port()), 1.0)
             sock.close()
@@ -857,15 +977,6 @@ class MimoServer:
             except Exception:
                 pass
             self._stderr_path = None
-
-
-def _free_port(host):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
-    finally:
-        sock.close()
 
 
 def ping(cfg, *, model=None, mimo_bin=None, timeout=45.0):
