@@ -1869,7 +1869,7 @@ def _reprompt_record(executions, method, session_id, error=None,
 def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
                            policy=None, transport_name=None, limit=None,
                            cancel_check=None, budget=None, used_logs=None,
-                           dsh_bin=None):
+                           dsh_bin=None, model_spec=None):
     """One score re-prompt for one reviewer report.
 
     Resume the same reviewer session when it has an id; only a non-ok/dead
@@ -1914,7 +1914,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
             label="reviewer score reprompt round %d" % int(round_no or 1),
             exclude_logs=logs, policy=policy, session_id=session_id,
             transport_name=transport_name, cancel_check=cancel_check,
-            dsh_bin=dsh_bin, whole_job_limit=whole_job_limit)
+            dsh_bin=dsh_bin, model_spec=model_spec,
+            whole_job_limit=whole_job_limit)
         executions.append(first)
         logs.update(first.get("session_logs") or [])
         stop_reason = str(first.get("stop_reason") or "").lower()
@@ -1943,6 +1944,7 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
                     exclude_logs=logs, policy=policy, session_id=None,
                     transport_name=transport_name,
                     cancel_check=cancel_check, dsh_bin=dsh_bin,
+                    model_spec=model_spec,
                     whole_job_limit=whole_job_limit)
                 executions.append(second)
                 logs.update(second.get("session_logs") or [])
@@ -1962,7 +1964,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
         label="reviewer score reprompt fresh round %d" % int(round_no or 1),
         exclude_logs=logs, policy=policy, session_id=None,
         transport_name=transport_name, cancel_check=cancel_check,
-        dsh_bin=dsh_bin, whole_job_limit=whole_job_limit)
+        dsh_bin=dsh_bin, model_spec=model_spec,
+        whole_job_limit=whole_job_limit)
     executions.append(fresh)
     logs.update(fresh.get("session_logs") or [])
     return _reprompt_record(executions, "fresh", None,
@@ -3971,11 +3974,171 @@ NO_BALANCE_MESSAGE = ("DeepSeek account balance is empty: top up at "
                       "platform.deepseek.com, then run the task again.")
 
 
+def _mimo_module():
+    """Return the MiMo worker adapter (3.15), or None when it is absent.
+
+    Imported lazily so the dsh path stays byte-identical and the harness
+    stays importable while the parallel 3.15 modules land.
+    """
+    try:
+        from . import mimo_worker
+        return mimo_worker
+    except Exception:
+        return None
+
+
+def _is_mimo_bin(value):
+    """True for a ``mimo``-named binary/wrapper (any platform suffix)."""
+    name = os.path.basename(str(value or "").strip()).lower()
+    if not name:
+        return False
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return stem == "mimo"
+
+
+def _spec_field(target, name):
+    if isinstance(target, dict):
+        return str(target.get(name) or "")
+    return str(getattr(target, name, "") or "")
+
+
+def _is_mimo_execution(cfg, target=None, dsh_bin=None):
+    """True when this phase must run through the MiMo worker adapter.
+
+    A phase is MiMo when the effective target resolves to the MiMo vendor
+    via ``mimo_worker.is_mimo_target`` (provider/model/vendor aliases, so an
+    explicit provider ``mimo`` counts), or when the effective ``dsh_bin`` is
+    a ``mimo``-named wrapper (``mimo``, ``mimo.exe``, ``mimo.cmd``, ...)
+    that reviewer/backup candidates use to carry their own MiMo binary.
+    """
+    worker = _mimo_module()
+    if worker is None:
+        return False
+    if target is not None:
+        try:
+            if worker.is_mimo_target(
+                    provider=_spec_field(target, "provider"),
+                    model=_spec_field(target, "model"),
+                    vendor=_spec_field(target, "vendor")):
+                return True
+        except Exception:
+            pass
+    effective = str(dsh_bin or "").strip()
+    if not effective:
+        try:
+            effective = str(cfg.get("dsh_bin") or "").strip()
+        except Exception:
+            effective = str(getattr(cfg, "dsh_bin", "") or "").strip()
+    return _is_mimo_bin(effective)
+
+
+def _execute_mimo_target(cfg, workspace, task, target=None, limit=None,
+                         progress_cb=None, label="builder", policy=None,
+                         session_id=None, cancel_check=None,
+                         live_usage_cb=None, dsh_bin=None, role=None,
+                         whole_job_limit=_WHOLE_JOB_LIMIT_UNSET,
+                         mimo_variant=None):
+    """Run one phase through ``mimo_worker.execute`` (no model overlay).
+
+    The result is post-processed exactly like the dsh path (role,
+    model_spec/provider/vendor); an adapter exception returns the same
+    error-dict shape ``_execute_once`` already returns.
+    """
+    started = time.time()
+    try:
+        worker = _mimo_module()
+        if worker is None:
+            raise RuntimeError("mimo_worker adapter is unavailable")
+        if policy is None:
+            policy = safety.resolve(
+                {}, cfg, reviewer=str(label).startswith("reviewer"))
+        sandbox = (policy.get("sandbox") if isinstance(policy, dict)
+                   else policy if isinstance(policy, str) else None)
+        model = _spec_field(target, "model") or None
+        provider = _spec_field(target, "provider")
+        if model and "/" not in model and provider:
+            model = "%s/%s" % (provider, model)
+        timeout = limit
+        if timeout is None and whole_job_limit is not _WHOLE_JOB_LIMIT_UNSET:
+            timeout = whole_job_limit
+        # The caller's dsh_bin, when set, is this phase's worker binary (a
+        # MiMo reviewer candidate carries its own).  A mimo-named cfg.dsh_bin
+        # is the MiMo wrapper itself; otherwise cfg.mimo_bin (MIMO_BIN).
+        mimo_bin = str(dsh_bin or "").strip() or None
+        if mimo_bin is None:
+            wrapper = ""
+            try:
+                wrapper = str(cfg.get("dsh_bin") or "").strip()
+            except Exception:
+                wrapper = str(getattr(cfg, "dsh_bin", "") or "").strip()
+            if _is_mimo_bin(wrapper):
+                mimo_bin = wrapper
+            else:
+                try:
+                    mimo_bin = str(cfg.get("mimo_bin") or "").strip() or None
+                except Exception:
+                    mimo_bin = None
+        result = worker.execute(
+            cfg, workspace, task,
+            model=model, variant=mimo_variant or None, session_id=session_id,
+            label=str(label), progress_cb=progress_cb,
+            sandbox=sandbox or "workspace-write",
+            cancel_check=cancel_check, timeout=timeout,
+            mimo_bin=mimo_bin, live_usage_cb=live_usage_cb)
+        if isinstance(result, dict):
+            result["role"] = str(role or label)
+            # The dsh path reports ``models`` as a per-model token dict;
+            # mimo_worker names models in a list.  Normalise to the dsh shape
+            # so _sum_executions/_review_round_usage/model_usage consume both
+            # transports identically.
+            for holder in (result, result.get("usage") or {}):
+                names = holder.get("models")
+                if isinstance(names, str):
+                    names = [names]
+                if isinstance(names, (list, tuple)):
+                    entries = {}
+                    for name in names:
+                        if not name:
+                            continue
+                        first = not entries
+                        entries[str(name)] = {
+                            "input": (result.get("tokens_in") or 0)
+                            if first else 0,
+                            "cache_read": (result.get("cache_read_tokens") or 0)
+                            if first else 0,
+                            "output": (result.get("tokens_out") or 0)
+                            if first else 0}
+                    holder["models"] = entries
+            if target is not None:
+                try:
+                    result["model_spec"] = target.as_dict()
+                    result["provider"] = target.provider
+                    result["vendor"] = target.vendor
+                except Exception:
+                    pass
+        return result
+    except Exception as exc:
+        return {
+            "status": "error", "answer": None, "exit_code": None,
+            "error": api.redact_secrets("mimo execution failed: %s" % (exc,)),
+            "tools_used": {}, "events": 0, "output_files": [],
+            "seconds": round(time.time() - started, 1),
+            "stderr_tail": "", "session_logs": [],
+            "tokens_in": None, "cache_read_tokens": None, "tokens_out": None,
+            "total_tokens": None, "estimated_cost_usd": None,
+            "cost_source": "unknown", "cost_known": False,
+            "models": [getattr(target, "model", None)] if target else None,
+            "stalled": False, "timed_out": False, "stop_reason": "error",
+            "transport": "mimo", "role": str(role or label),
+        }
+
+
 def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="builder",
                   exclude_logs=None, clock=None, output_slack=2.0,
                   policy=None, session_id=None, cancel_check=None,
                   transport_name=None, add_dirs=None, live_usage_cb=None,
                   dsh_bin=None, model_spec=None, patch=None, role=None,
+                  mimo_variant=None,
                   whole_job_limit=_WHOLE_JOB_LIMIT_UNSET):
     """Execute one phase, creating and removing a model overlay when needed.
 
@@ -3983,6 +4146,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
     no overlay is generated when the requested target equals
     ``(cfg.dsh_provider, cfg.dsh_model)``.  A per-execution overlay keeps the
     file lifetime as short as possible and guarantees cleanup even on failure.
+    MiMo targets never take the overlay path: they delegate to
+    ``mimo_worker.execute`` with ``-m`` naming the model directly.
     """
     target = model_spec
     if target is None:
@@ -3990,6 +4155,13 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
             target = model_policy.resolve_target(cfg)
         except Exception:
             target = None
+    if _is_mimo_execution(cfg, target=target, dsh_bin=dsh_bin):
+        return _execute_mimo_target(
+            cfg, workspace, task, target=target, limit=limit,
+            progress_cb=progress_cb, label=label, policy=policy,
+            session_id=session_id, cancel_check=cancel_check,
+            live_usage_cb=live_usage_cb, dsh_bin=dsh_bin, role=role,
+            whole_job_limit=whole_job_limit, mimo_variant=mimo_variant)
     overlay = None
     effective_patch = patch
     try:
@@ -4711,6 +4883,7 @@ def _job_spec_for_checkpoint(run, args, workspace):
             "builder_model", "builder_provider", "slice_models",
             "model_candidates", "reviewer_model", "reviewer_provider",
             "mode", "crosscheck_crews", "crosscheck_crew_size",
+            "crosscheck_crew_provider", "crosscheck_crew_model", "mimo_variant",
             "crosscheck_threshold", "crosscheck_max_rounds", "audit_review",
             "audit_sample_rate", "audit_spot_requirements", "audit_spot_fixes",
             "risk_paths", "auto_parallel", "auto_parallel_min_confidence",
@@ -5337,6 +5510,94 @@ def _review_resume_start(rounds, prior_reviews, prior_revisions):
     return int(rounds) + 1, None, "stopped"
 
 
+def _preflight_probe_spec(cfg, target, dsh_bin=None):
+    """Probe-model target for a MiMo readiness ping; None for other vendors.
+
+    MiMo probes/pings run ``mimo_probe_model`` (``xiaomi/mimo-v2.6-flash``)
+    via ``reviewer_backup.probe_model``; every other vendor keeps its
+    existing preflight model, so the dsh path stays byte-identical.
+    """
+    if not _is_mimo_execution(cfg, target=target, dsh_bin=dsh_bin):
+        return None
+    try:
+        model = reviewer_backup_mod.probe_model(target, cfg)
+    except Exception:
+        model = None
+    if not model:
+        return None
+    provider = _spec_field(target, "provider") or "mimo"
+    vendor = _spec_field(target, "vendor") or "Xiaomi (MiMo)"
+    try:
+        return model_policy.ModelTarget(
+            provider=provider, model=str(model), vendor=vendor,
+            base_url="", api="", api_key_env="MIMO_API_KEY",
+            source="reviewer")
+    except Exception:
+        return None
+
+
+def _is_crosscheck_crew_conflict(exc):
+    """True when *exc* is W6's CrosscheckCrewVendorConflict."""
+    cls = getattr(crosscheck_mod, "CrosscheckCrewVendorConflict", None)
+    if cls is not None and isinstance(exc, cls):
+        return True
+    return type(exc).__name__ == "CrosscheckCrewVendorConflict"
+
+
+def _select_crosscheck_crew(run, cfg, args, builder_target):
+    """Resolve the crosscheck crew target (W6) and record it on the run.
+
+    Returns the crew :class:`~model_policy.ModelTarget`, or ``None`` when the
+    selector is unavailable.  A crew-vendor conflict fails the run here --
+    before any paid execution -- with ``crosscheck_crew_vendor_conflict``.
+    """
+    select = getattr(crosscheck_mod, "select_crew_target", None)
+    if select is None:
+        return None
+    try:
+        crew = select(cfg, args, builder_target)
+    except Exception as exc:
+        if _is_crosscheck_crew_conflict(exc):
+            run.update(
+                status="error", seconds=0,
+                stop_reason="crosscheck_crew_vendor_conflict",
+                error=("crosscheck: the checker crew must be a different "
+                       "vendor than the builder: %s" % (exc,)),
+                status_detail=str(getattr(exc, "reason", "") or exc))
+        else:
+            run.update(
+                status="error", seconds=0,
+                stop_reason="crosscheck_error",
+                error="crosscheck crew selection failed: %s" % (exc,),
+                status_detail=str(exc))
+        path = save_run(run, cfg)
+        _finalize_work(run, cfg)
+        raise RuntimeError(run["error"] + _saved_note(run, path))
+    if not isinstance(crew, dict):
+        return None
+    record = dict(crew)
+    record.setdefault(
+        "builder_vendor", _spec_field(builder_target, "vendor"))
+    record.setdefault(
+        "different_vendor",
+        bool(record.get("vendor"))
+        and record.get("vendor") != record.get("builder_vendor"))
+    run["crosscheck_crew"] = record
+    provider = str(record.get("provider") or "")
+    model = str(record.get("model") or "")
+    if not provider and not model:
+        return None
+    try:
+        return model_policy.resolve_target(
+            cfg, provider, model, source="crew", allow_legacy=True)
+    except Exception:
+        return model_policy.ModelTarget(
+            provider=provider, model=model,
+            vendor=str(record.get("vendor") or ""),
+            base_url="", api="",
+            api_key_env="DEEPSEEK_API_KEY", source="crew")
+
+
 def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     """Run one Harness task with optional independent review/revision rounds.
 
@@ -5916,7 +6177,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     if failure_details:
         run["failure_notes"] = failure_details
     crosscheck_extra = None
+    crosscheck_crew_target = None
     if cc:
+        # 3.15: the checker crew is a different vendor than the builder (W6).
+        # Selection happens before any paid execution; the crew session and
+        # its fix rounds below run on the selected target.
+        crosscheck_crew_target = _select_crosscheck_crew(
+            run, cfg, args, builder_target)
         try:
             planned = crosscheck_mod.plan_parts(workspace, cfg)
             planned_parts = planned.get("parts") or []
@@ -6207,7 +6474,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 session_id=args.get("resume_session_id"),
                                 cancel_check=cancel_check,
                                 live_usage_cb=live_cb,
-                                model_spec=builder_target,
+                                mimo_variant=args.get("mimo_variant"),
+                                model_spec=(crosscheck_crew_target
+                                            or builder_target),
                                 role="builder",
                                 whole_job_limit=job_budget.max_seconds)
         executions.append(builder)
@@ -6341,7 +6610,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             transport_name=run["transport"],
                             cancel_check=cancel_check,
                             live_usage_cb=retry_live_cb,
-                            model_spec=builder_target,
+                            mimo_variant=args.get("mimo_variant"),
+                            model_spec=(crosscheck_crew_target
+                                        or builder_target),
                             role="builder",
                             whole_job_limit=job_budget.max_seconds)
                         executions.append(retried)
@@ -6429,7 +6700,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     label="builder nudged", exclude_logs=used_logs,
                     policy=builder_policy, add_dirs=run["add_dirs"],
                     transport_name=run["transport"], cancel_check=cancel_check,
-                    live_usage_cb=nudge_live_cb, model_spec=builder_target,
+                    live_usage_cb=nudge_live_cb,
+                    mimo_variant=args.get("mimo_variant"),
+                    model_spec=(crosscheck_crew_target or builder_target),
                     role="builder",
                     whole_job_limit=job_budget.max_seconds)
                 executions.append(nudged)
@@ -6528,6 +6801,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         transport_name=run["transport"],
                         cancel_check=cancel_check,
                         live_usage_cb=backup_cb,
+                        mimo_variant=args.get("mimo_variant"),
                         model_spec=backup_target, role="backup_builder",
                         whole_job_limit=job_budget.max_seconds)
                     executions.append(backup_exec)
@@ -6888,7 +7162,9 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 output_slack=0.0, policy=rescue_policy,
                 add_dirs=run["add_dirs"], transport_name=run["transport"],
                 cancel_check=cancel_check, live_usage_cb=rescue_live_cb,
-                model_spec=builder_target, role="builder",
+                mimo_variant=args.get("mimo_variant"),
+                model_spec=(crosscheck_crew_target or builder_target),
+                role="builder",
                 whole_job_limit=job_budget.max_seconds)
             executions.append(finisher)
             used_logs.update(finisher.get("session_logs") or [])
@@ -7228,6 +7504,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     exclude_logs=used_logs, policy=scaling_policy,
                     add_dirs=run["add_dirs"], transport_name=run["transport"],
                     cancel_check=cancel_check, live_usage_cb=wave_live_cb,
+                    mimo_variant=args.get("mimo_variant"),
                     model_spec=builder_target, role="builder",
                     whole_job_limit=job_budget.max_seconds)
                 executions.append(extra)
@@ -7583,6 +7860,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         transport_name=run["transport"],
                         cancel_check=cancel_check,
                         live_usage_cb=rev_live_cb,
+                        mimo_variant=args.get("mimo_variant"),
                         whole_job_limit=job_budget.max_seconds)
                     executions.append(revision)
                     used_logs.update(revision.get("session_logs") or [])
@@ -7902,6 +8180,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     add_dirs=run["add_dirs"],
                     transport_name=run["transport"],
                     cancel_check=cancel_check,
+                    mimo_variant=args.get("mimo_variant"),
+                    model_spec=(crosscheck_crew_target or builder_target),
                     whole_job_limit=job_budget.max_seconds)
                 executions.append(execution)
                 used_logs.update(execution.get("session_logs") or [])
@@ -8143,6 +8423,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 except model_policy.BuilderModelError as exc:
                     return {"status": "error", "error": exc.code,
                             "answer": None}
+                # A MiMo readiness ping runs the probe model (flash), not the
+                # candidate's paid model; other vendors are untouched.
+                spec = (_preflight_probe_spec(cfg, spec,
+                                              dsh_bin=(candidate.get("dsh_bin")
+                                                       or None))
+                        or spec)
                 _preflight_remaining = job_budget.remaining_seconds()
                 _preflight_cap = float(cfg.get(
                     "review_preflight_timeout", 45.0) or 45.0)
@@ -8163,6 +8449,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     cancel_check=cancel_check,
                     dsh_bin=(candidate.get("dsh_bin") or None),
                     patch=(candidate.get("patch") or None),
+                        mimo_variant=args.get("mimo_variant"),
                         model_spec=spec, role="reviewer",
                         whole_job_limit=job_budget.max_seconds)
                 except BaseException:
@@ -8760,7 +9047,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                      or None),
                             patch=((selected_reviewer or {}).get("patch")
                                    or None),
-                            model_spec=selected_spec,
+                            mimo_variant=args.get("mimo_variant"),
+                            model_spec=(
+                                _preflight_probe_spec(
+                                    cfg, selected_spec,
+                                    dsh_bin=((selected_reviewer or {})
+                                             .get("dsh_bin") or None))
+                                or selected_spec),
                             whole_job_limit=job_budget.max_seconds)
                         reviewer_executions.append(preflight)
                         used_logs.update(preflight.get("session_logs") or [])
@@ -8848,6 +9141,13 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 cancel_check=cancel_check,
                                 dsh_bin=reviewer_backup["bin"],
                                 role="reviewer",
+                                mimo_variant=args.get("mimo_variant"),
+                                # A MiMo backup ping runs the probe model
+                                # (flash); other backups keep the default
+                                # target exactly as before.
+                                model_spec=_preflight_probe_spec(
+                                    cfg, backup_candidate,
+                                    dsh_bin=reviewer_backup["bin"]),
                                 whole_job_limit=job_budget.max_seconds)
                             reviewer_executions.append(_backup_preflight)
                             used_logs.update(
@@ -9164,6 +9464,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                  else (selected_reviewer or {}).get("dsh_bin")),
                         patch=((selected_reviewer or {}).get("patch")
                                if not review_backup_used else None),
+                        mimo_variant=args.get("mimo_variant"),
                         model_spec=selected_spec,
                         role="reviewer",
                         whole_job_limit=job_budget.max_seconds)
@@ -9218,7 +9519,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         review_before, review_after,
                         allowed=("REVIEW.md", "REVIEW.partial.md",
                                  "REVIEW.partial.json",
-                                 ".browser-evidence/", "EVIDENCE.json"))
+                                 ".browser-evidence/", "EVIDENCE.json",
+                                 # Per-run MiMo permission config written by
+                                 # the worker adapter before the child starts,
+                                 # never by the reviewer itself.
+                                 "mimocode.jsonc"))
                     if violations:
                         review["status"] = "error"
                         review["error"] = (
@@ -9519,7 +9824,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         cancel_check=cancel_check, budget=job_budget,
                         used_logs=used_logs,
                         dsh_bin=(review_backup_dsh
-                                 if review_backup_used else None))
+                                 if review_backup_used else None),
+                        model_spec=selected_spec)
                     if reprompt_record.get("attempted"):
                         reviewer_executions.append(reprompt_record)
                         for _log in reprompt_record.get("session_logs") or []:
@@ -10021,6 +10327,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 transport_name=run["transport"],
                 cancel_check=cancel_check,
                 live_usage_cb=revision_live_cb,
+                mimo_variant=args.get("mimo_variant"),
                 model_spec=builder_target, role="revision",
                 whole_job_limit=job_budget.max_seconds)
             reviewer_executions.append(revision)
