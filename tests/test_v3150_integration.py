@@ -32,21 +32,35 @@ except Exception:  # W1 lands in parallel; the hook degrades to the dsh path.
 
 _MIMO_REASON = "deepseek_mcp.mimo_worker adapter is absent"
 
-# mimo_fakes "ok" mode accumulates two step_finish events:
-#   step 1: input 70, cache 20, output 38, reasoning 6, total 120
-#   step 2: input 80, cache 25, output 46, reasoning 7, total 140
-OK_TOKENS = {"tokens_in": 150, "cache_read_tokens": 45, "tokens_out": 84,
-             "reasoning_tokens": 13, "total_tokens": 260}
+# mimo_fakes "ok" mode replays tests/fixtures/mimo/mimo-0.1.17-run-events.jsonl
+# verbatim: two step_finish parts (input 19925+1354, cache read 10240+31872,
+# cache write 0+0, output 104+2299, reasoning 22+98, total 30291+35623) whose
+# CLI part.cost values are 0.008813859 + 0.0027891192 (cost_source "vendor").
+OK_TOKENS = {"tokens_in": 21279, "cache_read_tokens": 42112,
+             "cache_write_tokens": 0, "tokens_out": 2403,
+             "reasoning_tokens": 120, "total_tokens": 65914}
+OK_COST = 0.008813859 + 0.0027891192  # 0.0116029782, kept at round(cost, 6)
+OK_ANSWER = "I'll start by reading the brief and understanding the workspace."
+OK_SESSION = "ses_ffe5e2a611a85ffeatM04xDPrk"
 
 # Inline MiMo fake for the reviewer preflight/review flow.  W11's mimo_fakes
 # covers READY and the ok/error streams but has no review-report mode (its
-# reviews would parse as unscored), so test (e) uses this minimal fake per the
-# plan's JSONL event contract.  It appends one JSON argv line per invocation
-# to FAKE_MIMO_ARGV so a preflight and a review can both be inspected.
+# reviews would parse as unscored), so the review flow uses this minimal fake.
+# It emits the real mimo 0.1.17 event shape verified in
+# tests/fixtures/mimo/mimo-0.1.17-run-events.jsonl: top-level type/timestamp/
+# sessionID plus a `part` payload (text as part.text, step_finish tokens with
+# the cache {read, write} dict and part.cost, tool_use as part.tool with
+# part.state), and errors as top-level error.name / error.data.{message,
+# statusCode} like mimo-0.1.17-error-401.jsonl.  With FAKE_MIMO_MODE=error_auth
+# it emits that 401 error line and exits 1.  It appends one JSON argv line per
+# invocation to FAKE_MIMO_ARGV so a preflight and a review can both be
+# inspected; `-s <session>` is echoed as the events' sessionID (the fixture
+# recording's own id is used otherwise).
 _REVIEWER_FAKE = r'''#!/usr/bin/env python3
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 argv = sys.argv
@@ -70,6 +84,7 @@ if capture:
 
 task = ""
 workspace = Path(os.getcwd())
+session = ""
 positionals = []
 index = 1
 while index < len(argv):
@@ -78,6 +93,10 @@ while index < len(argv):
         index += 1
         if index < len(argv):
             workspace = Path(argv[index])
+    elif arg in ("-s", "--session"):
+        index += 1
+        if index < len(argv):
+            session = argv[index]
     elif not arg.startswith("-"):
         positionals.append(arg)
     index += 1
@@ -86,31 +105,97 @@ if positionals and positionals[0] == "run" and len(positionals) > 1:
 elif positionals:
     task = positionals[0]
 
+SNAPSHOT = "7108b384f4ddfdd09670d588110e4c6138c44571"
+if not session:
+    session = "ses_ffe5e2a611a85ffeatM04xDPrk"
+
+_seq = [0]
+
+def _ids():
+    _seq[0] += 1
+    return ("prt_reviewer_%06d" % _seq[0], "msg_reviewer_%06d" % _seq[0])
+
 def emit(payload):
     try:
         print(json.dumps(payload), flush=True)
     except (BrokenPipeError, OSError):
         raise SystemExit(0)
 
+def emit_text(text):
+    started = int(time.time() * 1000)
+    ended = int(time.time() * 1000)
+    prt, msg = _ids()
+    emit({"type": "text", "timestamp": ended, "sessionID": session,
+          "part": {"id": prt, "messageID": msg, "sessionID": session,
+                   "type": "text", "text": text,
+                   "time": {"start": started, "end": ended}}})
+
+def emit_step_start():
+    prt, msg = _ids()
+    emit({"type": "step_start", "timestamp": int(time.time() * 1000),
+          "sessionID": session,
+          "part": {"id": prt, "messageID": msg, "sessionID": session,
+                   "snapshot": SNAPSHOT, "type": "step-start"}})
+
+def emit_tool(tool, tool_input, output, title):
+    started = int(time.time() * 1000)
+    ended = int(time.time() * 1000)
+    prt, msg = _ids()
+    emit({"type": "tool_use", "timestamp": ended, "sessionID": session,
+          "part": {"type": "tool", "execution": "started",
+                   "callID": "call_reviewer_%06d" % _seq[0], "tool": tool,
+                   "state": {"status": "completed", "input": tool_input,
+                             "output": output,
+                             "metadata": {"truncated": False},
+                             "title": title,
+                             "time": {"start": started, "end": ended}},
+                   "id": prt, "messageID": msg, "sessionID": session}})
+
+def emit_step_finish():
+    prt, msg = _ids()
+    emit({"type": "step_finish", "timestamp": int(time.time() * 1000),
+          "sessionID": session,
+          "part": {"id": prt, "reason": "stop", "snapshot": SNAPSHOT,
+                   "messageID": msg, "sessionID": session,
+                   "type": "step-finish",
+                   "tokens": {"total": 134, "input": 70, "output": 38,
+                              "reasoning": 6,
+                              "cache": {"read": 20, "write": 0}},
+                   "cost": 0.00042}})
+
+def emit_error(message, status_code):
+    emit({"type": "error", "timestamp": int(time.time() * 1000),
+          "sessionID": session,
+          "error": {"name": "APIError",
+                    "data": {"message": message,
+                             "statusCode": status_code,
+                             "isRetryable": False,
+                             "metadata": {
+                                 "providerID": "xiaomi",
+                                 "url": ("https://api.xiaomimimo.com/v1/"
+                                         "chat/completions")}}}})
+
 REPORT = ("# Independent review\n\n## Score\nFinal quality score: 9.2/10\n\n"
           "## Blocking defects\nNone\n\n## Non-blocking defects\nNone\n\n"
           "## Fix list\nNone\n")
 
+if os.environ.get("FAKE_MIMO_MODE") == "error_auth":
+    emit_error("Invalid API Key: Please provide valid API Key", 401)
+    raise SystemExit(1)
 if task.lstrip().startswith("Reply with exactly READY"):
-    emit({"type": "text", "data": {"text": "READY"}})
+    emit_text("READY")
     raise SystemExit(0)
 if "INDEPENDENT REVIEWER" in task or "SCORE REPROMPT" in task:
     try:
         (workspace / "REVIEW.md").write_text(REPORT, encoding="utf-8")
     except OSError:
         pass
-    emit({"type": "text", "data": {"text": REPORT}})
+    emit_text(REPORT)
     raise SystemExit(0)
-emit({"type": "step_start", "data": {"name": "step-1"}})
-emit({"type": "tool_use", "data": {"name": "bash", "input": {"command": "ls"}}})
-emit({"type": "step_finish", "data": {"tokens": {
-    "total": 120, "input": 70, "output": 38, "reasoning": 6, "cache": 20}}})
-emit({"type": "text", "data": {"text": "Fake mimo ping done."}})
+emit_step_start()
+emit_tool("bash", {"command": "ls"}, "", "List files")
+emit_step_finish()
+emit_text("Fake mimo ping done.")
 raise SystemExit(0)
 '''
 
@@ -210,6 +295,7 @@ class BuilderOnMimoTests(_IntegrationBase):
             builder_model="xiaomi/mimo-v2.6-pro")
         self.assertEqual(run["status"], "ok")
         self.assertEqual(run["builder_transport"], "mimo")
+        self.assertEqual(run["answer"], OK_ANSWER)
         self.assertEqual(run["tokens_in"], OK_TOKENS["tokens_in"])
         self.assertEqual(run["cache_read_tokens"],
                          OK_TOKENS["cache_read_tokens"])
@@ -217,13 +303,20 @@ class BuilderOnMimoTests(_IntegrationBase):
         self.assertEqual(run["total_tokens"], OK_TOKENS["total_tokens"])
         self.assertEqual((run.get("usage") or {}).get("reasoning_tokens"),
                          OK_TOKENS["reasoning_tokens"])
+        self.assertEqual((run.get("usage") or {}).get("cache_write_tokens"),
+                         OK_TOKENS["cache_write_tokens"])
         rows = (run.get("model_usage") or {}).get("models") or {}
         row = rows.get("xiaomi/mimo-v2.6-pro")
         self.assertIsNotNone(row, rows)
         self.assertEqual(row["total_tokens"], OK_TOKENS["total_tokens"])
+        self.assertEqual(row["cache_write_tokens"],
+                         OK_TOKENS["cache_write_tokens"])
         self.assertEqual(row["executions"], 1)
         self.assertTrue(run.get("cost_known"))
-        self.assertGreater(run.get("estimated_cost_usd") or 0.0, 0.0)
+        self.assertEqual(run.get("cost_source"), "vendor")
+        self.assertEqual(run.get("estimated_cost_usd"), round(OK_COST, 6))
+        self.assertEqual(row["cost_source"], "vendor")
+        self.assertEqual(row["estimated_cost_usd"], round(OK_COST, 6))
         argv = self._mimo_argv()
         self.assertIn("-m", argv)
         self.assertIn("xiaomi/mimo-v2.6-pro", argv)
@@ -231,9 +324,12 @@ class BuilderOnMimoTests(_IntegrationBase):
         self.assertIn("builder", row.get("roles") or [])
 
     def test_auth_error_surfaces_mimo_remedy_and_classified_stop_reason(self):
-        auth = mimo_fakes.write_fake_mimo(self.root / "mimo-auth",
-                                         mode="error_auth")
+        # The inline fake's error mode emits the real 0.1.17 error shape
+        # (top-level error.name / error.data.{message, statusCode}) exactly as
+        # tests/fixtures/mimo/mimo-0.1.17-error-401.jsonl records it.
+        auth = fakes.write_fake_script(self.root / "mimo-auth", _REVIEWER_FAKE)
         self.env["MIMO_BIN"] = str(auth)
+        self.env["FAKE_MIMO_MODE"] = "error_auth"
         self.cfg._values["mimo_bin"] = str(auth)
         with self.assertRaises(RuntimeError) as caught:
             self._run(subagents=1, quality=False,
@@ -409,6 +505,13 @@ class SessionResumeTests(_IntegrationBase):
         argv = self._mimo_argv()
         self.assertIn("-s", argv)
         self.assertIn("sess-resume-2", argv)
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            fresh = harness._execute_once(
+                self.cfg, str(self.ws), "fresh task",
+                model_spec=spec, session_id=None, label="builder")
+        self.assertEqual(fresh["status"], "ok")
+        # Without -s the recording's own session id flows through unchanged.
+        self.assertEqual(fresh["transport_session_id"], OK_SESSION)
 
 
 if __name__ == "__main__":
