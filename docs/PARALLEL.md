@@ -71,6 +71,10 @@ the actual changed files with the inferred write set.
 - If neither applies, the patch is retained as `manual`, the worktree is
   retained, and the run reports the conflict; the canonical tree is unchanged.
 - A failed `git apply --check` follows the same serial path.
+- An empty write set is never installed: it is treated as no proof and
+  serialised. Overlap is case-insensitive (Windows/macOS safe), and
+  traversal or absolute wildcard globs are rejected rather than widened.
+  An absolute path inside the job workspace is normalised to repo-relative.
 
 The run's `pipeline` block records the inferred write set, confidence, source,
 parallel/serial decision and reason, peers, stray files, integration

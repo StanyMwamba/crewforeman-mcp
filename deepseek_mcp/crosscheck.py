@@ -112,6 +112,20 @@ def _as_bool(value, default):
     return bool(value)
 
 
+def _as_paths(value):
+    """Coerce a config/tool list of risk globs without inventing entries."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
 def _truncate(text, limit=MAX_TEXT):
     text = str(text or "")
     return text if len(text) <= limit else text[:limit] + "…"
@@ -261,6 +275,8 @@ def normalise_config(args, cfg):
         "audit_forced_jobs": _as_int(
             _cfg(cfg, "audit_forced_jobs", 5), 5, 0, 50),
         "audit_seed": _as_int(_cfg(cfg, "audit_seed", 0), 0, 0, 2 ** 63 - 1),
+        "risk_paths": _as_paths(
+            args.get("risk_paths", _cfg(cfg, "risk_paths", []))),
     }
 
 
@@ -380,8 +396,10 @@ def plan_parts(workspace, cfg=None):
             writes = [writes]
         write_set = []
         for entry in writes:
-            path_value = _norm_path(entry)
-            if path_value:
+            # A plan entry is normally one path, but a space/comma joined
+            # string must not hide a second write: split and validate every
+            # token before the disjointness check.
+            for path_value in _split_paths(entry):
                 write_set.append(path_value)
         depends = item.get("depends_on") or item.get("deps") or []
         if isinstance(depends, str):
@@ -620,17 +638,24 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
             for crews in rescuers.values():
                 crews.add(crew)
     # Fail closed: a part counts only when the build wave (or a successful
-    # rescue) actually completed it.  "planned"/"pending"/"stalled"/empty
-    # statuses are not built, so an all-green evidence sheet cannot certify a
-    # task that was never built.  A missing status is treated as built for
-    # legacy records, matching the old contract.
+    # rescue) explicitly marked it built.  Missing/empty statuses, like
+    # planned/pending/stalled, are not built, so an all-green evidence sheet
+    # cannot certify a task that was never built.
     done_statuses = ("built", "done", "ok", "complete", "completed", "passed")
-    part_ok = all(
-        str(part.get("status") or "built").strip().lower() in done_statuses
+    part_ok = bool(parts) and all(
+        str(part.get("status") or "").strip().lower() in done_statuses
         for part in parts)
 
     test_status = str((tests or {}).get("status") or "error").lower()
-    t_value = 1.0 if test_status in ("passed", "smoke_passed") else 0.0
+    # A compile-only smoke is not a test suite: it earns half the tests
+    # condition and can never satisfy a 10.0 gate.  Only a connector-run
+    # suite that passed earns the full 2.0 points.
+    if test_status == "passed":
+        t_value = 1.0
+    elif test_status == "smoke_passed":
+        t_value = 0.5
+    else:
+        t_value = 0.0
 
     required = [item for item in requirements if item.get("required", True) is not False]
     brief_items = [item for item in (brief_items or [])
@@ -697,6 +722,19 @@ def evaluate(parts, findings, requirements, tests, rescues=None,
         checker = checkers.get(part_id) if part_id else None
         finder = str(item.get("found_by_crew") or item.get("found_by") or "")
         crew = str(confirmation.get("crew") or confirmation.get("confirmed_by") or "")
+        fix = item.get("fix") if isinstance(item.get("fix"), dict) else {}
+        fix_crew = str(fix.get("crew") or fix.get("fixed_by") or "").strip()
+        # The original builder (or a successful rescuer), never the finding
+        # crew, must be the one that fixed the item.  Self-fixing and
+        # self-confirming is a gate bypass even when the report says "fixed".
+        if not fix_crew or fix_crew == finder:
+            continue
+        if part_id:
+            builder = builders.get(part_id)
+            allowed = {str(builder)} if builder else set()
+            allowed.update(rescuers.get(part_id) or set())
+            if not allowed or fix_crew not in allowed:
+                continue
         if not checker:
             # Cross-cutting finding: the finder must at least be a real checker
             # crew, never a builder certifying its own work.
@@ -982,6 +1020,18 @@ def apply_rescue(record, rescue, rescued=False):
                                  or part.get("checker_crew")),
                 "status": status,
             })
+    elif explicit:
+        # An explicit target that matches no part is a failed rescue, never a
+        # licence to mark the whole run rescued/built.
+        rows.append({
+            "part_id": explicit,
+            "scope": "unknown_part",
+            "reason": default_reason,
+            "failed_crew": failed_crew,
+            "rescue_crew": rescue_crew,
+            "checker_crew": None,
+            "status": "unknown_part",
+        })
     else:
         # No part could be identified.  A successful rescue completed the
         # whole task, so it covers every part; a failed one covers none.
@@ -1112,11 +1162,12 @@ def build_contract(cc, parts_info, pairing_map, prompt):
     lines += [
         "",
         "### Wave 1 - build",
-        "All builder crews build their parts at once (respect the Harness "
-        "child limit). Each builder writes only its part's files. If a crew "
-        "stalls, stops early, loses balance or the connector's finisher takes "
-        "over, mark the part `rescued` and have the finisher complete it; a "
-        "different crew must still check it.",
+        "Build every part at dependency level 0 at once, then start a part "
+        "only after every part in its `depends_on` list is built (respect the "
+        "Harness child limit). Each builder writes only its part's files. If a "
+        "crew stalls, stops early, loses balance or the connector's finisher "
+        "takes over, mark the part `rescued` and have the finisher complete "
+        "it; a different crew must still check it.",
         "",
         "### Wave 2 - cross-check",
         "Each crew reviews ONLY parts it did not build. Half of each crew are "

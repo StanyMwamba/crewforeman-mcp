@@ -120,7 +120,8 @@ def normalise_rel(path, workspace=None):
         root = os.path.normcase(os.path.realpath(str(workspace))).replace("\\", "/")
         candidate = os.path.normcase(os.path.realpath(text)) if os.path.isabs(text) else ""
         if candidate and candidate.startswith(root.rstrip("/") + "/"):
-            text = candidate[len(root):]
+            # Strip the separator too: "/root/src/a.py" -> "src/a.py".
+            text = candidate[len(root):].lstrip("/")
     if (text.startswith("/") or os.path.isabs(text)
             or re.match(r"^[A-Za-z]:/", text)):
         return ""
@@ -158,6 +159,21 @@ def normalise_set(items, workspace=None):
     return {"valid": valid, "invalid": invalid[:40], "truncated": len(valid) >= MAX_ITEMS}
 
 
+def _safe_glob(raw):
+    """Normalise a write-set glob, rejecting traversal/absolute patterns."""
+    text = str(raw or "").strip().replace("\\", "/")
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:/", text):
+        return ""
+    while text.startswith("./"):
+        text = text[2:]
+    if not text or ".." in text.split("/") or text.startswith(".git/"):
+        return ""
+    # Keep glob metacharacters, but never shell/format punctuation.
+    if not re.match(r"^[A-Za-z0-9._\-/*?\[\]]+$", text):
+        return ""
+    return text
+
+
 def path_covered(path, write_set):
     """True when ``path`` is the same as or under a write-set entry."""
     target = normalise_rel(path)
@@ -167,13 +183,16 @@ def path_covered(path, write_set):
         raw = str(item or "").strip().replace("\\", "/")
         if any(char in raw for char in "*?["):
             import fnmatch
-            if fnmatch.fnmatchcase(target, raw.lstrip("./")):
+            pattern = _safe_glob(raw)
+            if pattern and fnmatch.fnmatchcase(target.casefold(),
+                                               pattern.casefold()):
                 return True
             continue
         entry = normalise_rel(raw)
         if not entry:
             continue
-        if target == entry or target.startswith(entry.rstrip("/") + "/"):
+        if (target.casefold() == entry.casefold()
+                or target.casefold().startswith(entry.rstrip("/").casefold() + "/")):
             return True
     return False
 
@@ -181,8 +200,8 @@ def path_covered(path, write_set):
 def sets_overlap(first, second):
     left = [normalise_rel(item) for item in (first or [])]
     right = [normalise_rel(item) for item in (second or [])]
-    left = [item for item in left if item]
-    right = [item for item in right if item]
+    left = [item.casefold() for item in left if item]
+    right = [item.casefold() for item in right if item]
     if not left or not right:
         return True
     for a in left:
@@ -473,6 +492,10 @@ def stray_files(write_set, changed_files, extra_allowed=()):
 def integration_decision(pipe, changed_files, apply_check_ok):
     """Return how a finished patch may be integrated."""
     write_set = (pipe or {}).get("write_set") or []
+    if not write_set:
+        # An empty set cannot prove that any changed file is allowed.
+        return {"action": "serial_reintegrate", "reason": "no_write_set",
+                "stray": []}
     stray = stray_files(write_set, changed_files,
                         extra_allowed=(pipe or {}).get("extra_allowed") or [])
     if stray:

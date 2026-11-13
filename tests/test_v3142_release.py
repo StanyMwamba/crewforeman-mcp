@@ -124,5 +124,45 @@ class SchemaTests(unittest.TestCase):
             self.assertIn(key, data, key)
 
 
+class ResumeSurfaceTests(unittest.TestCase):
+    def test_crosscheck_surface_is_replayed(self):
+        from deepseek_mcp.harness import _resume_job_args
+        saved = {
+            "mode": "crosscheck",
+            "crosscheck_config": {
+                "threshold": 9.5, "max_rounds": 2, "crews": 3,
+                "crew_size": 2, "subagents": 6, "audit_review": True,
+                "audit_sample_rate": 0.4, "audit_spot_requirements": 4,
+                "audit_spot_fixes": 1, "risk_paths": ["billing/**"],
+            },
+        }
+        out = _resume_job_args(saved, {})
+        self.assertEqual(out["mode"], "crosscheck")
+        self.assertEqual(out["crosscheck_threshold"], 9.5)
+        self.assertEqual(out["crosscheck_max_rounds"], 2)
+        self.assertEqual(out["crosscheck_crews"], 3)
+        self.assertEqual(out["crosscheck_crew_size"], 2)
+        self.assertEqual(out["subagents"], 6)
+        self.assertTrue(out["audit_review"])
+        self.assertEqual(out["audit_sample_rate"], 0.4)
+        self.assertEqual(out["audit_spot_requirements"], 4)
+        self.assertEqual(out["risk_paths"], ["billing/**"])
+
+    def test_crosscheck_without_frozen_config_fails_closed(self):
+        from deepseek_mcp.harness import _resume_job_args
+        with self.assertRaises(RuntimeError):
+            _resume_job_args({"mode": "crosscheck"}, {})
+
+    def test_parallel_surface_is_replayed_from_spec(self):
+        from deepseek_mcp.harness import _resume_job_args
+        out = _resume_job_args(
+            {"auto_parallel": False},
+            {"auto_parallel_min_confidence": 0.7,
+             "write_set": ["src/a.py"]})
+        self.assertFalse(out["auto_parallel"])
+        self.assertEqual(out["auto_parallel_min_confidence"], 0.7)
+        self.assertEqual(out["write_set"], ["src/a.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

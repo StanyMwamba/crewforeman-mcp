@@ -150,8 +150,12 @@ def _norm_path(value):
 # risk detection
 
 
-def detect_risk(brief, paths, cfg=None):
-    """Return ``{risky, reasons, globs, words}`` for a job."""
+def detect_risk(brief, paths, cfg=None, extra_paths=None):
+    """Return ``{risky, reasons, globs, words}`` for a job.
+
+    ``extra_paths`` is the per-job ``risk_paths`` tool argument.  It is merged
+    with the config globs and can only add risk, never sample a job out.
+    """
     globs = list(DEFAULT_RISKY_GLOBS)
     extra = []
     for key in ("audit_risk_globs", "risk_paths"):
@@ -160,6 +164,10 @@ def detect_risk(brief, paths, cfg=None):
             value = [value]
         if isinstance(value, (list, tuple)):
             extra.extend(value)
+    if isinstance(extra_paths, str):
+        extra_paths = [extra_paths]
+    if isinstance(extra_paths, (list, tuple)):
+        extra.extend(extra_paths)
     for pattern in extra:
         value = str(pattern or "").strip()
         if value and value not in globs:
@@ -395,7 +403,7 @@ def _decide(rate, risky, forced_remaining, crosscheck, seed):
 def prepare(cfg, *, run, workspace, brief, changed_paths,
             requirements, fixes, crosscheck_mode, gate_passed,
             audit_review=None, sample_rate=None, seed=None,
-            spot_requirements=None, spot_fixes=None):
+            spot_requirements=None, spot_fixes=None, risk_paths=None):
     """Build the audit plan and persist the sampling/forced-rate state."""
     run = run or {}
     job_id = str(run.get("id") or "")
@@ -418,7 +426,7 @@ def prepare(cfg, *, run, workspace, brief, changed_paths,
         disabled["reason"] = "audit_review_false"
         return disabled
 
-    risk = detect_risk(brief, changed_paths, cfg)
+    risk = detect_risk(brief, changed_paths, cfg, extra_paths=risk_paths)
     state, state_error = load_state(cfg, workspace)
     forced_before = int(state.get("forced_remaining") or 0)
     forced_used = False
@@ -626,10 +634,40 @@ def review_block(plan, crew_evidence="", test_evidence=""):
 # parsing
 
 
+def _planned_spot_ids(plan):
+    """Selected requirement/fix ids from the audit plan, in stable order."""
+    record = (plan or {}).get("record") or plan or {}
+    spot = record.get("spot") or (plan or {}).get("spot") or {}
+    selected = []
+    for key, kind in (("requirements", "requirement"), ("fixes", "fix")):
+        for item in spot.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "").strip()
+            if ident:
+                selected.append((ident, kind))
+    return selected
+
+
+def _valid_spot(check):
+    """A spot check must report pass/fail and the command output it ran."""
+    result = str(check.get("result") or check.get("status") or "").strip().lower()
+    evidence = str(check.get("evidence") or "").strip()
+    return result in ("pass", "passed", "fail", "failed") and bool(evidence)
+
+
 def _coerce_blocking(value):
     rows = []
     if isinstance(value, int):
-        return [], max(0, value)
+        # Keep a row per counted item: the focused re-audit is built from
+        # these rows, and an integer count alone would silently become a
+        # normal review round.
+        return [
+            {"id": "AUD-%d" % (index + 1),
+             "text": "audit blocking item %d" % (index + 1),
+             "evidence": ""}
+            for index in range(max(0, value))
+        ], max(0, value)
     if not isinstance(value, list):
         return [], 0
     for index, item in enumerate(value):
@@ -690,9 +728,44 @@ def parse_audit(report_text, plan=None):
                     result["claims"].append({"claim": _truncate(item, 500),
                                              "why": "", "evidence": ""})
         checks = data.get("spot_checks")
-        if isinstance(checks, list):
-            result["spot_checks"] = [item for item in checks
-                                     if isinstance(item, dict)][:40]
+        if not isinstance(checks, list):
+            result["error"] = "spot_checks_missing"
+            return result
+        normalized = [item for item in checks if isinstance(item, dict)][:40]
+        by_id = {}
+        for check in normalized:
+            ident = str(check.get("id") or "").strip()
+            if ident:
+                by_id.setdefault(ident, []).append(check)
+        # Every seeded spot must come back with a pass/fail and the command
+        # output it re-ran.  A bare score cannot satisfy the audit.
+        for ident, _kind in _planned_spot_ids(plan):
+            if not by_id.get(ident):
+                result["error"] = "spot_checks_incomplete"
+                return result
+            if not any(_valid_spot(check) for check in by_id[ident]):
+                result["error"] = "spot_checks_incomplete"
+                return result
+        result["spot_checks"] = normalized
+        failed = [
+            check for check in normalized
+            if str(check.get("result") or check.get("status") or "").strip()
+            .lower() in ("fail", "failed")
+        ]
+        for check in failed:
+            ident = str(check.get("id") or "spot")
+            evidence = _truncate(check.get("evidence"), 800)
+            result["blocking"].append({
+                "id": "SPOT-%s" % ident,
+                "text": "audit spot check failed: %s" % ident,
+                "evidence": evidence,
+            })
+            result["blocking_count"] = int(result["blocking_count"]) + 1
+            result["claims"].append({
+                "claim": "spot check %s reported as passing" % ident,
+                "why": "the re-run evidence failed",
+                "evidence": evidence,
+            })
         result["ran"] = True
         return result
 
@@ -772,6 +845,26 @@ def confirmed_fixes(crosscheck_record):
         if str(confirmation.get("crew")
                or confirmation.get("confirmed_by") or "") != finder:
             continue
+        fix = item.get("fix") if isinstance(item.get("fix"), dict) else {}
+        fix_crew = str(fix.get("crew") or fix.get("fixed_by") or "").strip()
+        if not fix_crew or fix_crew == finder:
+            continue
+        part_id = str(item.get("part_id") or "")
+        parts = {
+            str(part.get("id")): part
+            for part in (crosscheck_record or {}).get("parts") or []
+            if isinstance(part, dict)
+        }
+        builder = str((parts.get(part_id) or {}).get("builder_crew") or "")
+        if part_id and builder and fix_crew != builder:
+            rescuers = {
+                str(row.get("rescue_crew") or "")
+                for row in (crosscheck_record or {}).get("rescues") or []
+                if isinstance(row, dict)
+                and str(row.get("part_id") or "") in (part_id, "", "all")
+            }
+            if fix_crew not in rescuers:
+                continue
         rows.append({
             "id": item.get("id"),
             "text": item.get("text"),

@@ -45,6 +45,13 @@ class RiskTests(unittest.TestCase):
         self.assertTrue(audit.detect_risk("x", ["billing/pay.py"], cfg)["risky"])
         self.assertTrue(audit.detect_risk("x", ["deepseek_mcp/jobs.py"], cfg)["risky"])
 
+    def test_per_job_risk_paths_are_additive(self):
+        result = audit.detect_risk(
+            "ordinary task", ["billing/pay.py"], None,
+            extra_paths=["billing/**"])
+        self.assertTrue(result["risky"])
+        self.assertIn("billing/**", result["globs"])
+
     def test_risk_paths_config_key_is_loaded(self):
         from deepseek_mcp.config import load_config
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -231,7 +238,8 @@ class PromptParseTests(unittest.TestCase):
             '"evidence": "cmd: fail"}], '
             '"crew_claims_that_did_not_hold": [{"claim": "tests pass", '
             '"why": "they fail", "evidence": "cmd"}], '
-            '"spot_checks": [{"id": "R1", "result": "fail"}]}\n'
+            '"spot_checks": [{"id": "R1", "result": "pass", '
+            '"evidence": "command: test -q; ok"}]}\n'
             "-->\n")
         result = audit.parse_audit(report, {})
         self.assertTrue(result["ran"])
@@ -289,6 +297,52 @@ class PromptParseTests(unittest.TestCase):
         self.assertEqual(result["score"], 10.0)
         self.assertEqual(result["blocking_count"], 0)
 
+    def test_seeded_spots_must_all_come_back_with_evidence(self):
+        plan = {"record": {"spot": {
+            "requirements": [{"id": "R1"}, {"id": "R2"}],
+            "fixes": [{"id": "F1"}]}}}
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": [{"id": "R1", "result": "pass", '
+                  '"evidence": "cmd"}]} -->')
+        result = audit.parse_audit(report, plan)
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["error"], "spot_checks_incomplete")
+        finish = audit.finish(plan["record"], report)
+        self.assertEqual(finish["verdict"], "not_reported")
+
+    def test_spot_check_pass_requires_command_output(self):
+        plan = {"record": {"spot": {"requirements": [{"id": "R1"}],
+                                    "fixes": []}}}
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": [{"id": "R1", "result": "pass", '
+                  '"evidence": ""}]} -->')
+        self.assertFalse(audit.parse_audit(report, plan)["ran"])
+
+    def test_failed_spot_check_is_blocking(self):
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": [{"id": "R1", "result": "fail", '
+                  '"evidence": "command: test; 1 failed"}]} -->')
+        result = audit.parse_audit(report, {})
+        self.assertTrue(result["ran"])
+        self.assertEqual(result["blocking_count"], 1)
+        self.assertIn("SPOT-R1", result["blocking"][0]["id"])
+        done = audit.finish({"job_id": "j"}, report, None)
+        self.assertEqual(done["verdict"], "blocked")
+
+    def test_integer_blocking_keeps_reaudit_rows(self):
+        report = ('<!-- AUDIT_JSON {"score": 6.0, "blocking": 2, '
+                  '"spot_checks": []} -->')
+        result = audit.parse_audit(report, {})
+        self.assertEqual(result["blocking_count"], 2)
+        self.assertEqual(len(result["blocking"]), 2)
+        block = audit.reaudit_block(
+            {"blocking": result["blocking"]}, result["blocking"])
+        self.assertIn("AUD-1", block)
+        self.assertIn("AUD-2", block)
+
     def test_finish_sets_forced_rate_after_failed_claim(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -296,7 +350,7 @@ class PromptParseTests(unittest.TestCase):
         record = {"job_id": "job-42", "sampled": True}
         report = ('<!-- AUDIT_JSON\n{"score": 8.0, "blocking": [], '
                   '"crew_claims_that_did_not_hold": [{"claim": "x", '
-                  '"why": "y", "evidence": "z"}]}\n-->')
+                  '"why": "y", "evidence": "z"}], "spot_checks": []}\n-->')
         result = audit.finish(record, report, cfg)
         self.assertTrue(result["ran"])
         self.assertTrue(result["forced_rate_set"])
@@ -312,24 +366,94 @@ class PromptParseTests(unittest.TestCase):
         self.assertNotIn("full audit", block.lower().split("do not repeat")[0])
 
 
+class StubbedAuditFlowTests(unittest.TestCase):
+    """End-to-end prepare -> stubbed reviewer report -> finish, no model call."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = _cfg(self.tmp.name)
+
+    def _prepare(self):
+        requirements = [
+            {"id": "R1", "text": "one", "evidence_command": "cmd one"},
+            {"id": "R2", "text": "two", "evidence_command": "cmd two"},
+        ]
+        fixes = [{"id": "F1", "text": "fix one",
+                  "evidence_command": "cmd fix"}]
+        return audit.prepare(
+            self.cfg, run={"id": "job-1"}, workspace=self.tmp.name,
+            brief="ordinary task", changed_paths=["docs/a.md"],
+            requirements=requirements, fixes=fixes, crosscheck_mode=True,
+            gate_passed=True, seed=42, spot_requirements=2, spot_fixes=1)
+
+    def _report(self, plan, fail_id=None):
+        checks = []
+        for item in plan["spot"]["requirements"]:
+            checks.append({"id": item["id"], "result": "pass",
+                           "evidence": "command: %s; ok" % item["id"]})
+        for item in plan["spot"]["fixes"]:
+            checks.append({"id": item["id"], "result": "pass",
+                           "evidence": "command: %s; ok" % item["id"]})
+        if fail_id:
+            for check in checks:
+                if check["id"] == fail_id:
+                    check["result"] = "fail"
+                    check["evidence"] = "command: regression; 1 failed"
+        block = {
+            "score": 9.5 if not fail_id else 6.0,
+            "blocking": [],
+            "crew_claims_that_did_not_hold": [],
+            "spot_checks": checks,
+        }
+        return "<!-- AUDIT_JSON\n%s\n-->" % json.dumps(block)
+
+    def test_seeded_spots_are_required_and_a_pass_is_recorded(self):
+        plan = self._prepare()
+        self.assertTrue(plan["sampled"])
+        self.assertEqual(len(plan["spot"]["requirements"]), 2)
+        self.assertEqual(len(plan["spot"]["fixes"]), 1)
+        done = audit.finish(plan["record"], self._report(plan), self.cfg)
+        self.assertTrue(done["ran"])
+        self.assertEqual(done["verdict"], "passed")
+        self.assertEqual(len(done["spot_checks"]), 3)
+
+    def test_failed_fix_spot_blocks_and_forces_future_audits(self):
+        plan = self._prepare()
+        fix_id = plan["spot"]["fixes"][0]["id"]
+        done = audit.finish(plan["record"], self._report(plan, fix_id),
+                            self.cfg)
+        self.assertTrue(done["ran"])
+        self.assertEqual(done["verdict"], "blocked")
+        self.assertTrue(done["forced_rate_set"])
+        state, _ = audit.load_state(self.cfg, self.tmp.name)
+        self.assertEqual(state["forced_remaining"], 5)
+
+
 class CrosscheckAuditInputsTests(unittest.TestCase):
     def test_requirements_and_confirmed_fixes(self):
-        record = {"requirements": [
+        record = {"parts": [
+            {"id": "p1", "builder_crew": "crew-1",
+             "checker_crew": "crew-2", "status": "built"}],
+            "requirements": [
             {"id": "R1", "text": "one", "checked_by": "crew-2",
              "evidence": "cmd"},
             {"id": "R2", "text": "optional", "required": False,
              "checked_by": "crew-2", "evidence": "cmd"}],
             "findings": [
                 {"id": "F1", "text": "fix", "status": "fixed",
-                 "found_by_crew": "crew-2",
+                 "part_id": "p1", "found_by_crew": "crew-2",
+                 "fix": {"crew": "crew-1", "evidence": "cmd"},
                  "confirmation": {"crew": "crew-2", "confirmed": True,
                                   "evidence": "cmd"}},
                 {"id": "F2", "text": "unconfirmed", "status": "fixed",
-                 "found_by_crew": "crew-2",
+                 "part_id": "p1", "found_by_crew": "crew-2",
+                 "fix": {"crew": "crew-1", "evidence": "cmd"},
                  "confirmation": {"crew": "crew-1", "confirmed": True,
                                   "evidence": "cmd"}},
                 {"id": "F3", "text": "alias", "status": "fixed",
-                 "found_by_crew": "crew-2",
+                 "part_id": "p1", "found_by_crew": "crew-2",
+                 "fix": {"crew": "crew-1", "evidence": "cmd"},
                  "confirmation": {"confirmed_by": "crew-2",
                                   "confirmed": True, "evidence": "cmd"}}]}
         self.assertEqual([item["id"] for item in

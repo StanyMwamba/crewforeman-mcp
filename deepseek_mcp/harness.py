@@ -4300,7 +4300,12 @@ def _job_spec_for_checkpoint(run, args, workspace):
             "live_scaling_threshold", "live_scaling_max_extra_waves",
             "review_preflight", "review_preflight_timeout",
             "builder_model", "builder_provider", "slice_models",
-            "model_candidates", "reviewer_model", "reviewer_provider")
+            "model_candidates", "reviewer_model", "reviewer_provider",
+            "mode", "crosscheck_crews", "crosscheck_crew_size",
+            "crosscheck_threshold", "crosscheck_max_rounds", "audit_review",
+            "audit_sample_rate", "audit_spot_requirements", "audit_spot_fixes",
+            "risk_paths", "auto_parallel", "auto_parallel_min_confidence",
+            "write_set")
     spec = {}
     for key in keys:
         if key in args:
@@ -8122,7 +8127,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 seed=cc.get("audit_seed") or None,
                                 spot_requirements=cc.get(
                                     "audit_spot_requirements"),
-                                spot_fixes=cc.get("audit_spot_fixes"))
+                                spot_fixes=cc.get("audit_spot_fixes"),
+                                risk_paths=cc.get("risk_paths"))
                             audit_plan["record"]["job_id"] = run.get("id")
                             audit_plan["record"]["crew_evidence"] = (
                                 audit_evidence)
@@ -10127,6 +10133,51 @@ def _resume_review_partial(saved, manifest, prior_rounds, workspace, run_id):
     return dict(usable[-1][2])
 
 
+def _resume_job_args(saved, spec=None):
+    """Replay the 3.14.2 job surface on resume, or fail closed.
+
+    The old whitelist rebuilt a resumed run as a standard job.  A crosscheck
+    run must never silently downgrade to standard, so a saved crosscheck mode
+    without its frozen config raises instead of continuing.
+    """
+    saved = saved if isinstance(saved, dict) else {}
+    spec = spec if isinstance(spec, dict) else {}
+    out = {}
+    cc = saved.get("crosscheck_config")
+    if not isinstance(cc, dict):
+        cc = {}
+    if str(saved.get("mode") or "") == "crosscheck" or cc:
+        if not cc:
+            raise RuntimeError(
+                "cannot resume crosscheck run: the saved job has no "
+                "crosscheck_config (refusing to downgrade to standard mode)")
+        out["mode"] = "crosscheck"
+        for arg, key in (
+                ("crosscheck_crews", "crews"),
+                ("crosscheck_crew_size", "crew_size"),
+                ("crosscheck_threshold", "threshold"),
+                ("crosscheck_max_rounds", "max_rounds"),
+                ("audit_review", "audit_review"),
+                ("audit_sample_rate", "audit_sample_rate"),
+                ("audit_spot_requirements", "audit_spot_requirements"),
+                ("audit_spot_fixes", "audit_spot_fixes"),
+                ("risk_paths", "risk_paths")):
+            if cc.get(key) is not None:
+                out[arg] = cc[key]
+        if cc.get("subagents") is not None:
+            out["subagents"] = cc["subagents"]
+    for name in ("auto_parallel", "auto_parallel_min_confidence",
+                 "write_set", "risk_paths"):
+        value = saved.get(name)
+        if value is None:
+            value = spec.get(name)
+        if value is None and isinstance(saved.get("pipeline"), dict):
+            value = saved["pipeline"].get(name)
+        if value is not None:
+            out[name] = value
+    return out
+
+
 def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
     """Resume a checkpointed run from its last finished phase.
 
@@ -10492,6 +10543,9 @@ def resume_harness(args, cfg, progress_cb=None, cancel_check=None):
         "_prior_rounds": prior_rounds,
         "_preserve_review": bool(prior_rounds and accepted_review is None),
     }
+    # 3.14.2: a resumed job keeps crosscheck/audit/auto-parallel semantics.
+    # _resume_job_args raises rather than silently downgrading crosscheck.
+    resume_args.update(_resume_job_args(saved, spec))
     if saved.get("builder_model"):
         resume_args["_saved_builder_model"] = dict(saved["builder_model"])
     # The paused question may name a per-job reviewer that only existed in the

@@ -67,16 +67,21 @@ points each:
 
 | # | Condition | Fraction |
 |---|---|---|
-| 1 | Connector-run tests | 1.0 when the gate test check is `ok` (a bounded compile smoke is accepted only when no test suite is detected), else 0.0 |
+| 1 | Connector-run tests | 1.0 only when the gate test check is `ok`; 0.5 for a bounded compile smoke when no test suite is detected; else 0.0 |
 | 2 | Every brief requirement checked | connector `R1..Rn` ids covered by the artifact, divided by the connector's checklist size; each row needs a real paired part, evidence, and its assigned checker (never the builder or rescuer) |
 | 3 | Zero open BLOCKING | 1.0 only when every real BLOCKING finding is explicitly `fixed`; unknown, `justified`, `wontfix` and unconfirmed states stay open |
 | 4 | Every minor fixed or justified | fixed or justified minors divided by all real minors; a justification needs at least 20 characters and acceptance by the finding crew or the part's paired checker |
-| 5 | Every fix confirmed by the finding crew | confirmed fixes divided by fixed findings; the finder must be the part's paired checker and the confirmation must come from that crew with evidence |
+| 5 | Every fix confirmed by the finding crew | confirmed fixes divided by fixed findings; the fix must be recorded by the part's builder (or a successful rescuer), never the finder, and the finder (the part's paired checker) confirms with evidence |
 
 ```
 raw   = 2.0 * (tests + requirements + blocking + minors + fixes)
 score = 10.0 when every fraction is 1.0, else min(round(raw, 2), 9.99)
 ```
+
+A compile-only smoke is not a test suite: it earns 0.5 of the tests
+condition, so a job with no tests can never reach 10.0. A missing or empty
+part status is not built; only an explicit `built`/`done` status (or a
+successful rescue that reconciles the part) earns the build condition.
 
 A part that is not built (`planned`, `pending`, `stalled`, `failed`,
 `blocked` or `error`) caps the score at 6.0; an unresolved rescue caps it at
@@ -103,8 +108,10 @@ hits a time limit, loops, loses provider balance or dies on a transient network
 error (the last two in crosscheck mode). The finisher works on the whole
 workspace: the connector narrows the record to an explicit `part_id` or
 `failed_crew`, otherwise to the parts that are not built yet, and reconciles a
-completed part to `built`. A whole-run rescue with no identifiable part records
-`scope="all"` and marks every part it completed. Each row records the failed
+completed part to `built`. An explicit `part_id` that matches no part is
+recorded as `scope="unknown_part"` and fails closed; it never widens to every
+part. Only a rescue with no explicit target and no failed crew may record
+`scope="all"` and mark the parts it completed. Each row records the failed
 crew (when known), reason, scope and rescue crew, and only a successful rescue
 marks the part `rescued`; a failed one caps the score at 8.0. A crew
 that did not build or rescue the part must still cross-check it; without that evidence
@@ -136,6 +143,12 @@ Risk detection is used only to (1) never sample the audit out and (2) record
 risky. Risk globs come from `risk_paths` (the name used in the 3.14.2 brief)
 and `audit_risk_globs`; both lists are merged with the built-in defaults.
 `audit_sample_rate` defaults to 1.0; `0.2` audits one in five low-risk jobs. A
-failed crew claim forces full audits for the next five crosscheck jobs. An
-audit blocking list gets one crew fix round and a focused re-audit of only
-those items.
+failed crew claim forces full audits for the next five crosscheck jobs. Every
+seeded spot id must come back with `pass`/`fail` and the command output that
+was re-run; a missing id, malformed list or failed spot is blocking, and an
+empty audit section is `not_reported`, never a pass. An audit blocking list
+gets one crew fix round and a focused re-audit of only those items.
+
+A resumed crosscheck job replays the frozen `mode`/`crosscheck_*`/`audit_*`
+settings and `risk_paths`; a saved crosscheck run without that config fails
+closed instead of silently restarting in standard mode.

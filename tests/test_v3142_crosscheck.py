@@ -122,6 +122,15 @@ class PlanTests(unittest.TestCase):
     def test_missing_plan_is_absent(self):
         self.assertEqual(crosscheck.plan_parts(self.tmp.name)["status"], "absent")
 
+    def test_space_joined_write_set_is_split_before_disjointness(self):
+        self._write({"parts": [
+            {"id": "p1", "write_set": ["src/a.py src/b.py"]},
+            {"id": "p2", "write_set": ["src/a.py"]},
+        ]})
+        result = crosscheck.plan_parts(self.tmp.name)
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("overlap" in item for item in result["errors"]))
+
     def test_artifact_roundtrip(self):
         self._write({"parts": [
             {"id": "p1", "write_set": ["a.py"]},
@@ -175,6 +184,8 @@ class ScoringTests(unittest.TestCase):
             {"id": "F1", "part_id": "p1", "severity": "blocking",
              "status": "fixed", "found_by_crew": "crew-2",
              "text": "breaks on empty input",
+             "fix": {"crew": "crew-1", "round": 2,
+                     "evidence": "command: patch applied"},
              "confirmation": {"crew": "crew-2", "confirmed": True,
                               "evidence": "command: test -q; 12 passed"}},
             {"id": "F2", "part_id": "p1", "severity": "minor",
@@ -198,6 +209,45 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result["conditions"], {
             "tests": 1.0, "requirements": 1.0, "blocking": 1.0,
             "minors": 1.0, "fixes": 1.0})
+
+    def test_compile_smoke_is_not_a_full_test_suite(self):
+        parts, findings, requirements = self._full()
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "smoke_passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["tests"], 0.5)
+        self.assertEqual(result["score"], 9.0)
+        self.assertFalse(result["passed"])
+        self.assertIn("tests_smoke_passed", result["reasons"])
+
+    def test_missing_part_status_cannot_certify_ten(self):
+        parts, findings, requirements = self._full()
+        parts[0].pop("status")
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertLessEqual(result["score"], 6.0)
+        self.assertFalse(result["passed"])
+        self.assertIn("part_failed", result["reasons"])
+
+    def test_finding_crew_cannot_fix_and_confirm_the_same_item(self):
+        parts, findings, requirements = self._full()
+        findings[0]["fix"] = {"crew": "crew-2", "round": 2,
+                              "evidence": "self patch"}
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["fixes"], 0.0)
+        self.assertEqual(result["score"], 8.0)
+
+    def test_fix_must_be_by_the_builder_or_rescuer(self):
+        parts, findings, requirements = self._full()
+        findings[0]["fix"] = {"crew": "crew-9", "round": 2,
+                              "evidence": "someone else"}
+        result = crosscheck.evaluate(
+            parts, findings, requirements, {"status": "passed"},
+            threshold=10.0, brief_count=2)
+        self.assertEqual(result["conditions"]["fixes"], 0.0)
 
     def test_unknown_part_requirement_cannot_self_certify(self):
         parts, findings, requirements = self._full()
@@ -426,6 +476,25 @@ class RescueTests(unittest.TestCase):
             {"status": "passed"}, record["rescues"], threshold=10.0,
             brief_count=1)
         self.assertLess(evaluation["score"], 10.0)
+
+    def test_unknown_explicit_rescue_target_never_widens_to_all_parts(self):
+        record = crosscheck.new_record({"threshold": 10.0})
+        record["parts"] = [
+            _part("p1", ["a.py"], status="failed"),
+            _part("p2", ["b.py"], status="failed"),
+        ]
+        record = crosscheck.apply_rescue(
+            record, {"part_id": "typo", "status": "ok",
+                     "rescue_crew": "finisher"}, rescued=True)
+        self.assertEqual([part["status"] for part in record["parts"]],
+                         ["failed", "failed"])
+        self.assertFalse(any(part.get("rescued") for part in record["parts"]))
+        self.assertEqual(record["rescues"][0]["scope"], "unknown_part")
+        evaluation = crosscheck.evaluate(
+            record["parts"], [], [], {"status": "passed"},
+            record["rescues"], threshold=10.0)
+        self.assertLessEqual(evaluation["score"], 8.0)
+        self.assertIn("rescue_failed", evaluation["reasons"])
 
     def test_rescue_does_not_cap_a_green_result(self):
         record = crosscheck.new_record({"threshold": 10.0})

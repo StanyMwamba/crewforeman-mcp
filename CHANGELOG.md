@@ -66,8 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the connector's own brief ids. A semantically empty `AUDIT_JSON` fails closed.
   A failed rescue does not mark a part rescued and caps the score at 8.0;
   successful rescues target the unfinished parts and reconcile their status.
-  A part that is only `planned`/`pending` cannot reach 10.0, and the build
-  contract prints the connector's own `R1..Rn` brief checklist.
+  A part that is only `planned`/`pending` (or has no status) cannot reach
+  10.0, and the build contract prints the connector's own `R1..Rn` brief
+  checklist.
+- **Strict gate and replay hardening.** A compile-only smoke earns half the
+  tests condition and cannot reach 10.0. A fix counts only when the part's
+  builder or a successful rescuer made it; the finding crew cannot fix and
+  confirm the same item. An unmatched explicit rescue target is recorded as
+  `unknown_part` and cannot mark other parts rescued. Every seeded audit spot
+  id must return pass/fail plus command output, and a failed spot is blocking.
+  Per-job `risk_paths` reaches risk detection, and resume replays the frozen
+  crosscheck/audit/parallel settings or fails closed instead of downgrading.
 - **Parallel/integration hardening.** A `PLAN.json` write set is
   pipeline-eligible; explicit declarations are trusted at confidence 1.0; a
   serial peer in another workspace no longer forces this workspace serial. A

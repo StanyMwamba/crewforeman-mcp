@@ -272,6 +272,29 @@ class StrayTests(unittest.TestCase):
             writesets.stray_files(["tests/test_*.py"], ["tests/helper.py"]),
             ["tests/helper.py"])
 
+    def test_traversal_glob_cannot_allow_every_file(self):
+        self.assertEqual(
+            writesets.stray_files(["../*"], ["etc/passwd"]), ["etc/passwd"])
+        self.assertEqual(
+            writesets.stray_files(["src/../*"], ["etc/passwd"]),
+            ["etc/passwd"])
+
+    def test_windows_case_collision_counts_as_overlap(self):
+        self.assertTrue(writesets.sets_overlap(
+            ["src/A.py"], ["src/a.py"]))
+
+    def test_absolute_path_inside_workspace_is_repo_relative(self):
+        with tempfile.TemporaryDirectory() as root:
+            absolute = os.path.join(root, "src", "a.py")
+            self.assertEqual(
+                writesets.normalise_rel(absolute, root), "src/a.py")
+
+    def test_empty_write_set_is_never_installed(self):
+        decision = writesets.integration_decision(
+            {"write_set": []}, ["src/a.py"], True)
+        self.assertEqual(decision["action"], "serial_reintegrate")
+        self.assertEqual(decision["reason"], "no_write_set")
+
     def test_integration_decision(self):
         pipe = {"write_set": ["src/"]}
         clean = writesets.integration_decision(pipe, ["src/a.py"], True)
