@@ -12,7 +12,6 @@ import json
 import os
 import queue
 import re
-import select
 import shutil
 import signal
 import subprocess
@@ -74,51 +73,71 @@ ERROR_TYPES = ("error", "failed", "failure")
 STALL_POLL_SECONDS = 0.25
 STOP_GRACE_SECONDS = 2.0
 # A deliberate stop (time limit / stall / cancel) must keep draining the
-# child's stdout while the child shuts down.  Closing the read end early made
-# dsh's session-log flush fail with "flush on a closed handle".  Bounded so a
-# child that ignores SIGTERM cannot pin the reader.
+# child's stdout while any process in its group can still write.  Closing the
+# read end early made dsh's session-log flush fail with "flush on a closed
+# handle".  The drain continues past STOP_DRAIN_SECONDS while the group is
+# alive; STOP_DRAIN_HARD_SECONDS is the absolute bound (drain + SIGTERM grace +
+# a final reaping window) before the stream is abandoned to the daemon pump.
 STOP_DRAIN_SECONDS = 3.0
-# After the direct child exits, keep draining inherited stdout for at most this
-# long: a grandchild may flush one last event, but a silent or flooding
-# grandchild must never hold the reader open indefinitely.
+STOP_DRAIN_HARD_SECONDS = STOP_DRAIN_SECONDS + STOP_GRACE_SECONDS + 2.0
+# After the direct child exits, keep draining inherited stdout while its
+# process group is alive: a grandchild may flush one last event.  The bound
+# covers the old one-second window plus the graceful-kill grace.  At the bound
+# the inherited group is terminated (SIGTERM, then SIGKILL) so a silent or
+# never-exit grandchild is reaped instead of leaking a process and reader
+# thread; the stream is abandoned only if the group still refuses to die.
 EXIT_DRAIN_SECONDS = 1.0
-# Windows ``select`` only accepts sockets, so a child stdout pipe cannot be
-# polled with it (WSAENOTSOCK 10038).  On Windows a daemon reader thread pumps
-# raw chunks into this bounded queue instead; POSIX keeps the select loop.
+EXIT_GROUP_DRAIN_SECONDS = EXIT_DRAIN_SECONDS + STOP_GRACE_SECONDS + 2.0
+# Once the whole group is gone, keep reading this long so a last chunk that
+# was already in flight is not lost.  EOF normally ends the drain sooner.
+POST_GROUP_DRAIN_SECONDS = 0.5
+# A bounded queue applies backpressure to a flooding child instead of growing
+# memory without limit.  ``select`` cannot poll an anonymous pipe on Windows
+# (WSAENOTSOCK 10038), so a daemon reader thread is the single reader on every
+# platform; it uses the same raw-read/EOF contract the POSIX loop used.
 STDOUT_QUEUE_CHUNKS = 64
-USE_STDOUT_PUMP = (os.name == "nt")
+USE_STDOUT_PUMP = True
+# ``_execute_once``/``_execute_once_impl`` accept ``whole_job_limit`` so the
+# absolute phase ceiling can tell an unlimited whole job (0/None) from a
+# positive per-process request.  This sentinel means "not provided"; direct
+# callers keep using their per-process ``limit`` for the old fallback.
+_WHOLE_JOB_LIMIT_UNSET = object()
 
 
 class _StdoutPump:
-    """Read a child stdout pipe from a daemon thread (Windows).
+    """Read a child stdout pipe from a daemon thread (all platforms).
 
-    ``select.select`` is Winsock-only on Windows and raises WinError 10038 for
-    an anonymous pipe.  The pump reproduces the POSIX reader: raw reads, an
-    EOF sentinel, and a bounded queue so a flooding child applies backpressure
-    instead of growing memory without limit.  ``close`` can be called while
-    the reader is blocked; the thread is a daemon and the caller terminates
-    the process tree before abandoning it.
+    The pump is the single owner of the stream.  It reads raw bytes, queues
+    them with backpressure, and closes the stream only in this thread after
+    the blocking read returns EOF.  ``close`` merely asks the reader to stop;
+    the waiting thread must never close the stream while a grandchild in the
+    child's process group may still be flushing its session log.  A pump that
+    is asked to stop while blocked is deliberately left to the daemon thread
+    instead of being closed from the caller.
     """
 
     def __init__(self, stream, max_chunks=STDOUT_QUEUE_CHUNKS):
         self._stream = stream
         self._queue = queue.Queue(maxsize=max_chunks)
-        self._closed = threading.Event()
+        self._stop = threading.Event()
         self._eof = threading.Event()
+        self._real_eof = threading.Event()
         self._thread = threading.Thread(
             target=self._pump, name="dsh-stdout-reader", daemon=True)
         self._thread.start()
 
     def _pump(self):
+        saw_eof = False
         try:
-            while not self._closed.is_set():
+            while not self._stop.is_set():
                 try:
                     chunk = os.read(self._stream.fileno(), 65536)
                 except (OSError, ValueError):
                     break
                 if not chunk:
+                    saw_eof = True
                     break
-                while not self._closed.is_set():
+                while not self._stop.is_set():
                     try:
                         self._queue.put(chunk, timeout=STALL_POLL_SECONDS)
                         break
@@ -126,14 +145,15 @@ class _StdoutPump:
                         continue
         finally:
             self._eof.set()
-            # The pump owns the pipe once started: close it here, after the
-            # blocking read has returned, never from the waiting thread (a
-            # close racing a pending Windows read can wait for the grandchild
-            # that inherited the write end).
-            try:
-                self._stream.close()
-            except Exception:
-                pass
+            # Close only after a real EOF.  A stop request, an abandoned
+            # reader, or a stream closed by a test must not make this thread
+            # close the read end under a still-running process group.
+            if saw_eof:
+                self._real_eof.set()
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
 
     def read(self, timeout):
         """Return bytes, ``b""`` at EOF, or ``None`` when idle."""
@@ -143,7 +163,13 @@ class _StdoutPump:
             return b"" if self._eof.is_set() else None
 
     def close(self):
-        self._closed.set()
+        # Do not close the stream here: only the pump thread may close it,
+        # and only after its blocking read returned EOF.
+        self._stop.set()
+
+    def eof(self):
+        """True only after a real pipe EOF (not a stop/error/abandon)."""
+        return self._real_eof.is_set()
 
 
 # A reviewer's background child may still be writing its session log when the
@@ -1840,6 +1866,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
             remaining = budget.remaining_seconds()
         except Exception:
             remaining = None
+    whole_job_limit = (budget.max_seconds
+                       if budget is not None else _WHOLE_JOB_LIMIT_UNSET)
     call_limit, has_time = _reprompt_bounded_limit(limit, remaining)
     if not has_time:
         return _reprompt_record(
@@ -1866,7 +1894,7 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
             label="reviewer score reprompt round %d" % int(round_no or 1),
             exclude_logs=logs, policy=policy, session_id=session_id,
             transport_name=transport_name, cancel_check=cancel_check,
-            dsh_bin=dsh_bin)
+            dsh_bin=dsh_bin, whole_job_limit=whole_job_limit)
         executions.append(first)
         logs.update(first.get("session_logs") or [])
         stop_reason = str(first.get("stop_reason") or "").lower()
@@ -1894,7 +1922,8 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
                            % int(round_no or 1)),
                     exclude_logs=logs, policy=policy, session_id=None,
                     transport_name=transport_name,
-                    cancel_check=cancel_check, dsh_bin=dsh_bin)
+                    cancel_check=cancel_check, dsh_bin=dsh_bin,
+                    whole_job_limit=whole_job_limit)
                 executions.append(second)
                 logs.update(second.get("session_logs") or [])
         method = ("fresh_after_dead_session" if fallback_used
@@ -1913,7 +1942,7 @@ def _reprompt_review_score(cfg, workspace, review, report_text, round_no=1,
         label="reviewer score reprompt fresh round %d" % int(round_no or 1),
         exclude_logs=logs, policy=policy, session_id=None,
         transport_name=transport_name, cancel_check=cancel_check,
-        dsh_bin=dsh_bin)
+        dsh_bin=dsh_bin, whole_job_limit=whole_job_limit)
     executions.append(fresh)
     logs.update(fresh.get("session_logs") or [])
     return _reprompt_record(executions, "fresh", None,
@@ -2108,6 +2137,8 @@ def _apply_execution(run, execution, include_outputs=True):
         child_progress_events=execution.get("child_progress_events") or 0,
         child_sessions_active=execution.get("child_sessions_active") or 0,
         tmpdir_isolated=bool(execution.get("tmpdir_isolated")),
+        stream_abandoned=bool(execution.get("stream_abandoned")),
+        cleanup_deferred=bool(execution.get("cleanup_deferred")),
     )
     if include_outputs:
         run["output_files"] = execution.get("output_files") or []
@@ -2176,26 +2207,59 @@ def _cap_extension(cfg):
     return _positive_float(getattr(cfg, "stall_cap_extension_seconds", 300.0)) or 300.0
 
 
+def _phase_absolute_cap(cfg):
+    """Return the configured absolute per-phase ceiling, legacy alias aware.
+
+    ``phase_absolute_cap_seconds`` is the current key.  The 3.14.x
+    ``stall_cap_hard_max_seconds`` remains a backwards-compatible fallback:
+    when the new key was not set explicitly and the old one was, the old value
+    wins.  SimpleNamespace test configs (no ``is_explicit``) use whichever key
+    they define, preferring the new one when both are present.
+    """
+    new_name = "phase_absolute_cap_seconds"
+    old_name = "stall_cap_hard_max_seconds"
+    default = 7200.0
+    new_value = getattr(cfg, new_name, default)
+    old_value = getattr(cfg, old_name, default)
+    explicit = getattr(cfg, "is_explicit", None)
+    if callable(explicit):
+        if explicit(new_name):
+            return _positive_float(new_value)
+        if explicit(old_name):
+            return _positive_float(old_value)
+        return _positive_float(new_value)
+    if hasattr(cfg, new_name):
+        return _positive_float(new_value)
+    return _positive_float(old_value)
+
+
 def _stall_cap_hard_max(cfg):
     """Absolute ceiling for cap extensions; None/0 disables only the ceiling."""
-    return _positive_float(getattr(cfg, "stall_cap_hard_max_seconds", 7200.0))
+    return _phase_absolute_cap(cfg)
 
 
-def _stall_hard_max_for_limit(cfg, limit, phase_cap):
-    """Apply the absolute stall ceiling only when the phase has a deadline.
+def _stall_hard_max_for_limit(cfg, limit, phase_cap,
+                              whole_job_limit=_WHOLE_JOB_LIMIT_UNSET):
+    """Apply the absolute phase ceiling only when the whole job has a deadline.
 
-    With an explicitly unlimited whole-job budget ``JobBudget.phase_limit``
-    returns ``None``.  Re-introducing the built-in 7200 s ceiling there would
-    recreate exactly the deadline the caller disabled, so an unbounded phase
-    keeps only the progress-gated stall threshold.
+    ``limit`` is the per-process limit; ``whole_job_limit`` is the whole-job
+    budget.  An explicitly unlimited whole job (``job_max_seconds`` 0/None)
+    must not re-impose the built-in 7200 s ceiling just because the caller also
+    requested a positive per-process ``max_seconds``.  Direct callers that do
+    not supply ``whole_job_limit`` keep the historical fallback to ``limit``.
+
+    A positive finite job keeps the configured ceiling, which may itself be
+    disabled with ``phase_absolute_cap_seconds`` = 0/None.
     """
-    if phase_cap is None or limit is None:
+    if whole_job_limit is _WHOLE_JOB_LIMIT_UNSET:
+        whole_job_limit = limit
+    if phase_cap is None or whole_job_limit is None:
         return None
     try:
-        if float(limit) <= 0:
+        if float(whole_job_limit) <= 0:
             return None
     except (TypeError, ValueError):
-        return _stall_cap_hard_max(cfg)
+        pass
     return _stall_cap_hard_max(cfg)
 
 
@@ -2221,6 +2285,12 @@ class _StallWatch(object):
     deadline is extended. This is the fix for the v3.5.0 incident where a
     reviewer and both revision rounds were killed at 900.2/900.3 s while their
     child sessions and output files were demonstrably growing.
+
+    The absolute ceiling is progress-aware in the same way: at the ceiling a
+    phase that produced progress within the grace window rolls the ceiling
+    forward instead of dying.  Only a genuinely silent phase fires the ceiling.
+    An unlimited job passes ``hard_max_seconds=None`` so no absolute cap exists
+    at all; the silent-phase watchdog remains the only timer.
     """
 
     def __init__(self, stall_seconds, clock=None, max_seconds=None,
@@ -2240,7 +2310,8 @@ class _StallWatch(object):
         self._cap_extensions = 0
         self._cap_deadline = (self._started + float(max_seconds)
                               if max_seconds is not None else None)
-        # Progress may extend the cap only up to this absolute ceiling.
+        # Progress may extend the cap only up to this absolute ceiling.  The
+        # ceiling itself rolls forward while progress is recent.
         self._hard_deadline = (self._started + float(hard_max_seconds)
                                if hard_max_seconds is not None else None)
         self._elapsed = None
@@ -2282,16 +2353,27 @@ class _StallWatch(object):
             if not cap_due and not hard_due:
                 return None
             if hard_due:
-                # The ceiling fires even when progress is recent: a phase can
-                # never run past the absolute bound.
+                if (now - self._last) <= self.grace_seconds:
+                    # The phase is demonstrably progressing.  Roll the
+                    # absolute ceiling forward instead of killing work; this
+                    # is required for an unlimited job and is the sane default
+                    # even inside a finite job.
+                    self._hard_deadline = now + self.extension_seconds
+                    if (self._cap_deadline is not None
+                            and self._cap_deadline < self._hard_deadline):
+                        self._cap_deadline = self._hard_deadline
+                    self._cap_extensions += 1
+                    return None
+                # Silent for the whole grace window: this is the only case
+                # where the absolute ceiling fires.
                 return self._fire_cap(now, hard=True)
             if (now - self._last) <= self.grace_seconds:
                 # Still progressing: extend instead of destroying the work.
                 candidate = now + self.extension_seconds
                 if (self._hard_deadline is not None
                         and candidate >= self._hard_deadline):
-                    # Clamp the final extension to the ceiling; the poll at the
-                    # ceiling fires even though progress was recent.
+                    # Clamp the extension to the ceiling; a poll there either
+                    # rolls the ceiling forward (recent progress) or fires it.
                     self._cap_deadline = self._hard_deadline
                     self._cap_extensions += 1
                     return None
@@ -2377,39 +2459,92 @@ def _signal_harness_group(proc, sig, pgid=None):
         pass
 
 
-def _terminate_process(proc, grace=STOP_GRACE_SECONDS):
+def _process_group_alive(pgid):
+    """True while any process in *pgid* still exists.
+
+    ``killpg(pgid, 0)`` is the only portable POSIX group liveness probe.  A
+    zombie leader keeps the group visible until the caller reaps it, so callers
+    must poll/wait the direct child before relying on this.
+    """
+    if pgid is None or os.name == "nt":
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The group exists but is owned by another user; treat it as alive so
+        # a stop cannot silently leave it running.
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_process(proc, grace=STOP_GRACE_SECONDS, pgid=None, state=None):
     """Terminate a Harness process tree, then kill it if it ignores SIGTERM.
 
     POSIX uses the child's own process group so Chrome/zygote grandchildren do
     not outlive a stall or time-limit stop. Windows has no killpg; the platform
-    layer uses ``taskkill /T /F``. The pgid is captured before the first signal:
-    the leader may exit while a grandchild that ignores SIGTERM is still in the
-    group, and that group must still get SIGKILL after the grace period.
+    layer uses ``taskkill /T /F``. The caller captures and passes ``pgid`` once
+    right after spawn: the leader may already have exited while a grandchild
+    that ignores SIGTERM is still in the group, and that group must still get
+    SIGKILL after the grace period.  Re-deriving the pgid from a dead leader is
+    exactly how grandchildren used to survive a stop.
+
+    ``state`` is an optional mutable dict owned by the execution; it records
+    ``terminated``/``force_killed`` for the shutdown-noise policy.
     """
+    def _mark(force=False):
+        if state is not None:
+            state["terminated"] = True
+            if force:
+                state["force_killed"] = True
+
     if os.name == "nt":
+        # taskkill /T /F is already a forced tree kill; run it even when the
+        # direct child has exited so surviving descendants are still found.
+        _mark(force=True)
         try:
-            platforms.terminate_tree(proc.pid, timeout=max(1.0, grace))
+            platforms.terminate_tree(proc.pid, timeout=max(1.0, float(grace)))
         except Exception:
             pass
         return
-    pgid = _process_group(proc)
-    try:
-        if proc.poll() is not None:
-            return
-        _signal_harness_group(proc, signal.SIGTERM, pgid)
-    except Exception:
-        pass
-    deadline = time.monotonic() + grace
-    while proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
+    if pgid is None:
+        pgid = _process_group(proc)
     if pgid is not None:
+        # Reap the leader first: an unreaped zombie keeps killpg(pgid, 0)
+        # successful and would make the group look alive forever.
+        proc.poll()
+        if not _process_group_alive(pgid):
+            return
+        _mark()
+        _signal_harness_group(proc, signal.SIGTERM, pgid)
+        deadline = time.monotonic() + max(0.0, float(grace))
+        while time.monotonic() < deadline:
+            proc.poll()
+            if not _process_group_alive(pgid):
+                return
+            time.sleep(0.05)
+        # The leader may be gone and only a stubborn grandchild remains; the
+        # captured pgid still reaches it.
+        _mark(force=True)
         try:
             os.killpg(pgid, signal.SIGKILL)
-            return
         except Exception:
-            pass
+            _signal_harness_group(proc, signal.SIGKILL, pgid)
+        return
+    # No group was captured (a non-leader Popen supplied by a caller/test).
+    if proc.poll() is not None:
+        return
+    _mark()
+    _signal_harness_group(proc, signal.SIGTERM, None)
+    deadline = time.monotonic() + max(0.0, float(grace))
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
     if proc.poll() is None:
-        _signal_harness_group(proc, signal.SIGKILL)
+        _mark(force=True)
+        _signal_harness_group(proc, signal.SIGKILL, None)
 
 
 
@@ -3089,7 +3224,8 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                        exclude_logs=None, clock=None, output_slack=2.0,
                        policy=None, session_id=None, cancel_check=None,
                        transport_name=None, add_dirs=None, live_usage_cb=None,
-                       dsh_bin=None, model_spec=None, patch=None):
+                       dsh_bin=None, model_spec=None, patch=None,
+                       whole_job_limit=_WHOLE_JOB_LIMIT_UNSET):
     """Run one Harness process and return its parsed result.
 
     ``limit`` is a per-process wall-clock limit. ``clock`` is injectable for the
@@ -3173,12 +3309,24 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     stderr_text = ""
     stall_limit = _stall_seconds(cfg)
     stall_cap = _stall_max_seconds(cfg, label)
-    stall_hard_cap = _stall_hard_max_for_limit(cfg, limit, stall_cap)
+    stall_hard_cap = _stall_hard_max_for_limit(
+        cfg, limit, stall_cap, whole_job_limit)
     errfile = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(cmd, cwd=str(workspace), env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=errfile, text=False,
                                 bufsize=0, **platforms.popen_kwargs())
+        # Capture the process group once, while the leader is guaranteed alive.
+        # Every later stop reuses this pgid: deriving it from a dead pid is how
+        # an inherited-stdout grandchild used to survive SIGTERM/SIGKILL.
+        # Windows has no pgid; platforms.terminate_tree(pid) uses taskkill /T.
+        child_pgid = _process_group(proc)
+        process_state = {"pgid": child_pgid, "terminated": False,
+                         "force_killed": False, "stream_abandoned": False}
+        # The pump is the sole owner of stdout on every platform.  Detach the
+        # Popen handle so __del__ cannot close the read end either.
+        pump = _StdoutPump(proc.stdout)
+        proc.stdout = None
         try:
             from . import jobs
             jobs.set_child_pid(proc.pid)
@@ -3248,7 +3396,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
             confirm=lambda action: _confirm_loop_signal(cfg, action))
         if entry and entry.get("action") in ("nudge", "replan", "stop"):
             try:
-                _terminate_process(proc)
+                _terminate_process(proc, pgid=child_pgid, state=process_state)
             except Exception:
                 pass
 
@@ -3257,7 +3405,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         if proc.poll() is not None:
             return
         if _request_stop("timeout"):
-            _terminate_process(proc)
+            _terminate_process(proc, pgid=child_pgid, state=process_state)
 
     def _watch_stall():
         while not monitor_stop.wait(STALL_POLL_SECONDS):
@@ -3277,7 +3425,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                                 progress_cb("%s: cancelled; stopping" % label)
                             except Exception:
                                 pass
-                        _terminate_process(proc)
+                        _terminate_process(proc, pgid=child_pgid, state=process_state)
                     return
             # The parent emits nothing while workflow's parallel() barrier is
             # open.  A growing child session log is real progress, so refresh
@@ -3348,7 +3496,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                             watch.elapsed() or 0, watch.detail())))
                 except Exception:
                     pass
-            _terminate_process(proc)
+            _terminate_process(proc, pgid=child_pgid, state=process_state)
             return
 
     timer = threading.Timer(limit, _timeout) if limit else None
@@ -3359,10 +3507,10 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     if monitor:
         monitor.start()
 
-    # ``select`` with a short timeout lets the loop check the stop reason even
-    # when a Harness grandchild inherits stdout and keeps the pipe open after
-    # the direct child is killed. Read raw bytes and split JSONL ourselves:
-    # selecting on a buffered TextIOWrapper misses lines it already read ahead.
+    # The daemon pump with a short read timeout lets the loop check the stop
+    # reason even when a Harness grandchild inherits stdout and keeps the pipe
+    # open after the direct child is killed. Read raw bytes and split JSONL
+    # ourselves: a buffered TextIOWrapper misses lines it already read ahead.
     # stderr goes to a temp file, not a pipe, so it can never block a thread.
     line_buffer = b""
 
@@ -3395,7 +3543,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 live_reason = None
             if live_reason:
                 if _request_stop(str(live_reason)):
-                    _terminate_process(proc)
+                    _terminate_process(proc, pgid=child_pgid, state=process_state)
                 return
         if parsed["kind"] == "tool":
             tools[parsed["name"]] = tools.get(parsed["name"], 0) + 1
@@ -3444,68 +3592,116 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         else:
             watch.touch("event", parsed.get("type") or "event")
 
-    drain_deadline = None
-    stop_drain_deadline = None
-    pump = _StdoutPump(proc.stdout) if USE_STDOUT_PUMP else None
+    stream_abandoned = False
+    stdout_eof = False
+    stop_started_at = None
+    stop_deadline = None
+    stop_kill_deadline = None
+    exit_deadline = None
+    exit_kill_deadline = None
+    group_gone_since = None
+
+    def _group_gone():
+        if child_pgid is None:
+            # No process group to probe (Windows, or a POSIX capture
+            # failure).  The direct child's exit says nothing about inherited
+            # grandchildren, so treat the group as gone only at a real pipe
+            # EOF.  If EOF never arrives, the bounded shutdown path below
+            # abandons the stream and defers cleanup instead of closing the
+            # read end or deleting directories a grandchild may still use.
+            return pump.eof()
+        return not _process_group_alive(child_pgid)
+
+    def _force_kill_group():
+        _terminate_process(proc, grace=0.0, pgid=child_pgid,
+                           state=process_state)
+
     try:
         while True:
-            if stop["reason"] is not None:
-                # A stop reason is not an excuse to close the child's stdout:
-                # the child (or a grandchild) may still be flushing its final
-                # events and session log.  Keep draining for a short, bounded
-                # window until it exits, then stop.  Closing the pipe early is
-                # what produced `dsh: session "...": flush on a closed
-                # handle` at every time limit.
-                if stop_drain_deadline is None:
-                    stop_drain_deadline = time.monotonic() + STOP_DRAIN_SECONDS
-                if proc.poll() is not None:
-                    break
-                if time.monotonic() >= stop_drain_deadline:
-                    break
+            # Reap an exited leader before probing the group: its zombie would
+            # otherwise keep killpg(pgid, 0) successful forever.
+            proc.poll()
             now = time.monotonic()
-            exited = proc.poll() is not None
-            if exited and drain_deadline is None:
-                # The direct child is gone. A grandchild can still inherit the
-                # stdout pipe and flush one last event, so drain for a bounded
-                # window instead of waiting for an EOF that may never arrive.
-                # Starting the clock here (not once outside the loop) also
-                # catches an exit that happened between select iterations.
-                drain_deadline = now + EXIT_DRAIN_SECONDS
-            if drain_deadline is None:
-                timeout = STALL_POLL_SECONDS
-            else:
-                remaining = drain_deadline - now
-                if remaining <= 0:
-                    # Bounded even when a grandchild floods the pipe forever.
+            reason_now = stop["reason"]
+            if reason_now is not None:
+                if stop_started_at is None:
+                    stop_started_at = now
+                    stop_deadline = now + STOP_DRAIN_HARD_SECONDS
+                    # The timer/watchdog usually signals first; cover a stop
+                    # reason that was only recorded by another path.
+                    if not process_state.get("terminated"):
+                        _signal_harness_group(proc, signal.SIGTERM,
+                                              child_pgid)
+                        process_state["terminated"] = True
+                if stop_kill_deadline is not None and now >= stop_kill_deadline:
+                    if _group_gone():
+                        break
+                    # The group would not die even after the final SIGKILL.
+                    # Leave the read end to the daemon pump: closing it here
+                    # is exactly the EPIPE this fix removes.
+                    stream_abandoned = True
+                    process_state["stream_abandoned"] = True
                     break
-                timeout = min(0.1 if exited else STALL_POLL_SECONDS, remaining)
-            try:
-                if pump is not None:
-                    chunk = pump.read(timeout)
-                    if chunk is None:
-                        continue
-                else:
-                    ready, _writable, _errors = select.select(
-                        [proc.stdout], [], [], timeout)
-                    if not ready:
-                        # Keep draining until EOF, a stop reason, or the
-                        # post-exit deadline. Do not break on the first idle
-                        # select after exit: a grandchild may flush the final
-                        # event shortly afterwards.
-                        continue
-                    chunk = os.read(proc.stdout.fileno(), 65536)
-            except OSError as exc:
-                # Defence in depth: a host whose select() cannot poll this
-                # pipe (Windows WSAENOTSOCK, 10038) must not silently disable
-                # the event stream. Switch to the reader thread and retry.
-                if pump is None and getattr(exc, "winerror", None) == 10038:
-                    pump = _StdoutPump(proc.stdout)
-                    continue
-                break
-            except ValueError:
-                break
+                if now >= stop_deadline and stop_kill_deadline is None:
+                    # Last bound: force-kill anything left, then keep draining
+                    # through one short final window before abandoning.
+                    _force_kill_group()
+                    stop_kill_deadline = now + POST_GROUP_DRAIN_SECONDS
+            else:
+                exited = proc.poll() is not None
+                if exited:
+                    if exit_deadline is None:
+                        # The direct child is gone but a grandchild may still
+                        # inherit stdout and flush one last event.  Keep
+                        # draining while the inherited group is alive, but
+                        # bound the wait: a silent or flooding grandchild must
+                        # not pin the reader forever.
+                        exit_deadline = now + EXIT_GROUP_DRAIN_SECONDS
+                    if (exit_kill_deadline is not None
+                            and now >= exit_kill_deadline):
+                        if _group_gone():
+                            break
+                        stream_abandoned = True
+                        process_state["stream_abandoned"] = True
+                        break
+                    if (now >= exit_deadline
+                            and exit_kill_deadline is None):
+                        if _group_gone():
+                            break
+                        # The group outlived the drain bound.  Terminate it
+                        # (SIGTERM, then SIGKILL after the grace) so a 30 s or
+                        # never-exit grandchild is actually reaped, then keep
+                        # the pipe open through one short final window.
+                        _terminate_process(
+                            proc, grace=STOP_GRACE_SECONDS,
+                            pgid=child_pgid, state=process_state)
+                        exit_kill_deadline = (
+                            time.monotonic() + POST_GROUP_DRAIN_SECONDS)
+            group_gone = _group_gone()
+            if group_gone:
+                if group_gone_since is None:
+                    group_gone_since = now
+                elif now - group_gone_since >= POST_GROUP_DRAIN_SECONDS:
+                    # EOF was not observed (an escaped writer may still hold
+                    # the pipe) but the child's group is gone; stop reading.
+                    break
+            if reason_now is not None:
+                timeout = STALL_POLL_SECONDS
+            elif exit_deadline is not None:
+                timeout = 0.1
+            else:
+                timeout = STALL_POLL_SECONDS
+            if group_gone or stop_kill_deadline is not None:
+                timeout = min(timeout, 0.05)
+            elif exit_kill_deadline is not None:
+                timeout = min(timeout, 0.05)
+            chunk = pump.read(timeout)
+            if chunk is None:
+                continue
             if not chunk:
+                stdout_eof = True
                 break
+            group_gone_since = None
             line_buffer += chunk
             while b"\n" in line_buffer:
                 raw, line_buffer = line_buffer.split(b"\n", 1)
@@ -3522,42 +3718,40 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         if monitor:
             monitor.join(timeout=STOP_GRACE_SECONDS + STALL_POLL_SECONDS * 2)
         reason = stop["reason"]
-        if reason and proc.poll() is None:
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        # Bound the final wait: a child that closes stdout but stays alive
-        # (or ignores SIGTERM) must not pin the reader forever.
+        # A stop may race this waiter.  Give the group one final bounded
+        # chance to disappear before touching anything it may still write.
+        if not _group_gone():
+            _terminate_process(proc, grace=0.0, pgid=child_pgid,
+                               state=process_state)
+            deadline = time.monotonic() + STOP_GRACE_SECONDS
+            while not _group_gone() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        cleanup_safe = _group_gone()
+        if not cleanup_safe:
+            stream_abandoned = True
+            process_state["stream_abandoned"] = True
+        # Reap the direct child, bounded; never wait on proc.stdout.
         try:
             code = proc.wait(timeout=STOP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            _terminate_process(proc)
+            _terminate_process(proc, grace=0.0, pgid=child_pgid,
+                               state=process_state)
             try:
-                code = proc.wait(timeout=STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                try:
-                    code = proc.wait(timeout=1.0)
-                except Exception:
-                    code = proc.poll()
+                code = proc.wait(timeout=1.0)
+            except Exception:
+                code = proc.poll()
         except Exception:
             code = proc.poll()
-        if pump is not None:
-            # The daemon reader owns proc.stdout; closing it here can block
-            # until a grandchild that inherited the write end exits.
+        if not cleanup_safe and _group_gone():
+            cleanup_safe = True
+        if cleanup_safe or stdout_eof:
+            # The pump owns the stream on every platform: close() only asks
+            # its daemon reader to stop.  It never closes the stream here.
             pump.close()
-        else:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
+        # stderr is a regular temp file, separate from the child's inherited
+        # fd.  Seek/read/close it unconditionally: reading while the group is
+        # alive cannot block or deliver EPIPE, and an abandoned group must
+        # still leave its failure text in the run record.
         try:
             errfile.seek(0)
             stderr_text = errfile.read().decode("utf-8", "replace")
@@ -3568,18 +3762,21 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 errfile.close()
             except Exception:
                 pass
+        # When the group could not be reaped, do not remove tmpdir or the
+        # reviewer home: a live child may still be using them.  The daemon
+        # pump keeps the stdout read end open so the late writer gets no
+        # EPIPE.
         if reason and reason not in ("loop", "loop_nudge", "loop_stop") and code == 0 and final:
             # The process completed on its own at the same instant the timer
             # or watchdog fired; do not mislabel a normal completion.
             reason = None
             stop["reason"] = None
             stall_state.clear()
-        if reason:
-            # A deliberately stopped child may print a closed-handle teardown
-            # complaint while flushing its session log.  The stop reason is
-            # the phase's real outcome; do not let shutdown noise masquerade
-            # as the failure (or leak "flush on a closed handle" into the job
-            # error and the run record).
+        if (reason and process_state.get("terminated")
+                and not stream_abandoned):
+            # Only a genuinely force-stopped child may print a closed-handle
+            # teardown complaint.  The normal path must not rely on stripping
+            # text to hide a real early close.
             stderr_text = _strip_shutdown_noise(stderr_text, reason)
         if reason == "timeout":
             errors.append("time limit reached")
@@ -3622,13 +3819,15 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     except Exception as exc:
         usage, session_logs = None, []
         usage_reason = "session usage read failed: %s" % exc
-    if tmpdir:
+    if tmpdir and cleanup_safe:
         # The process tree is gone; browser temp files must not pollute the
         # output scan or the next run's workspace.
         shutil.rmtree(tmpdir, ignore_errors=True)
-    if reviewer_home is not None:
+    if reviewer_home is not None and cleanup_safe:
         # The private reviewer home is disposable: REVIEW.md is already
         # persisted in the workspace, and no builder/resume path reads it.
+        # Remove it only after the whole child group is gone so a late session
+        # logger never has its DSH_HOME pulled out from under it.
         shutil.rmtree(str(reviewer_home), ignore_errors=True)
     seconds = round(time.time() - started, 1)
     stalled = bool(stall_state.get("stalled")) or reason == "stalled"
@@ -3701,6 +3900,11 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         "child_sessions_in_flight": child_sessions_in_flight,
         "tmpdir_isolated": bool(tmpdir),
         "reviewer_home_isolated": bool(reviewer_home),
+        # True when the child's group outlived the shutdown bound: its stdout
+        # read end was deliberately left to the daemon pump, and per-run
+        # cleanup that a live process could still be using was deferred.
+        "stream_abandoned": bool(stream_abandoned),
+        "cleanup_deferred": bool(not cleanup_safe),
         "sandbox": policy,
         "os_sandbox": sandbox_meta,
         "os_sandbox_wrapped": bool(sandbox_meta.get("wrapped")),
@@ -3758,7 +3962,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
                   exclude_logs=None, clock=None, output_slack=2.0,
                   policy=None, session_id=None, cancel_check=None,
                   transport_name=None, add_dirs=None, live_usage_cb=None,
-                  dsh_bin=None, model_spec=None, patch=None, role=None):
+                  dsh_bin=None, model_spec=None, patch=None, role=None,
+                  whole_job_limit=_WHOLE_JOB_LIMIT_UNSET):
     """Execute one phase, creating and removing a model overlay when needed.
 
     The default target is explicitly allowed to stay byte-identical to 3.11.0:
@@ -3785,7 +3990,8 @@ def _execute_once(cfg, workspace, task, limit=None, progress_cb=None, label="bui
             output_slack=output_slack, policy=policy, session_id=session_id,
             cancel_check=cancel_check, transport_name=transport_name,
             add_dirs=add_dirs, live_usage_cb=live_usage_cb, dsh_bin=dsh_bin,
-            model_spec=target, patch=effective_patch)
+            model_spec=target, patch=effective_patch,
+            whole_job_limit=whole_job_limit)
         if isinstance(result, dict):
             result["role"] = str(role or label)
             if target is not None:
@@ -5989,7 +6195,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 cancel_check=cancel_check,
                                 live_usage_cb=live_cb,
                                 model_spec=builder_target,
-                                role="builder")
+                                role="builder",
+                                whole_job_limit=job_budget.max_seconds)
         executions.append(builder)
         used_logs.update(builder.get("session_logs") or [])
         _cost_settle(run, cost_ledger, "builder", builder, job_budget,
@@ -6122,7 +6329,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             cancel_check=cancel_check,
                             live_usage_cb=retry_live_cb,
                             model_spec=builder_target,
-                            role="builder")
+                            role="builder",
+                            whole_job_limit=job_budget.max_seconds)
                         executions.append(retried)
                         used_logs.update(retried.get("session_logs") or [])
                         _cost_settle(run, cost_ledger, "builder-retry",
@@ -6209,7 +6417,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     policy=builder_policy, add_dirs=run["add_dirs"],
                     transport_name=run["transport"], cancel_check=cancel_check,
                     live_usage_cb=nudge_live_cb, model_spec=builder_target,
-                    role="builder")
+                    role="builder",
+                    whole_job_limit=job_budget.max_seconds)
                 executions.append(nudged)
                 used_logs.update(nudged.get("session_logs") or [])
                 _cost_settle(run, cost_ledger, "builder-nudge", nudged,
@@ -6306,7 +6515,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         transport_name=run["transport"],
                         cancel_check=cancel_check,
                         live_usage_cb=backup_cb,
-                        model_spec=backup_target, role="backup_builder")
+                        model_spec=backup_target, role="backup_builder",
+                        whole_job_limit=job_budget.max_seconds)
                     executions.append(backup_exec)
                     used_logs.update(backup_exec.get("session_logs") or [])
                     _cost_settle(run, cost_ledger, "builder-backup",
@@ -6665,7 +6875,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 output_slack=0.0, policy=rescue_policy,
                 add_dirs=run["add_dirs"], transport_name=run["transport"],
                 cancel_check=cancel_check, live_usage_cb=rescue_live_cb,
-                model_spec=builder_target, role="builder")
+                model_spec=builder_target, role="builder",
+                whole_job_limit=job_budget.max_seconds)
             executions.append(finisher)
             used_logs.update(finisher.get("session_logs") or [])
             _cost_settle(run, cost_ledger, "rescue", finisher, job_budget,
@@ -7004,7 +7215,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     exclude_logs=used_logs, policy=scaling_policy,
                     add_dirs=run["add_dirs"], transport_name=run["transport"],
                     cancel_check=cancel_check, live_usage_cb=wave_live_cb,
-                    model_spec=builder_target, role="builder")
+                    model_spec=builder_target, role="builder",
+                    whole_job_limit=job_budget.max_seconds)
                 executions.append(extra)
                 used_logs.update(extra.get("session_logs") or [])
                 _cost_settle(run, cost_ledger, "live-wave", extra, job_budget,
@@ -7357,7 +7569,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         add_dirs=run["add_dirs"],
                         transport_name=run["transport"],
                         cancel_check=cancel_check,
-                        live_usage_cb=rev_live_cb)
+                        live_usage_cb=rev_live_cb,
+                        whole_job_limit=job_budget.max_seconds)
                     executions.append(revision)
                     used_logs.update(revision.get("session_logs") or [])
                     _cost_settle(run, cost_ledger, "gate-revision", revision,
@@ -7675,7 +7888,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     exclude_logs=used_logs, policy=revision_policy,
                     add_dirs=run["add_dirs"],
                     transport_name=run["transport"],
-                    cancel_check=cancel_check)
+                    cancel_check=cancel_check,
+                    whole_job_limit=job_budget.max_seconds)
                 executions.append(execution)
                 used_logs.update(execution.get("session_logs") or [])
                 _cost_settle(run, cost_ledger, "crosscheck", execution,
@@ -7936,7 +8150,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     cancel_check=cancel_check,
                     dsh_bin=(candidate.get("dsh_bin") or None),
                     patch=(candidate.get("patch") or None),
-                        model_spec=spec, role="reviewer")
+                        model_spec=spec, role="reviewer",
+                        whole_job_limit=job_budget.max_seconds)
                 except BaseException:
                     raise
                 reviewer_executions.append(result)
@@ -8532,7 +8747,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                      or None),
                             patch=((selected_reviewer or {}).get("patch")
                                    or None),
-                            model_spec=selected_spec)
+                            model_spec=selected_spec,
+                            whole_job_limit=job_budget.max_seconds)
                         reviewer_executions.append(preflight)
                         used_logs.update(preflight.get("session_logs") or [])
                         _answered = (
@@ -8618,7 +8834,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                 transport_name=run["transport"],
                                 cancel_check=cancel_check,
                                 dsh_bin=reviewer_backup["bin"],
-                                role="reviewer")
+                                role="reviewer",
+                                whole_job_limit=job_budget.max_seconds)
                             reviewer_executions.append(_backup_preflight)
                             used_logs.update(
                                 _backup_preflight.get("session_logs") or [])
@@ -8935,7 +9152,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         patch=((selected_reviewer or {}).get("patch")
                                if not review_backup_used else None),
                         model_spec=selected_spec,
-                        role="reviewer")
+                        role="reviewer",
+                        whole_job_limit=job_budget.max_seconds)
                     reviewer_executions.append(review)
                     used_logs.update(review.get("session_logs") or [])
                     _review_answer_text = str(review.get("answer") or "")
@@ -9790,7 +10008,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 transport_name=run["transport"],
                 cancel_check=cancel_check,
                 live_usage_cb=revision_live_cb,
-                model_spec=builder_target, role="revision")
+                model_spec=builder_target, role="revision",
+                whole_job_limit=job_budget.max_seconds)
             reviewer_executions.append(revision)
             used_logs.update(revision.get("session_logs") or [])
             _cost_settle(run, cost_ledger, "revision", revision, job_budget,

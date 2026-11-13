@@ -31,7 +31,7 @@ class CapExtensionTests(unittest.TestCase):
         self.assertFalse(watch.cap_hit())
         self.assertEqual(watch.poll(), None)
 
-    def test_constant_progress_is_stopped_at_the_hard_ceiling(self):
+    def test_constant_progress_extends_the_hard_ceiling(self):
         now = [0.0]
         watch = harness._StallWatch(
             None, clock=lambda: now[0], max_seconds=10.0,
@@ -44,17 +44,24 @@ class CapExtensionTests(unittest.TestCase):
             self.assertIsNone(watch.poll())
         self.assertFalse(watch.cap_hit())
         self.assertEqual(watch.cap_extensions(), 3)
-        # At the ceiling recent progress no longer buys an extension.
+        # At the ceiling recent progress rolls the ceiling forward instead of
+        # killing demonstrably live work.
         now[0] = 250.0
         watch.touch("child", "grown at the ceiling")
+        self.assertIsNone(watch.poll())
+        self.assertFalse(watch.cap_hit())
+        self.assertEqual(watch.cap_extensions(), 4)
+        # The rolled ceiling still fires once the phase has been silent for
+        # the whole grace window.
+        now[0] = 351.0
         self.assertEqual(watch.poll(), "cap")
         self.assertTrue(watch.cap_hit())
         self.assertTrue(watch.cap_hard())
-        self.assertEqual(watch.elapsed(), 250.0)
+        self.assertEqual(watch.elapsed(), 351.0)
         text = watch.error("builder", child_events=4)
         self.assertIn("absolute watchdog cap", text)
         self.assertIn("hard ceiling", text)
-        self.assertIn("extensions: 3", text)
+        self.assertIn("extensions: 4", text)
 
     def test_silent_phase_dies_at_stall_seconds_before_the_cap(self):
         now = [0.0]
@@ -97,10 +104,16 @@ class PhaseScalingTests(unittest.TestCase):
             self._cfg(cap_finisher_multiplier=0), "finisher"))
 
     def test_hard_ceiling_default_and_override(self):
+        self.assertEqual(config.DEFAULTS["phase_absolute_cap_seconds"], 7200.0)
+        # The 3.14.x key stays as a backwards-compatible fallback.
         self.assertEqual(config.DEFAULTS["stall_cap_hard_max_seconds"], 7200.0)
         self.assertEqual(harness._stall_cap_hard_max(self._cfg()), 7200.0)
         self.assertEqual(harness._stall_cap_hard_max(
+            self._cfg(phase_absolute_cap_seconds=900)), 900.0)
+        self.assertEqual(harness._stall_cap_hard_max(
             self._cfg(stall_cap_hard_max_seconds=900)), 900.0)
+        self.assertIsNone(harness._stall_cap_hard_max(
+            self._cfg(phase_absolute_cap_seconds=0)))
         self.assertIsNone(harness._stall_cap_hard_max(
             self._cfg(stall_cap_hard_max_seconds=0)))
 

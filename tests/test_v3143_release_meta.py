@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 import deepseek_mcp
-from deepseek_mcp import config, observability
+from deepseek_mcp import config, harness, observability
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "3.14.3"
@@ -68,11 +68,22 @@ class DocsTests(unittest.TestCase):
         ops = (ROOT / "docs" / "OPERATIONS.md").read_text(encoding="utf-8")
         for needle in ("depends_on_policy", "git_identity_exceptions",
                        "job_max_seconds", "os_sandbox=off",
+                       "phase_absolute_cap_seconds",
                        "job_max_seconds_display"):
             self.assertIn(needle, ops)
         cross = (ROOT / "docs" / "CROSSCHECK.md").read_text(encoding="utf-8")
         self.assertIn("false_alarm_filtered", cross)
         self.assertIn("repro", cross)
+
+    def test_identity_exception_scope_is_documented(self):
+        # The corrected semantics: exact normalized remote, only the repo's
+        # own configured identity there, every other identity still blocked.
+        ops = " ".join((ROOT / "docs" / "OPERATIONS.md").read_text(
+            encoding="utf-8").split())
+        self.assertIn("exact after normalization", ops)
+        self.assertIn("only the repository's own configured", ops)
+        self.assertIn("every other", ops)
+        self.assertIn("no personal address is built in", ops.lower())
 
     def test_config_example_has_identity_and_policy(self):
         data = json.loads((ROOT / "config.example.json").read_text(
@@ -88,6 +99,23 @@ class DocsTests(unittest.TestCase):
         data = json.loads((ROOT / "config.example.json").read_text(
             encoding="utf-8"))
         self.assertNotIn("job_max_seconds", data)
+
+    def test_config_example_phase_cap_keeps_unlimited_jobs_unlimited(self):
+        # The example may pin the documented default phase cap, but it must
+        # never turn a job_max_seconds=0 job back into a bounded one.
+        data = json.loads((ROOT / "config.example.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(data.get("phase_absolute_cap_seconds"),
+                         config.DEFAULTS["phase_absolute_cap_seconds"])
+        cfg = config.load_config(config_path=ROOT / "config.example.json",
+                                 env={})
+        self.assertIsNone(
+            harness._stall_hard_max_for_limit(cfg, 0, 1800.0),
+            "config.example.json re-imposed an absolute cap on an "
+            "unlimited job")
+        self.assertEqual(
+            harness._stall_hard_max_for_limit(cfg, 7200.0, 1800.0),
+            7200.0)
 
     def test_no_personal_email_in_tree_docs(self):
         pattern = re.compile(r"[\w.+-]+@(?!example\.com|example\.org|"

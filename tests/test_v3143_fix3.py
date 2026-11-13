@@ -191,10 +191,6 @@ class ZeroJobDeadlineStallCapTest(unittest.TestCase):
         self.assertEqual(harness._job_seconds_display(7200.0), "7200s")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class UnlimitedRunRecordTest(unittest.TestCase):
     """The run record must not re-introduce the 7200 s cap it disabled."""
 

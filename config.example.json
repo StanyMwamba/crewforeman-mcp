@@ -16,6 +16,7 @@
   "stall_seconds": 480,
   "stall_max_seconds": 1800,
   "stall_cap_hard_max_seconds": 7200,
+  "phase_absolute_cap_seconds": 7200,
   "quality_max_rounds": 3,
   "quality_convergence": "observe",
   "review_test_suite": "auto",

@@ -2,17 +2,20 @@
 
 A fake ``dsh`` writes a deliverable, emits a JSON ``final`` event, and exits 0
 while a grandchild keeps the inherited stdout pipe open.  ``run_harness`` must
-stop within the bounded post-exit drain instead of waiting for a pipe EOF that
-may never arrive.  Four cases:
+keep draining while the inherited process group is alive, bounded by
+``EXIT_GROUP_DRAIN_SECONDS``, then terminate that group so a 30 s or never-exit
+grandchild is reaped instead of leaking a live process and reader thread.  Four
+cases:
 
 1. a silent 30 s grandchild (the review's original hang);
-2. a grandchild that never exits (thread cleanup and SIGKILL confirmation);
+2. a grandchild that never exits (thread cleanup and group termination);
 3. a ``final`` event flushed 0.45 s *after* the direct child exits;
-4. a grandchild flooding JSONL for 5 s (must not stretch the drain to 5 s).
+4. a grandchild flooding JSONL for 5 s (bounded by the drain deadline).
 
 Each fake records its grandchild pid through ``PIPE_TEST_PIDFILE`` and every
-test SIGKILLs the grandchild in ``addCleanup``, so a failing run never leaves a
-30 s/forever/flooding process behind.  No real Harness, API, or network.
+test cleans the pidfile process up in ``addCleanup``, so a failing run never
+leaves a 30 s/forever/flooding process behind.  No real Harness, API, or
+network.
 """
 
 import os
@@ -200,18 +203,21 @@ class NormalExitPipeTests(unittest.TestCase):
         run, elapsed = self._run_harness(script)
 
         self.assertLess(
-            elapsed, 3.0,
+            elapsed, 8.0,
             "run_harness waited %.3f s for the 30 s grandchild" % elapsed)
         self.assertEqual(run.get("status"), "ok")
         self.assertEqual(run.get("exit_code"), 0)
         self.assertEqual(run.get("answer"), "done-sleep30")
         self._assert_deliverable(run)
 
-        # Prove the test held stdout open after the direct child exited.
+        # The inherited group held stdout after the direct child exited, then
+        # the bounded normal-exit path terminated it.  It must not survive the
+        # run as an orphan.
         self._grandchild_pid = self._read_grandchild_pid()
-        if not platforms.pid_alive(self._grandchild_pid):
-            self.fail("grandchild %d was not alive after the run"
-                      % self._grandchild_pid)
+        self.assertTrue(
+            self._wait_gone(self._grandchild_pid, 2.0),
+            "grandchild %d survived the normal-exit group termination"
+            % self._grandchild_pid)
 
     def test_02_never_exit_grandchild_is_bounded_and_reaped(self):
         baseline = set(threading.enumerate())
@@ -242,14 +248,14 @@ class NormalExitPipeTests(unittest.TestCase):
         run, elapsed = self._run_harness(script)
 
         self.assertLess(
-            elapsed, 3.0,
+            elapsed, 8.0,
             "run_harness waited %.3f s for the never-exit grandchild" % elapsed)
         self.assertEqual(run.get("status"), "ok")
         self.assertEqual(run.get("exit_code"), 0)
         self.assertEqual(run.get("answer"), "done-never")
         self._assert_deliverable(run)
 
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 2.0
         while (set(threading.enumerate()) - baseline
                and time.monotonic() < deadline):
             time.sleep(0.01)
@@ -262,8 +268,9 @@ class NormalExitPipeTests(unittest.TestCase):
         pid = self._read_grandchild_pid()
         self._grandchild_pid = pid
         self.assertTrue(
-            self._kill_grandchild(),
-            "grandchild %d survived SIGKILL/cleanup" % pid)
+            self._wait_gone(pid, 2.0),
+            "never-exit grandchild %d survived the normal-exit group "
+            "termination" % pid)
 
     def test_03_late_final_after_direct_exit_is_retained(self):
         script = self._write_fake_dsh("""
@@ -289,7 +296,7 @@ class NormalExitPipeTests(unittest.TestCase):
         run, elapsed = self._run_harness(script)
 
         self.assertLess(
-            elapsed, 3.0,
+            elapsed, 8.0,
             "run_harness took %.3f s for a late final" % elapsed)
         self.assertEqual(run.get("status"), "ok")
         self.assertEqual(run.get("exit_code"), 0)
@@ -297,6 +304,10 @@ class NormalExitPipeTests(unittest.TestCase):
             run.get("answer"), "done-late",
             "the final flushed 0.45 s after the direct child exited was lost")
         self._grandchild_pid = self._read_grandchild_pid()
+        self.assertTrue(
+            self._wait_gone(self._grandchild_pid, 2.0),
+            "late-final grandchild %d survived the bounded drain"
+            % self._grandchild_pid)
 
     def test_04_flooding_grandchild_is_bounded(self):
         script = self._write_fake_dsh("""
@@ -310,8 +321,8 @@ class NormalExitPipeTests(unittest.TestCase):
                 "# Deliverable\\n\\nNon-empty builder output.\\n",
                 encoding="utf-8")
 
-            # The flood keeps stdout readable for 5 s; it must not extend the
-            # post-exit drain beyond its 1 s bound.
+            # The flood keeps stdout readable for 5 s; the bounded normal-exit
+            # drain must terminate it rather than letting it pin the reader.
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", __GRANDCHILD__])
             # The grandchild is deliberately left running; mark the handle as
@@ -329,13 +340,17 @@ class NormalExitPipeTests(unittest.TestCase):
         run, elapsed = self._run_harness(script)
 
         self.assertLess(
-            elapsed, 2.5,
+            elapsed, 8.0,
             "run_harness followed the 5 s flood for %.3f s" % elapsed)
         self.assertEqual(run.get("status"), "ok")
         self.assertEqual(run.get("exit_code"), 0)
         self.assertEqual(run.get("answer"), "done-flood")
         self._assert_deliverable(run)
         self._grandchild_pid = self._read_grandchild_pid()
+        self.assertTrue(
+            self._wait_gone(self._grandchild_pid, 2.0),
+            "flooding grandchild %d survived the bounded drain"
+            % self._grandchild_pid)
 
 
 if __name__ == "__main__":

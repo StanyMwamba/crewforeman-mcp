@@ -213,6 +213,70 @@ if mode == "catalog_sleep":
 if mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_DSH_SLEEP", "3")))
     sys.exit(0)
+if mode in ("linger_group", "linger_group_home"):
+    # Regression for the closed-handle shutdown ordering: the direct child
+    # exits immediately, but a grandchild inherits stdout and flushes one last
+    # JSON event later.  On the old ordering the connector broke its post-exit
+    # drain after EXIT_DRAIN_SECONDS and closed the pipe, so the late writer
+    # got EPIPE and printed the dsh closed-handle complaint.
+    import subprocess
+    emit({"type": "session", "version": 4, "id": "linger-session",
+          "cwd": str(workspace.resolve())})
+    emit({"type": "tool_call", "name": "before"})
+    emit({"type": "final", "text": "linger direct complete"})
+    late_lines = [
+        "import json, os, sys, time",
+        "time.sleep(float(os.environ.get('FAKE_DSH_LINGER_SECONDS', '2.5')))",
+        "if os.environ.get('FAKE_DSH_LINGER_HOME'):",
+        "    home = os.environ.get('DSH_HOME')",
+        "    if home:",
+        "        try:",
+        "            target = os.path.join(home, 'sessions', 'late-session')",
+        "            os.makedirs(target, exist_ok=True)",
+        "            with open(os.path.join(target, 'session.v4.jsonl'), 'a',",
+        "                      encoding='utf-8') as handle:",
+        "                handle.write(json.dumps({'type': 'session', 'id': 'late'}) + '\\n')",
+        "        except Exception:",
+        "            pass",
+        "try:",
+        "    print(json.dumps({'type': 'tool_call', 'name': 'late'}), flush=True)",
+        "except (BrokenPipeError, OSError):",
+        "    try:",
+        "        sys.stderr.write('dsh: session \\\"linger\\\": flush on a closed handle\\n')",
+        "        sys.stderr.flush()",
+        "    except Exception:",
+        "        pass",
+    ]
+    grandchild = subprocess.Popen([sys.executable, "-c",
+                                   "\n".join(late_lines)])
+    # Deliberately left running; mark the handle as reaped so this fake does
+    # not emit a ResourceWarning on exit.
+    grandchild.returncode = 0
+    pidfile = os.environ.get("FAKE_DSH_GRANDCHILD_PID")
+    if pidfile:
+        Path(pidfile).write_text(str(grandchild.pid), encoding="utf-8")
+    sys.exit(0)
+if mode == "group_stubborn":
+    # Both the direct child and its grandchild ignore SIGTERM and keep the
+    # inherited stdout open: the stop path must SIGKILL the captured group and
+    # return within its bounded shutdown window.
+    import signal
+    import subprocess
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    stubborn = ("import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "time.sleep(30)\n")
+    grandchild = subprocess.Popen([sys.executable, "-c", stubborn])
+    grandchild.returncode = 0
+    pidfile = os.environ.get("FAKE_DSH_GRANDCHILD_PID")
+    if pidfile:
+        Path(pidfile).write_text(str(grandchild.pid), encoding="utf-8")
+    parent_pidfile = os.environ.get("FAKE_DSH_PARENT_PID")
+    if parent_pidfile:
+        Path(parent_pidfile).write_text(str(os.getpid()), encoding="utf-8")
+    emit({"type": "tool_call", "name": "stubborn"})
+    time.sleep(30)
+    sys.exit(0)
 if mode == "tree":
     import subprocess
     child = subprocess.Popen([sys.executable, "-c",
@@ -247,6 +311,10 @@ if mode == "drain":
     # Non-zero makes the deliberate stop observable after the drain; a zero
     # exit with a final answer is correctly relabelled a normal completion.
     sys.exit(3)
+if mode == "stderr_boom":
+    sys.stderr.write(os.environ.get("FAKE_DSH_STDERR_TEXT", "fatal: boom") + "\n")
+    sys.stderr.flush()
+    sys.exit(1)
 if mode == "error":
     emit({"type": "error", "message": os.environ.get("FAKE_DSH_ERROR_MESSAGE", "fake dsh failure")})
     sys.exit(1)

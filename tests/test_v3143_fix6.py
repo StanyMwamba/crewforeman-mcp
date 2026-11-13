@@ -504,6 +504,27 @@ class CrosscheckReproGateTest(unittest.TestCase):
         self.assertEqual(filtered[0]["false_alarm_reason"],
                          "repro_output_too_short")
 
+    def test_four_character_expected_output_is_accepted(self):
+        # The minimum is four characters: the boundary itself must verify.
+        item = self.finding(executable=True,
+                            repro={"command": "python repro.py",
+                                   "output": "boom"})
+        kept, filtered, stats = crosscheck.verify_findings(
+            [item], self.ws, runner=StubRunner((0, "boom")))
+        self.assertEqual(len(kept), 1, filtered)
+        self.assertEqual(filtered, [])
+        self.assertEqual(stats["false_alarm_filtered"], 0)
+
+    def test_missing_repro_output_is_dropped(self):
+        item = self.finding(executable=True,
+                            repro={"command": "python repro.py"})
+        kept, filtered, stats = crosscheck.verify_findings(
+            [item], self.ws, runner=StubRunner((0, "anything")))
+        self.assertEqual(kept, [])
+        self.assertEqual(filtered[0]["false_alarm_reason"],
+                         "missing_repro_output")
+        self.assertEqual(stats["false_alarm_filtered"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

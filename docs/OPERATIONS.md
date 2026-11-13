@@ -875,13 +875,18 @@ the whole child tree without signalling the MCP server itself.
   is **progress-gated**: when the cap is reached but progress arrived within
   `stall_cap_grace_seconds` (default 120), the deadline is extended by
   `stall_cap_extension_seconds` (default 300) instead of killing the work.
-  Extensions stop at the hard ceiling `stall_cap_hard_max_seconds` (default
-  `7200`): at that point the cap fires even if progress is recent, so a phase
-  can never run past it. Set the hard ceiling to `0` to disable only the
-  ceiling. The cap is scaled per phase by `cap_reviewer_multiplier` (1.5),
-  `cap_revision_multiplier` (1.25) and `cap_finisher_multiplier` (0.5). Set a
-  multiplier to 0 to disable the cap for that phase; `stall_seconds=0`
-  disables only the silence timer.
+  Extensions are bounded by the progress-aware absolute per-phase cap
+  `phase_absolute_cap_seconds` (default `7200`; the 3.14.x
+  `stall_cap_hard_max_seconds` key is a backwards-compatible alias used only
+  when the new key is not explicitly set). At the cap, a phase that produced
+  progress within `stall_cap_grace_seconds` rolls forward by
+  `stall_cap_extension_seconds` instead of dying, so only a genuinely silent
+  phase fires the absolute cap. Set the cap to `0` (or `null`) to disable only
+  the absolute cap. It is disabled automatically while `job_max_seconds` is
+  `0`. The progress-gated `stall_max_seconds` cap is scaled per phase by
+  `cap_reviewer_multiplier` (1.5), `cap_revision_multiplier` (1.25) and
+  `cap_finisher_multiplier` (0.5). Set a multiplier to 0 to disable that cap
+  for the phase; `stall_seconds=0` disables only the silence timer.
 
 The unconditional bound is the whole-job budget, which spans builder,
 live-scaling waves, reviewer, revisions, rescue and retries:
@@ -1360,6 +1365,23 @@ only. Remove the key (or set it to `null`) if you also want the operator
 default to be unlimited. Progress-gated stall detection (`stall_seconds`,
 `stall_max_seconds`) is unchanged and still protects against a silent child.
 
+### `phase_absolute_cap_seconds`
+
+`phase_absolute_cap_seconds` is the absolute per-phase watchdog cap. It is
+**progress-aware**: when the cap is reached but the phase produced progress
+within `stall_cap_grace_seconds`, the cap is rolled forward by
+`stall_cap_extension_seconds` instead of killing the phase, so only a
+genuinely silent phase fires it. It defaults to `7200` when `job_max_seconds`
+is positive, and it is **disabled when `job_max_seconds` is `0`** (unlimited),
+regardless of this key. Set it to `null` or `0` to disable only the absolute
+cap for a bounded job. `stall_max_seconds` remains the normal progress-gated
+process cap, and `stall_seconds` still stops a truly silent phase.
+`stall_cap_hard_max_seconds` is the backwards-compatible alias, used only when
+the new key is not explicitly set. Environment aliases are
+`DSH_PHASE_ABSOLUTE_CAP_SECONDS` and `DEEPSEEK_PHASE_ABSOLUTE_CAP_SECONDS`.
+With an unlimited job no absolute cap is passed at all, so a progressing phase
+is never killed by a 7200 s ceiling and only silence can stop it.
+
 ### `depends_on_policy`
 
 Controls what a queued job does when the run named by `depends_on` ends in a
@@ -1394,24 +1416,35 @@ committer name+email, plus email addresses in commit messages and
 `base..head` - and blocks the push when any identity is outside the allowlist (the configured `git_identity`
 name and address and the default `crewforeman-mcp` / `noreply@example.com`).
 Exception entries are remotes, never emails; an email-shaped exception does
-not widen the global allowlist. An exception remote is exempt from the
-metadata check but its added content is still scanned.
+not widen the global allowlist. An exception changes *whose* identity is
+allowed on that remote, not whether the metadata gate runs: on the exactly
+matched remote the gate still scans every commit and **allows only the
+repository's own configured repo-local `(name, email)` pair on that remote**;
+every other identity, including the connector's default identity, is still
+blocked. The exception replaces the normal metadata allowlist rather than
+extending it, and message/trailer/content addresses use only that repo-local
+address. Added content is always scanned.
 
 `git_identity_max_scan_commits` (default 10000) bounds one gate run. A larger
 range fails closed with `too_many_commits` instead of scanning part of the
 history; raise it only for a repository that really has that much history.
 
-`git_identity_exceptions` lists remotes that keep their own repo-local
-identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
-Matching is **exact**, not a substring: an entry must be `owner/repo` (a
-GitHub.com shorthand only) or a full URL (with or without `.git`). A
-substring match would let an entry such as `owner/repo` exempt an unrelated
+`git_identity_exceptions` lists remotes on which the repository keeps its own
+configured identity, for example a fork such as `"example-org/Cypraea"`.
+Matching is **exact after normalization**, not a substring: an entry must be
+`owner/repo` (a GitHub.com shorthand only) or a full URL (with or without
+`.git`; host and path are normalized before comparison). A substring match
+would let an entry such as `owner/repo` exempt an unrelated
 `evil.example/fork-of-owner/repo` push target, and a bare remote name is a
 local label that can be re-pointed at another URL, so bare names such as
 `origin` are ignored. On GitHub Enterprise, GitLab or any other host, use the
-full URL. An exception is
-resolved from a configured remote name; a direct-URL `git push` does not
-borrow it. No personal address is built in anywhere.
+full URL. An exception is matched against the exact normalized remote
+location: a configured remote name and an exact URL both resolve to that
+location, while a different URL, lookalike host or bare label cannot borrow
+it. The exception allowlist is exclusive: it replaces the normal allowlist
+with only that repository's own configured repo-local identity, so even the
+connector's default identity is blocked on that remote. No personal address
+is built in anywhere.
 
 ```bash
 python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \
@@ -1431,14 +1464,22 @@ git config core.hooksPath scripts/hooks
 ```
 
 Connector-controlled release tooling calls
-`git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)` (wrapped
-by `scripts/ship_push.py`) and never a bare `git push`: it runs the same gate
-and returns before the push on any violation. That helper is the hard local
-gate; the Git hook is cooperative and, like every Git hook, can be skipped
-with `git push --no-verify`. GitHub Actions therefore runs the same CLI gate
-over the pushed range before the test matrix, so a bypassed local hook still
-cannot land an off-allowlist commit or content on `main`. Release/publish
-tooling must call `push_with_gate` rather than a bare `git push`.
-`scripts/hooks/pre-push` runs the same gate for each pushed ref, using the
-remote's advertised sha as the base (or the merge-base for a new branch). It
-scans metadata and content and exits non-zero on any violation.
+`git_identity.push_with_gate(cfg, repo, remote, refspec, ...)` (wrapped by
+`scripts/ship_push.py`) and never a bare `git push`. It accepts `base=` for
+older callers but does not trust it: the gate range comes from each
+destination ref's advertised sha in `git ls-remote`, with the full history
+scanned when that value is unknown. After the gate passes, it pushes the
+exact commit sha it scanned to the destination ref, so a mutable local ref
+cannot move the pushed commit out from under the gate. For connector pushes
+that helper is the **non-skippable** gate and returns before any `git push`
+on a violation; the Git hook is defense in depth and, like every Git hook,
+can be skipped with `git push --no-verify`. GitHub Actions re-runs the same
+gate over the pushed range on the push event and fails the run on a bypass —
+that is post-push detection, not prevention; the connector's `push_with_gate`
+is what prevents the push. Release/publish tooling must call
+`push_with_gate` rather than a bare `git push`.
+The installed hook and the checked-in `scripts/hooks/pre-push` use the same
+range rule for each pushed ref: the advertised destination sha from git's
+stdin when supplied, and the full pushed history (bounded by
+`git_identity_max_scan_commits`) when the destination ref is new or unknown.
+They scan metadata and content and exit non-zero on any violation.

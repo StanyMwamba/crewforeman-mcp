@@ -14,16 +14,23 @@ that stops crosscheck false alarms from being counted.
 - **Closed-handle faults can no longer kill a phase.** The connector used to
   stop reading a child's stdout the instant a stop reason was set, close the
   pipe, and only then wait for the child: dsh's final session-log flush then
-  hit a closed handle. A deliberately stopped child is now drained until it
-  exits (bounded by `STOP_DRAIN_SECONDS`), and teardown noise is removed from
-  the stopped phase's error. `flush on a closed handle` /
-  `I/O operation on closed file` are also classified as infrastructure
-  faults. A gate revision is retried once on a fresh session, then the run
+  hit a closed handle. A deliberately stopped child is now drained while its
+  process group is alive, bounded by `STOP_DRAIN_HARD_SECONDS`
+  (`STOP_DRAIN_SECONDS` plus the grace and reap windows); the stdout pump owns
+  the pipe and closes it only after a real EOF; the tmpdir and reviewer home
+  are removed only after the group is gone, and stderr (a separate temp file)
+  is always read. Teardown noise is removed from the stopped phase's error.
+  `flush on a closed handle` / `I/O operation on closed file` are also
+  classified as infrastructure faults. A gate revision is retried once on a
+  fresh session, then the run
   degrades cleanly to `ok_unreviewed` with `stop_reason="gate_error"`,
   `gate_error` and `gate_warning` recorded, instead of ending in `error`.
   A run whose deliverables succeeded is no longer reported as
   `review phase is still in flight; refusing a terminal done status`; the
-  terminal status reflects the work that actually shipped.
+  terminal status reflects the work that actually shipped. Root cause: the
+  shutdown order closed the read side while the child and its session logger
+  could still flush; the connector now drains and reaps the child before
+  closing the stream, with the retry/degrade kept as a backstop.
 - **`depends_on_policy`** (`"success"` default, `"finished"`) on the tool and
   in config, also via `DSH_DEPENDS_ON_POLICY` / `DEEPSEEK_DEPENDS_ON_POLICY`.
   `"success"` keeps today's behaviour with a message that names the dependency
@@ -37,25 +44,39 @@ that stops crosscheck false alarms from being counted.
   built-in 7200 s stall ceiling no longer re-imposes the deadline the caller
   disabled. An operator-configured positive ceiling caps positive per-job
   requests only: an explicit `0` is never re-capped. The shipped
-  `config.example.json` no longer pins a ceiling.
+  `config.example.json` no longer pins `job_max_seconds`; its
+  `phase_absolute_cap_seconds` entry is the documented default and is ignored
+  when `job_max_seconds` is `0`. The new `phase_absolute_cap_seconds` is the
+  progress-aware absolute per-phase watchdog cap: it defaults to `7200` when
+  `job_max_seconds` is positive and is disabled while `job_max_seconds` is
+  `0`, so an unlimited job is never killed by a 7200 s ceiling while it is
+  progressing. At the cap a phase with recent progress rolls forward instead
+  of dying, so only a genuinely silent phase is stopped; the 3.14.x
+  `stall_cap_hard_max_seconds` key remains a backwards-compatible alias.
 - **Commit-identity gate.** New `deepseek_mcp/git_identity.py` sets the
   repo-local identity from config `git_identity` (default
   `crewforeman-mcp` with the reserved `noreply` address at `example.com`) for every commit and rebase the
   connector creates, and its pre-push gate scans commit **metadata** (author
   and committer name+email, plus message/trailer addresses, for every commit
   in `base..head`) as well as added file contents. Any identity outside the allowlist blocks the push.
-  `git_identity_exceptions` lists remotes that keep their own identity (for
-  example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
-  on `owner/repo` (GitHub.com shorthand) or the full URL (a bare remote name
-  is ignored), so a lookalike host or a re-pointed label cannot borrow the
-  exception, and no personal address is hardcoded. Exception entries are remotes only; an
-  email-shaped entry never widens the global identity allowlist. The connector
-  installs the `pre-push` hook on the first commit/rebase it creates (an
-  operator's own hook is preserved as `pre-push.local` and runs first) and
-  exposes
-  `git_identity.push_with_gate` and `scripts/ship_push.py` for
-  connector-controlled pushes; the GitHub Actions workflow runs the same gate
-  over the pushed range before the test matrix. CLI:
+  `git_identity_exceptions` lists remotes that keep their own configured
+  identity (for example a fork such as `example-org/Cypraea`); matching is
+  exact after normalization on `owner/repo` (GitHub.com shorthand) or the full
+  URL (a bare remote name is ignored), so a lookalike host or a re-pointed
+  label cannot borrow the exception. On that exact remote the exception
+  replaces the normal allowlist: only the repository's own configured
+  repo-local `(name, email)` pair is allowed, so every other identity,
+  including the connector's default pair, is still blocked; message, trailer
+  and content addresses use only that repo-local address, no personal address
+  is hardcoded, and added content is still scanned. Exception entries are
+  remotes only; an email-shaped entry never widens the global identity
+  allowlist. Connector pushes go through `git_identity.push_with_gate` (and
+  `scripts/ship_push.py`), the non-skippable gate that verifies every commit
+  in the exact pushed range and returns before any `git push` on a violation.
+  The connector also installs the `pre-push` hook on the first commit/rebase
+  it creates (an operator's own hook is preserved as `pre-push.local` and runs
+  first); hooks are defense in depth, and the GitHub Actions workflow runs the
+  same gate over the pushed range before the test matrix. CLI:
   `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
   builders get the OS boundary when the platform can provide it; a per-job

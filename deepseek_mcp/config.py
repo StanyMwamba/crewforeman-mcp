@@ -117,8 +117,14 @@ DEFAULTS = {
     "stall_max_seconds": 1800.0,
     "stall_cap_grace_seconds": 120.0,
     "stall_cap_extension_seconds": 300.0,
-    # Even a phase that keeps making progress is stopped at this absolute
-    # ceiling. None/0 disables only the ceiling, not the progress-gated cap.
+    # Absolute per-phase ceiling.  It is progress-aware: if the phase produced
+    # progress within stall_cap_grace_seconds at the deadline, the ceiling is
+    # rolled forward by stall_cap_extension_seconds instead of killing it.
+    # None/0 disables only the ceiling, not the progress-gated cap.  An
+    # unlimited whole-job budget (job_max_seconds 0/None) never applies it.
+    "phase_absolute_cap_seconds": 7200.0,
+    # Backwards-compatible alias for phase_absolute_cap_seconds.  It is used
+    # only when the new key is not explicitly set.
     "stall_cap_hard_max_seconds": 7200.0,
     "cap_reviewer_multiplier": 1.5,
     "cap_revision_multiplier": 1.25,
@@ -491,6 +497,8 @@ ENV_MAP = {
     "DEEPSEEK_STALL_CAP_GRACE_SECONDS": "stall_cap_grace_seconds",
     "DSH_STALL_CAP_EXTENSION_SECONDS": "stall_cap_extension_seconds",
     "DEEPSEEK_STALL_CAP_EXTENSION_SECONDS": "stall_cap_extension_seconds",
+    "DSH_PHASE_ABSOLUTE_CAP_SECONDS": "phase_absolute_cap_seconds",
+    "DEEPSEEK_PHASE_ABSOLUTE_CAP_SECONDS": "phase_absolute_cap_seconds",
     "DSH_STALL_CAP_HARD_MAX_SECONDS": "stall_cap_hard_max_seconds",
     "DEEPSEEK_STALL_CAP_HARD_MAX_SECONDS": "stall_cap_hard_max_seconds",
     "DSH_CAP_REVIEWER_MULTIPLIER": "cap_reviewer_multiplier",
@@ -806,7 +814,7 @@ FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "review_test_timeout_seconds", "failure_notes_half_life_days",
               "daily_alert_usd", "daily_limit_usd", "render_probe_timeout",
               "stall_cap_grace_seconds", "stall_cap_extension_seconds",
-              "stall_cap_hard_max_seconds",
+              "phase_absolute_cap_seconds", "stall_cap_hard_max_seconds",
               "cap_reviewer_multiplier", "cap_revision_multiplier",
               "cap_finisher_multiplier", "job_max_seconds", "job_max_cost_usd",
               "live_scaling_threshold", "live_scaling_min_seconds",

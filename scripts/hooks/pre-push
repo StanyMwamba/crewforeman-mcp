@@ -18,7 +18,9 @@ HOOK_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
 ROOT=$(CDPATH='' cd -- "$HOOK_DIR/../.." && pwd -P) || exit 1
 refs="$HOOK_DIR/.pre-push-refs.$$"
 trap 'rm -f "$refs"' EXIT HUP INT TERM
-cat > "$refs" || exit 1
+# Strip CR defensively: a CRLF refs stream (or a Windows text-mode reader)
+# would otherwise leave a trailing CR on the sha and break the gate's range.
+tr -d '\r' > "$refs" || exit 1
 status=0
 if [ -x "$HOOK_DIR/pre-push.local" ]; then
     "$HOOK_DIR/pre-push.local" "$@" < "$refs" || status=1
@@ -36,25 +38,25 @@ if [ -z "$PYTHON" ]; then
     echo "pre-push: no python interpreter found; refusing." >&2
     exit 1
 fi
-case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*) CF_SEP=';' ;;
-    *) CF_SEP=':' ;;
-esac
-CF_PYTHONPATH="$ROOT"
-if [ -n "${PYTHONPATH:-}" ]; then
-    CF_PYTHONPATH="$CF_PYTHONPATH$CF_SEP$PYTHONPATH"
-fi
-export PYTHONPATH="$CF_PYTHONPATH"
+GATE_ROOT="$ROOT"
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || REPO=$(pwd -P)
 remote="$1"
-while read local_ref local_sha remote_ref remote_sha; do
+while read -r local_ref local_sha remote_ref remote_sha; do
+    local_sha=$(printf '%s' "$local_sha" | tr -d '\r')
+    remote_sha=$(printf '%s' "$remote_sha" | tr -d '\r')
+    [ -z "$local_ref" ] && continue
     [ "$local_sha" = "$zero" ] && continue
     base="$remote_sha"
-    case "$base" in
-        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base="" ;;
-    esac
-    # An empty base scans the full pushed history (new branch, no origin/main).
-    if ! "$PYTHON" -m deepseek_mcp.git_identity \
-            --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
+    # A new branch has no advertised old sha.  Scan the full history; never
+    # merge-base against a remote-tracking ref (it can be stale after the
+    # remote is re-pointed or rewound, which would hide pushed commits).
+    [ "$base" = "$zero" ] && base=""
+    # Bootstrap: insert the absolute connector root at sys.path[0] before the
+    # import, so a deepseek_mcp package in the pushed repo (cwd) cannot
+    # shadow the real gate.
+    if ! "$PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); from deepseek_mcp.git_identity import main; sys.exit(main(sys.argv[2:]))' \
+            "$GATE_ROOT" --repo "$REPO" --base "$base" --head "$local_sha" \
+            --remote "$remote"; then
         status=1
     fi
 done < "$refs"

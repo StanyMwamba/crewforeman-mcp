@@ -168,6 +168,26 @@ class DependsOnPolicyTests(unittest.TestCase):
         self.assertEqual(record["depends_on"], new_run)
         self.assertTrue(start.called, "the revived dependent was not started")
 
+    def test_start_job_uses_config_policy_when_tool_omits_it(self):
+        ctrl = self._controller()
+        self.store.enqueue("dep", run_id="dep")
+        cfg = _cfg(self.root, depends_on_policy="finished")
+        submitted = {}
+
+        def fake_submit(work_id, **kwargs):
+            submitted.update(kwargs)
+            return {"state": "queued", "position": 0}
+
+        with mock.patch.object(jobs, "_admission_controller",
+                               return_value=ctrl), \
+                mock.patch.object(ctrl, "submit", side_effect=fake_submit), \
+                mock.patch.object(ctrl, "start"):
+            jobs.start_job(
+                "resume_deepseek",
+                {"run_id": "dep", "prompt": "x", "wait_seconds": 0},
+                cfg=cfg, wait=0)
+        self.assertEqual(submitted.get("depends_on_policy"), "finished")
+
     def test_resume_revives_parked_dependent(self):
         ctrl = self._controller()
         self._parked_dependent(ctrl)

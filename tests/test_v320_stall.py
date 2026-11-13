@@ -322,9 +322,10 @@ class HarnessStallIntegrationTests(unittest.TestCase):
         self.assertEqual(run["stop_reason"], "stalled")
 
 
-    def test_normal_exit_with_grandchild_stdout_returns_immediately(self):
-        # A normal exit 0 + final must not wait for a grandchild that inherited
-        # stdout; only stop reasons and true EOF may end the reader early.
+    def test_normal_exit_with_grandchild_stdout_is_bounded(self):
+        # A normal exit 0 + final must not hang on a grandchild that inherited
+        # stdout.  The reader keeps draining while the inherited group is
+        # alive, bounded by EXIT_GROUP_DRAIN_SECONDS, then terminates it.
         script = self._write_fake_dsh("""
             import json
             import os
@@ -357,8 +358,11 @@ class HarnessStallIntegrationTests(unittest.TestCase):
         }, cfg)
         elapsed = time.time() - started
 
-        self.assertLess(elapsed, 2.0)
+        self.assertLess(elapsed, 8.0,
+                        "normal exit hung on inherited stdout for %.3f s"
+                        % elapsed)
         self.assertEqual(run["status"], "ok")
+        self.assertEqual(run.get("answer"), "done")
         self.assertIn("deliverable.md", run["output_files"])
 
 

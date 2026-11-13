@@ -84,6 +84,16 @@ class GitIdentityTest(unittest.TestCase):
         self.git("-c", "user.name=Outsider", "-c", "user.email=" + email,
                  "commit", "-m", message)
 
+    def local_commit(self, message, name="Fork Owner",
+                     email="fork.owner@example.org"):
+        """Commit with the repository's own configured identity."""
+        self.git("config", "--local", "user.name", name)
+        self.git("config", "--local", "user.email", email)
+        self.write(message + ".txt", message)
+        self.git("add", "-A")
+        self.git("commit", "-m", message)
+        return self.git("rev-parse", "HEAD").strip()
+
     def ident(self, rev="HEAD"):
         out = self.git("log", "-1", "--format=%an%x00%ae%x00%cn%x00%ce", rev)
         return out.rstrip("\n").split("\x00")
@@ -238,7 +248,7 @@ class GitIdentityTest(unittest.TestCase):
                             and v.get("email") == "committer@example.org"
                             for v in report["violations"]))
 
-    def test_exception_remote_allows_foreign_identity(self):
+    def test_exception_remote_allows_only_the_repo_local_identity(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")
         self.git("remote", "add", "upstream",
@@ -247,11 +257,17 @@ class GitIdentityTest(unittest.TestCase):
                "git_identity_exceptions": ["example-org/Cypraea"]}
         blocked = git_identity.check_push(CFG, repo=str(self.repo), base=base,
                                           head="HEAD", remote="upstream")
-        self.assertFalse(blocked["ok"])
+        self.assertFalse(blocked["ok"], blocked)
+        # The exception does not skip the metadata scan: only the repo's own
+        # configured pair may pass on that remote.
+        self.git("reset", "--hard", base)
+        self.local_commit("fork-owner")
         allowed = git_identity.check_push(cfg, repo=str(self.repo), base=base,
                                           head="HEAD", remote="upstream")
         self.assertTrue(allowed["ok"], allowed["messages"])
         self.assertEqual(allowed["exception"], "example-org/Cypraea")
+        self.assertEqual(allowed["exception_identity"]["email"],
+                         "fork.owner@example.org")
 
     def test_exception_is_exact_not_a_substring(self):
         """An entry must not exempt evil.example/fork-of-owner/repo."""
@@ -267,11 +283,12 @@ class GitIdentityTest(unittest.TestCase):
 
     def test_exception_matches_full_url_and_owner_repo(self):
         base = self.commit("base", "base.txt")
-        self.foreign_commit("foreign")
+        self.local_commit("fork-owner")
         self.git("remote", "add", "upstream",
                  "https://github.com/example-org/Cypraea.git")
         for entry in ("https://github.com/example-org/Cypraea",
                       "https://github.com/example-org/Cypraea.git",
+                      "git" "@github.com:example-org/Cypraea.git",
                       "example-org/Cypraea"):
             cfg = {"git_identity": dict(CFG["git_identity"]),
                    "git_identity_exceptions": [entry]}
@@ -279,15 +296,34 @@ class GitIdentityTest(unittest.TestCase):
                 cfg, repo=str(self.repo), base=base, head="HEAD",
                 remote="upstream")
             self.assertTrue(report["ok"], (entry, report["messages"]))
+            self.assertEqual(report["exception"], entry)
 
     def test_direct_url_push_cannot_borrow_a_configured_exception(self):
         base = self.commit("base", "base.txt")
-        self.foreign_commit("foreign")
+        self.local_commit("fork-owner")
         cfg = {"git_identity": dict(CFG["git_identity"]),
                "git_identity_exceptions": ["example-org/Cypraea"]}
+        # The destination is a different repository on the same host.
         report = git_identity.check_push(
             cfg, repo=str(self.repo), base=base, head="HEAD",
-            remote="https://github.com/example-org/Cypraea.git")
+            remote="https://github.com/attacker/Cypraea.git")
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exception"], "")
+
+    def test_direct_url_push_matches_only_an_exact_entry(self):
+        base = self.commit("base", "base.txt")
+        self.local_commit("fork-owner")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["example-org/Cypraea"]}
+        exact = "https://github.com/example-org/Cypraea.git"
+        report = git_identity.check_push(
+            cfg, repo=str(self.repo), base=base, head="HEAD", remote=exact)
+        self.assertTrue(report["ok"], report["messages"])
+        self.assertEqual(report["exception"], "example-org/Cypraea")
+        lookalike = "https://evil.example/example-org/Cypraea.git"
+        report = git_identity.check_push(
+            cfg, repo=str(self.repo), base=base, head="HEAD",
+            remote=lookalike)
         self.assertFalse(report["ok"], report)
         self.assertEqual(report["exception"], "")
 
@@ -321,6 +357,8 @@ class GitIdentityTest(unittest.TestCase):
         text = hook.read_text(encoding="utf-8")
         self.assertIn("CrewForeman pre-push gate (auto-installed)", text)
         self.assertIn("deepseek_mcp.git_identity", text)
+        # A CRLF refs stream must not leave a CR in the sha handed to git.
+        self.assertIn("tr -d '\\r'", text)
         # The installed hook must be able to import the package even when the
         # clone is not the connector checkout and the package is not installed.
         self.assertIn(str(REPO_ROOT), text)
@@ -343,6 +381,24 @@ class GitIdentityTest(unittest.TestCase):
         hook = self.repo / ".githooks" / "pre-push"
         self.assertTrue(hook.is_file())
         self.assertFalse((self.repo / ".git" / "hooks" / "pre-push").exists())
+
+    def test_checked_in_hook_is_not_clobbered_with_core_hooks_path(self):
+        hooks = self.repo / "scripts" / "hooks"
+        hooks.mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "scripts" / "hooks" / "pre-push",
+                     hooks / "pre-push")
+        self.commit("base", "base.txt")
+        self.git("config", "core.hooksPath", "scripts/hooks")
+        self.write("second.txt", "second")
+        self.git("add", "-A")
+        rc, _out, err = git_identity.commit_with_identity(
+            CFG, self.repo, "second")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.git("status", "--porcelain"), "",
+                         "the tracked checked-in hook must not be rewritten")
+        self.assertFalse((hooks / "pre-push.local").exists())
+        self.assertIn("checked-in copy",
+                      (hooks / "pre-push").read_text(encoding="utf-8"))
 
     def test_push_with_gate_blocks_foreign_then_allows_connector_identity(self):
         bare = self.root / "remote.git"
@@ -439,6 +495,21 @@ class GitIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(push.called)
 
+    def test_ship_push_rejects_no_verify_without_gating(self):
+        import importlib.util
+        script = (REPO_ROOT / "scripts" / "ship_push.py")
+        spec = importlib.util.spec_from_file_location("cf_ship_push_guard",
+                                                      script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.commit("base", "base.txt")
+        with mock.patch.object(git_identity, "push_with_gate") as push:
+            rc = module.main(["--repo", str(self.repo), "--remote", "origin",
+                              "--refspec", "main:main", "--extra-arg",
+                              "--no-verify"])
+        self.assertEqual(rc, 2)
+        self.assertFalse(push.called)
+
     def test_commit_message_trailer_identity_is_scanned(self):
         base = self.commit("base", "base.txt")
         self.write("trailer.txt", "x")
@@ -458,17 +529,43 @@ class GitIdentityTest(unittest.TestCase):
     def test_checked_in_hook_blocks_and_allows(self):
         hook = REPO_ROOT / "scripts" / "hooks" / "pre-push"
         self.assertTrue(hook.is_file())
+        self.assertIn("tr -d '\\r'", hook.read_text(encoding="utf-8"))
         base = self.commit("base", "base.txt")
         self.git("remote", "add", "origin",
                  "https://github.com/example-org/crewforeman-mcp.git")
         self.foreign_commit("foreign")
         refs = "refs/heads/main HEAD refs/heads/main %s\n" % base
+        # Feed CRLF on every platform: Windows text-mode stdin may add CRs,
+        # and a trailing CR in remote_sha used to corrupt the gate range.
+        crlf_refs = refs.replace("\n", "\r\n")
+        proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
+                              cwd=str(self.repo), input=crlf_refs, text=True,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("allowlist", proc.stdout)
+        self.assertNotIn("ambiguous argument", proc.stdout)
+        self.git("reset", "--hard", base)
+        self.commit("mine", "mine.txt")
+        proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
+                              cwd=str(self.repo), input=crlf_refs, text=True,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("sh"), "sh is required")
+    def test_installed_hook_handles_crlf_refs(self):
+        base = self.commit("base", "base.txt")
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        self.assertTrue(hook.is_file())
+        self.foreign_commit("foreign")
+        refs = "refs/heads/main HEAD refs/heads/main %s\r\n" % base
         proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
                               cwd=str(self.repo), input=refs, text=True,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT)
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("allowlist", proc.stdout)
+        self.assertNotIn("ambiguous argument", proc.stdout)
         self.git("reset", "--hard", base)
         self.commit("mine", "mine.txt")
         proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
@@ -496,7 +593,7 @@ class GitIdentityTest(unittest.TestCase):
     def test_config_object_exception_is_honoured(self):
         """The connector passes a Config hybrid, not a plain dict."""
         base = self.commit("base", "base.txt")
-        self.foreign_commit("foreign")
+        self.local_commit("fork-owner")
         self.git("remote", "add", "upstream",
                  "https://github.com/example-org/Cypraea.git")
         cfg = config_mod.Config({
@@ -512,13 +609,17 @@ class GitIdentityTest(unittest.TestCase):
         base = self.commit("base", "base.txt")
         self.git("remote", "add", "upstream",
                  "https://github.com/example-org/Cypraea.git")
-        self.commit("secret", "notes.txt",
-                    "api_" + "key = " + chr(34) + "sk-"
-                    + "abcdefghijklmnopqrstuvwxyz012345" + chr(34) + "\n")
+        self.local_commit("fork-owner")
+        self.write("notes.txt",
+                   "api_" + "key = " + chr(34) + "sk-"
+                   + "abcdefghijklmnopqrstuvwxyz012345" + chr(34) + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-m", "secret")
         cfg = {"git_identity": dict(CFG["git_identity"]),
-               "git_identity_exceptions": ["upstream"]}
+               "git_identity_exceptions": ["example-org/Cypraea"]}
         report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
                                          head="HEAD", remote="upstream")
+        self.assertEqual(report["exception"], "example-org/Cypraea")
         self.assertFalse(report["ok"], "an exception must not skip content")
         self.assertIn("api_key", {v.get("rule")
                                   for v in report["violations"]})
@@ -586,7 +687,7 @@ class GitIdentityTest(unittest.TestCase):
 
     def test_cli_reads_config_object_and_allows_exception_remote(self):
         base = self.commit("base", "base.txt")
-        self.foreign_commit("foreign")
+        self.local_commit("fork-owner")
         self.git("remote", "add", "upstream",
                  "https://github.com/example-org/Cypraea.git")
         cfg_path = self.root / "config.json"

@@ -115,6 +115,24 @@ class ConnectorCommitIdentityTests(unittest.TestCase):
         self.assertTrue(violations, "foreign author must be a violation")
         self.assertIn(FOREIGN, json.dumps(violations))
 
+    def test_metadata_gate_pairs_name_and_email(self):
+        """A globally allowed address with a foreign name is still blocked."""
+        self.assertEqual(git_identity.commit_with_identity(
+            self._cfg(), self.repo, "first")[0], 0)
+        base = _run([GIT, "rev-parse", "HEAD"], self.repo,
+                    self.env).stdout.strip()
+        (self.repo / "e.txt").write_text("five\n", encoding="utf-8")
+        _run([GIT, "add", "-A"], self.repo, self.env)
+        _run([GIT, "-c", "user.name=Global Person", "-c",
+              "user.email=noreply@example.com", "commit", "-q", "-m",
+              "name-only leak"], self.repo, self.env)
+        violations = git_identity.scan_metadata(
+            self.repo, base, "HEAD", self._cfg())
+        self.assertTrue(any(v.get("field") == "name"
+                            for v in violations), violations)
+        self.assertFalse(any(v.get("field") == "email"
+                             for v in violations), violations)
+
     def test_pipeline_no_longer_hardcodes_an_identity(self):
         source = (Path(__file__).resolve().parent.parent / "deepseek_mcp"
                   / "pipeline.py").read_text(encoding="utf-8")
