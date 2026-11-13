@@ -155,11 +155,15 @@ TOOLS = [
                 "Use 0 for one agent. Explicit values are kept exactly up to the configurable hard "
                 "maximum max_explicit_subagents (default 32).")},
             "builder_model": {"type": "string", "description": (
-                "Builder model id for this job. Empty inherits builder_model "
+                "Builder model id for this job (for example "
+                "'xiaomi/mimo-v2.6-pro' with builder_provider 'mimo' for "
+                "MiMo Code). Empty inherits builder_model "
                 "config, then dsh_model, then deepseek-flash.")},
             "builder_provider": {"type": "string", "description": (
                 "Provider name for the builder model (built-in deepseek-official "
-                "or a providers[] entry). Empty inherits builder_provider config, "
+                "or a providers[] entry; for example 'mimo' for MiMo Code, "
+                "used with builder_model 'xiaomi/mimo-v2.6-pro'). Empty "
+                "inherits builder_provider config, "
                 "then dsh_provider.")},
             "slice_models": {"type": "object", "description": (
                 "Optional slice-name -> 'provider/model' (or object with provider "
@@ -170,12 +174,20 @@ TOOLS = [
                 "candidates; the connector scores them and applies the winner. "
                 "Capped by model_candidates_max.")},
             "reviewer_model": {"type": "string", "description": (
-                "Optional per-job reviewer model id. The connector routes it "
+                "Optional per-job reviewer model id (for example "
+                "'xiaomi/mimo-v2.6-pro' with reviewer_provider 'mimo' for "
+                "MiMo Code). The connector routes it "
                 "through a generated overlay; existing dsh_bin wrappers remain "
                 "the legacy path.")},
             "reviewer_provider": {"type": "string", "description": (
                 "Optional per-job reviewer provider name, used with "
-                "reviewer_model.")},
+                "reviewer_model (for example 'mimo' for MiMo Code, "
+                "with reviewer_model 'xiaomi/mimo-v2.6-pro').")},
+            "mimo_variant": {"type": "string", "description": (
+                "Optional MiMo Code variant for MiMo workers, passed to "
+                "`mimo run --variant <v>` (for example alongside provider "
+                "'mimo' and model 'xiaomi/mimo-v2.6-pro'). Empty inherits "
+                "mimo_variant config.")},
             "mode": {"type": "string", "enum": ["standard", "crosscheck"],
                      "description": (
                          "Job mode. `crosscheck` runs the opt-in crew build/"
@@ -202,6 +214,18 @@ TOOLS = [
                                           "Initial build/check plus focused fix rounds; "
                                           "then status crosscheck_below_threshold "
                                           "(default 3).")},
+            "crosscheck_crew_provider": {"type": "string", "description": (
+                "Provider name for the crosscheck checker crew, so the checker "
+                "is a different vendor than the builder (for example 'mimo' "
+                "for MiMo Code, with crosscheck_crew_model "
+                "'xiaomi/mimo-v2.6-pro'). Empty inherits "
+                "crosscheck_crew_provider config, then auto-selects a vendor "
+                "different from the builder.")},
+            "crosscheck_crew_model": {"type": "string", "description": (
+                "Model id for the crosscheck checker crew (for example "
+                "'xiaomi/mimo-v2.6-pro' for MiMo Code, with "
+                "crosscheck_crew_provider 'mimo'). Empty inherits "
+                "crosscheck_crew_model config, then the crew vendor default.")},
             "audit_review": {"type": "boolean", "description": (
                 "One-shot audit by the normally configured reviewer after a passing "
                 "crew gate (default on in crosscheck mode).")},
