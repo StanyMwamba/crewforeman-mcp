@@ -34,6 +34,16 @@ except Exception:  # pragma: no cover - api always exists in the package
     def redact_secrets(text):
         return str(text or "")
 
+try:  # Same-package pure helpers for crew vendor selection (3.15.0).
+    from . import model_policy as _model_policy
+except Exception:  # pragma: no cover - broken install only
+    _model_policy = None
+
+try:
+    from . import reviewer_vendor as _reviewer_vendor
+except Exception:  # pragma: no cover - broken install only
+    _reviewer_vendor = None
+
 
 VERSION = 1
 CROSSCHECK_FILE = "CROSSCHECK.json"
@@ -71,6 +81,19 @@ class CrosscheckConfigError(CrosscheckError):
 
 class CrosscheckPlanError(CrosscheckError):
     code = "crosscheck_plan_invalid"
+
+
+class CrosscheckCrewVendorConflict(CrosscheckError):
+    """The explicit checker crew is the builder's own vendor.
+
+    "The checker crew is a different vendor" is enforced, not advisory.
+    """
+
+    code = "crosscheck_crew_same_vendor"
+
+    def __init__(self, reason="crosscheck_crew_same_vendor"):
+        self.reason = str(reason or "crosscheck_crew_same_vendor")
+        super().__init__(self.reason)
 
 
 def _cfg(cfg, key, default=None):
@@ -297,6 +320,251 @@ def split_subagents(total, crews):
     extra = total % crews
     sizes = [base + (1 if index < extra else 0) for index in range(crews)]
     return sizes
+
+
+# ---------------------------------------------------------------------------
+# crosscheck crew vendor selection (3.15.0, roles & routing)
+
+
+def _crew_text(value, limit=200):
+    if value is None:
+        return ""
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception:
+        return ""
+    text = text.replace("\x00", "").strip()
+    return text[:limit] if len(text) > limit else text
+
+
+def _crew_canonical(value):
+    """Canonical vendor for a vendor/provider/model value, or ``None``."""
+    text = _crew_text(value, 200)
+    if not text:
+        return None
+    if _reviewer_vendor is None:
+        return None
+    try:
+        return _reviewer_vendor.canonical_vendor(text)
+    except Exception:
+        return None
+
+
+def _crew_vendor_of(provider, model):
+    return (_crew_canonical(provider) or _crew_canonical(model) or "unknown")
+
+
+def _field(target, key):
+    if target is None:
+        return ""
+    if isinstance(target, dict):
+        return _crew_text(target.get(key))
+    return _crew_text(getattr(target, key, ""))
+
+
+def _target_vendor(target):
+    """Return the builder target's canonical vendor, else ``"unknown"``."""
+    if target is None:
+        return "unknown"
+    if isinstance(target, str):
+        found = _crew_canonical(target)
+        if found:
+            return found
+        for half in target.split("/", 1):
+            found = _crew_canonical(half)
+            if found:
+                return found
+        return "unknown"
+    if isinstance(target, (tuple, list)) and len(target) >= 2:
+        target = {"provider": target[0], "model": target[1]}
+    explicit = _field(target, "vendor")
+    if explicit:
+        # An explicit unknown vendor is never promoted to a guess.
+        return _crew_canonical(explicit) or "unknown"
+    for key in ("provider", "model"):
+        found = _crew_canonical(_field(target, key))
+        if found:
+            return found
+    return "unknown"
+
+
+def _configured_provider_entries(cfg):
+    """Bounded scan of ``providers[]`` for crew routing (defensive read)."""
+    listed = _cfg(cfg, "providers", [])
+    entries = []
+    if not isinstance(listed, list):
+        return entries
+    for raw in listed[:16]:
+        if not isinstance(raw, dict):
+            continue
+        name = _crew_text(raw.get("name") or raw.get("provider") or raw.get("id"), 64)
+        models_raw = raw.get("models")
+        if isinstance(models_raw, str):
+            models_raw = [models_raw]
+        if not isinstance(models_raw, list):
+            models_raw = []
+        models = []
+        for item in models_raw[:16]:
+            if isinstance(item, dict):
+                item = item.get("id") or item.get("name") or item.get("model")
+            text = _crew_text(item, 128)
+            if text and text not in models:
+                models.append(text)
+        if not models and raw.get("model"):
+            text = _crew_text(raw.get("model"), 128)
+            if text:
+                models.append(text)
+        vendor = (_crew_canonical(raw.get("vendor"))
+                  or _crew_canonical(name)
+                  or "unknown")
+        if vendor == "unknown":
+            for item in models:
+                found = _crew_canonical(item)
+                if found:
+                    vendor = found
+                    break
+        entries.append({"name": name, "vendor": vendor, "models": models})
+    return entries
+
+
+def _mimo_defaults(cfg):
+    model = _crew_text(_cfg(cfg, "mimo_default_model", ""), 128)
+    return (_model_policy.MIMO_PROVIDER,
+            model or _model_policy.DEFAULT_MIMO_MODEL)
+
+
+def _deepseek_defaults(cfg):
+    provider = _crew_text(_cfg(cfg, "dsh_provider", ""), 64)
+    model = _crew_text(_cfg(cfg, "dsh_model", ""), 128)
+    provider = provider or _model_policy.DEFAULT_PROVIDER
+    model = model or _model_policy.DEFAULT_MODEL
+    if _crew_vendor_of(provider, model) != "DeepSeek":
+        return _model_policy.DEFAULT_PROVIDER, _model_policy.DEFAULT_MODEL
+    return provider, model
+
+
+def _first_different_crew(cfg, builder_vendor):
+    """First configured/different known vendor, else a builtin default."""
+    for entry in _configured_provider_entries(cfg):
+        if not entry["name"] or not entry["models"]:
+            continue
+        if entry["vendor"] in ("unknown", builder_vendor):
+            continue
+        return entry["name"], entry["models"][0]
+    for provider, model in (_deepseek_defaults(cfg), _mimo_defaults(cfg)):
+        if _crew_vendor_of(provider, model) != builder_vendor:
+            return provider, model
+    return _mimo_defaults(cfg)
+
+
+def _default_model_for(cfg, provider):
+    vendor = _crew_canonical(provider)
+    if vendor == _model_policy.MIMO_VENDOR:
+        model = _crew_text(_cfg(cfg, "mimo_default_model", ""), 128)
+        return model or _model_policy.DEFAULT_MIMO_MODEL
+    if provider == _model_policy.DEFAULT_PROVIDER or vendor == "DeepSeek":
+        model = _crew_text(_cfg(cfg, "dsh_model", ""), 128)
+        return model or _model_policy.DEFAULT_MODEL
+    for entry in _configured_provider_entries(cfg):
+        if entry["name"] == provider and entry["models"]:
+            return entry["models"][0]
+    return ""
+
+
+def _default_provider_for(cfg, model):
+    vendor = _crew_canonical(model)
+    if vendor == _model_policy.MIMO_VENDOR:
+        return _model_policy.MIMO_PROVIDER
+    if vendor == "DeepSeek":
+        return _model_policy.DEFAULT_PROVIDER
+    if vendor and _reviewer_vendor is not None:
+        provider = getattr(_reviewer_vendor, "_PROVIDERS", {}).get(vendor, "")
+        if provider:
+            return provider
+    matches = [entry["name"] for entry in _configured_provider_entries(cfg)
+               if model in entry["models"] and entry["name"]]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _validate_crew_pair(provider, model):
+    """Validate provider/model with model_policy's exact pair rules."""
+    if _model_policy is not None:
+        validate = getattr(_model_policy, "_validate_pair", None)
+        if callable(validate):
+            try:
+                validate(provider, model)
+            except Exception as exc:
+                raise CrosscheckConfigError(
+                    _crew_text(exc) or "invalid crosscheck_crew_provider/model")
+            return provider, model
+    model_re = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    provider_re = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    if (not model_re.match(model) or "=" in model or ";" in model
+            or model.startswith("-")):
+        raise CrosscheckConfigError("crosscheck_crew_model is invalid")
+    if not provider_re.match(provider) or "=" in provider or ";" in provider:
+        raise CrosscheckConfigError("crosscheck_crew_provider is invalid")
+    return provider, model
+
+
+def select_crew_target(cfg, args, builder_target=None):
+    """Pick the crosscheck checker-crew provider/model (3.15 contract).
+
+    Returns ``{"provider", "model", "vendor", "builder_vendor",
+    "different_vendor", "source"}``.  Explicit
+    ``crosscheck_crew_provider``/``crosscheck_crew_model`` tool args win over
+    the same config keys (source ``"explicit"``); the pair is validated with
+    model_policy's rules.  Auto (source ``"auto"``) picks a vendor different
+    from the builder's: Xiaomi (MiMo) with ``xiaomi/mimo-v2.6-pro`` for a
+    DeepSeek builder, the model-policy DeepSeek defaults for a MiMo builder,
+    else the first configured/different known vendor.  An explicit choice from
+    the builder's own vendor raises :class:`CrosscheckCrewVendorConflict`.
+    Pure function: no I/O, no network.
+    """
+    if _model_policy is None or _reviewer_vendor is None:
+        raise CrosscheckConfigError("crosscheck crew routing is unavailable")
+    args = args or {}
+    provider = (_crew_text(args.get("crosscheck_crew_provider"), 64)
+                or _crew_text(_cfg(cfg, "crosscheck_crew_provider", ""), 64))
+    model = (_crew_text(args.get("crosscheck_crew_model"), 128)
+             or _crew_text(_cfg(cfg, "crosscheck_crew_model", ""), 128))
+    builder_vendor = _target_vendor(builder_target)
+    if provider or model:
+        if not model:
+            model = _default_model_for(cfg, provider)
+        if not model:
+            raise CrosscheckConfigError("crosscheck_crew_model is empty")
+        if not provider:
+            provider = _default_provider_for(cfg, model)
+        if not provider:
+            raise CrosscheckConfigError("crosscheck_crew_provider is empty")
+        provider, model = _validate_crew_pair(provider, model)
+        vendor = _crew_vendor_of(provider, model)
+        if (builder_vendor != "unknown" and vendor != "unknown"
+                and vendor == builder_vendor):
+            raise CrosscheckCrewVendorConflict()
+        return {
+            "provider": provider,
+            "model": model,
+            "vendor": vendor,
+            "builder_vendor": builder_vendor,
+            "different_vendor": vendor != builder_vendor,
+            "source": "explicit",
+        }
+    if builder_vendor == "DeepSeek":
+        provider, model = _mimo_defaults(cfg)
+    elif builder_vendor == _model_policy.MIMO_VENDOR:
+        provider, model = _deepseek_defaults(cfg)
+    else:
+        provider, model = _first_different_crew(cfg, builder_vendor)
+    return {
+        "provider": provider,
+        "model": model,
+        "vendor": _crew_vendor_of(provider, model),
+        "builder_vendor": builder_vendor,
+        "different_vendor": True,
+        "source": "auto",
+    }
 
 
 # ---------------------------------------------------------------------------
