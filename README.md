@@ -11,6 +11,8 @@ CrewForeman 3.15.0 is a local stdio MCP server. It runs Harness on your machine,
 
 **Using a reviewer from a different vendor means a model never grades its own work.**
 Use a reviewer from any vendor - see [docs/REVIEWER.md](docs/REVIEWER.md).
+MiMo Code (`mimo`, v0.1.17) is a second-vendor worker: builder, independent reviewer or crosscheck crew - see [docs/TEAMS.md](docs/TEAMS.md).
+Permissions, concurrency and per-vendor cost for MiMo runs are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 The lead sizes the team and merges the best candidates - see [docs/TEAMS.md](docs/TEAMS.md).
 Opt-in `mode="crosscheck"` builds independent parts with one crew and cross-checks each part with another; the connector scores the gate - see [docs/CROSSCHECK.md](docs/CROSSCHECK.md).

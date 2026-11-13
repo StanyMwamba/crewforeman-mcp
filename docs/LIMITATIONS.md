@@ -87,6 +87,27 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
   best-effort against the beta client whose desktop-entry name varies; use the
   explicit command override when resolution fails.
 
+## MiMo worker (3.15.0)
+
+- **Real `mimo` is never exercised in CI.** The suite drives fake `mimo`
+  programs only (recorded JSONL event streams, auth/limit/network errors,
+  slow and silent runs, serve/attach) on macOS, Ubuntu and Windows under
+  Python 3.9 and 3.15. A real `mimo` v0.1.17 behaviour that differs from
+  the recorded contract - event schema, flags, serve URL, health endpoint -
+  is not proven by CI and needs an adapter update first.
+- **Serve/attach protocol assumptions.** `mimo serve` is assumed to expose
+  a `/healthz` ready check and `mimo run --attach <url>` to speak the same
+  JSONL event stream as a direct run; the server lifecycle (start, ready
+  check, stop, cleanup on crash) is built on that v0.1.17 contract.
+- **`mimocode.jsonc` is MiMo's permission system, not an OS sandbox.** The
+  per-run file scopes what the MiMo worker may do inside its own rules; the
+  OS file-write boundary (Seatbelt / Landlock / restricted token) is a
+  separate layer described under Platform boundaries. The skip-permissions
+  opt-in disables even the MiMo-side checks and is dangerous.
+- **Unknown MiMo prices stay unknown.** A model with no `mimo_prices` row
+  and no built-in price records `cost_known=false` and a `null` cost; it is
+  never zero-filled.
+
 | Area | Limitation | Behaviour / workaround |
 | --- | --- | --- |
 | Packaging | `pip install .` uses a small in-tree PEP 517 backend so it works offline; that backend does not implement editable installs (PEP 660). | Install into a venv with `pip install .`, or run `python -m deepseek_mcp` from the repository root for a source-linked development loop. |

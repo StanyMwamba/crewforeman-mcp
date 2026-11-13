@@ -90,6 +90,27 @@ Resume the paused job with `resume_deepseek` and the `option` shown by
 runs the paid review; it does not rerun the builder. Declining returns
 `ok_unreviewed` with `review_declined_by_user=true` and no invented score.
 
+## MiMo as reviewer (new in 3.15.0)
+
+MiMo Code (`mimo`, v0.1.17) is an independent-reviewer candidate like any
+other vendor. Set `reviewer_provider: "mimo"` with
+`reviewer_model: "xiaomi/mimo-v2.6-pro"` (or add a `reviewers[]` entry with
+`"vendor": "Xiaomi (MiMo)"`), and the connector runs the `READY` preflight
+ping and the paid review through the MiMo adapter. Against DeepSeek
+builders the MiMo reviewer is cross-vendor, so the same-vendor question
+does not arise; against MiMo builders pick a DeepSeek or other-vendor
+reviewer instead, and the same fail-closed rule applies.
+
+A MiMo reviewer runs under the `read-only` per-run `mimocode.jsonc`
+preset: reads, `glob`/`grep`/`list` and non-mutating `bash` are allowed
+while `edit` and mutating commands are denied, so the reviewer cannot
+grade its own writes. Auth failures name the remedy
+(`mimo providers login` for the `xiaomi` provider, or the provider key
+variable); limit and network failures carry the same vendor-correct text
+as builder runs. MiMo is also accepted as the backup reviewer target when
+the primary reviewer's service fails, and the quota-error attribution
+names `Xiaomi (MiMo)`, never DeepSeek.
+
 ## Resumable reviews
 
 A review writes `REVIEW.partial.md` and `REVIEW.partial.json` while it runs. The reviewer emits structured `@@REVIEW_PROGRESS@@` checkpoint lines, and the connector parses and saves them, along with completed areas and test reruns. After an interruption, `resume_deepseek` resumes from that checkpoint: the reviewer checks the remaining areas, and carried findings are merged under their original blocking or non-blocking heading.

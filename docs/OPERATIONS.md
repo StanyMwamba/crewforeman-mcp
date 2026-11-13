@@ -1484,3 +1484,76 @@ range rule for each pushed ref: the advertised destination sha from git's
 stdin when supplied, and the full pushed history (bounded by
 `git_identity_max_scan_commits`) when the destination ref is new or unknown.
 They scan metadata and content and exit non-zero on any violation.
+
+## 3.15.0 MiMo worker options
+
+MiMo Code (`mimo`, v0.1.17) is the second-vendor worker; these keys control
+its permissions, concurrency and cost. All of them are additive: without
+them every job keeps the 3.14.3 behaviour byte-for-byte.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mimo_bin` | `mimo` | MiMo executable; `MIMO_BIN` / `DSH_MIMO_BIN` / `DEEPSEEK_MIMO_BIN` |
+| `mimo_default_model` | `xiaomi/mimo-v2.6-pro` | Build/review/crosscheck model; `MIMO_MODEL` / `DSH_MIMO_MODEL` |
+| `mimo_probe_model` | `xiaomi/mimo-v2.6-flash` | Probe and readiness-ping model; `MIMO_PROBE_MODEL` |
+| `mimo_variant` | empty | Optional `--variant` value; `MIMO_VARIANT` |
+| `mimo_skip_permissions` | `false` | Dangerous opt-in (see below); `DSH_MIMO_SKIP_PERMISSIONS` |
+| `mimo_sandbox` | empty | Force a preset; empty means the per-role default; `DSH_MIMO_SANDBOX` |
+| `mimo_max_concurrent_agents` | `0` | `0` auto-detects; `DSH_MIMO_MAX_CONCURRENT_AGENTS` |
+| `mimo_use_serve` | `false` | Share one serve/attach server; `DSH_MIMO_USE_SERVE` |
+| `mimo_serve_host` / `mimo_serve_port` | `127.0.0.1` / `0` | Serve listener; `DSH_MIMO_SERVE_HOST` / `DSH_MIMO_SERVE_PORT` |
+| `mimo_prices` | `{}` | Per-model USD/1M price rows; `DSH_MIMO_PRICES` (JSON) |
+| `crosscheck_crew_provider` | empty | Checker-crew provider; `DSH_CROSSCHECK_CREW_PROVIDER` |
+| `crosscheck_crew_model` | empty | Checker-crew model; `DSH_CROSSCHECK_CREW_MODEL` |
+
+### Permissions: the per-run `mimocode.jsonc`
+
+CrewForeman never passes the skip-permissions flag (and never the yolo
+alias) by default. Each MiMo child runs under a per-run `mimocode.jsonc`
+written into its workspace - never the user's global
+`~/.config/mimocode/mimocode.jsonc` - with `permission` globs mapped from
+the sandbox presets:
+
+- **`read-only`** (reviewers, audits, probes): `read`/`glob`/`grep`/`list`
+  allowed, `edit` denied, `bash` a deny-map that allows only non-mutating
+  commands (`ls*`, `cat*`, `git status*`, `git log*`, `git diff*`, `find*`,
+  `wc*`, `head*`, `tail*`, `grep*`, `pwd`, `which*`). A read-only reviewer
+  cannot edit files or run mutating commands.
+- **`workspace-write`** (builders, crosscheck crews, finishers): edit
+  allowed, `bash` allowed with deny rules for `git push*`, `gh *`,
+  `git config --global*`, `sudo *`, `rm -rf /*` and the skip-permissions
+  and yolo flags themselves; `external_directory` allows only the
+  workspace.
+- **`danger-full-access`**: everything allowed; documented opt-in only.
+
+`mimo_sandbox` forces one preset; otherwise reviewer/audit/probe roles get
+`read-only` and builder/crosscheck/finisher roles get `workspace-write`.
+`mimo_skip_permissions` is the **only** path to
+`--dangerously-skip-permissions` (env `DSH_MIMO_SKIP_PERMISSIONS` /
+`DEEPSEEK_MIMO_SKIP_PERMISSIONS`), and it is dangerous: it disables MiMo's
+permission checks entirely. Leave it `false` unless you accept that risk.
+
+### Concurrency detection and limit backoff
+
+The MiMo child ceiling is `workflow.maxConcurrentAgents` read (never
+written) from the global `~/.config/mimocode/mimocode.jsonc` and the
+project `mimocode.jsonc`. When neither sets it, MiMo's documented default
+is `min(16, 2 x CPU cores)`; the effective limit is the **maximum** of the
+values found (global, project, built-in default), and an explicit
+`mimo_max_concurrent_agents` overrides all of them. Detection caches under
+the state directory - never in `~/.config` - and a limit or 429 error
+records a backoff event there and suggests a reduced concurrency (for
+example `limit // 2`), which the caller records in the run.
+
+### Prices and the per-vendor split
+
+Every phase records input, cache-read, output and reasoning tokens plus
+estimated USD per vendor and model. Built-in MiMo prices (USD per 1M
+tokens): `mimo-v2.6-pro` input 0.435, cache hit 0.0036, output 0.87;
+`mimo-v2.6-flash` input 0.14, output 0.28 (reasoning tokens count as
+output unless a price says otherwise). `mimo_prices` overrides any model
+with `{"<model>": {"input": F, "cache_hit": F, "output": F}}`. A model
+with no price row keeps `cost_known=false` and a `null` cost - unknown
+cost is never zero-filled. Run records gain `model_usage.by_vendor`, and
+job status and the spend/waste reports show the per-vendor split, so MiMo
+and DeepSeek spend are visible side by side.

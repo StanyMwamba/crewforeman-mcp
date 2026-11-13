@@ -12,6 +12,7 @@ Placeholders in the snippets:
 - `YOUR_DEEPSEEK_API_KEY` - the default DeepSeek key placeholder.
 - `YOUR_ANTHROPIC_API_KEY`, `YOUR_MOONSHOT_API_KEY` (or `YOUR_KIMI_API_KEY`) -
   optional, only for those vendors.
+- `YOUR_MIMO_API_KEY`, `MIMO_BIN` - optional, only for MiMo Code workers.
 
 3.15.0 looks each key up by variable **name**: first the connector's process
 environment is checked, then the Harness credentials file
@@ -71,8 +72,8 @@ is required for a local server.
 }
 ```
 
-**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
-`MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
+**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY`,
+`MOONSHOT_API_KEY` or `MIMO_API_KEY` only for the vendors a job uses. Harness users can omit these
 entries because 3.15.0 reads the names from the Harness credentials file.
 
 **Confirm.** Open **Customize** in the sidebar and check the `crewforeman-mcp`
@@ -105,8 +106,8 @@ than constructing one. `type: "stdio"` is required.
 }
 ```
 
-**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
-`MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
+**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY`,
+`MOONSHOT_API_KEY` or `MIMO_API_KEY` only for the vendors a job uses. Harness users can omit these
 entries because 3.15.0 reads the names from the Harness credentials file.
 
 **Confirm.** Run **MCP: List Servers**: the server appears with start, restart
@@ -143,8 +144,8 @@ file if it does not exist. Use a top-level `mcpServers` object.
 }
 ```
 
-**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY` or
-`MOONSHOT_API_KEY` only if those vendors are used. Harness users can omit these
+**Env.** Put `DEEPSEEK_API_KEY` in the `env` object; add `ANTHROPIC_API_KEY`,
+`MOONSHOT_API_KEY` or `MIMO_API_KEY` only for the vendors a job uses. Harness users can omit these
 entries because 3.15.0 reads the names from the Harness credentials file.
 
 **Confirm.** Fully quit and reopen Claude Desktop, then click the **+** button
@@ -191,7 +192,8 @@ after it is passed to the server. Keep at least one other option between
 ```
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `env` object (or pass `--env`); add
-`ANTHROPIC_API_KEY` or `MOONSHOT_API_KEY` only if those vendors are used.
+`ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY` or `MIMO_API_KEY` only for the
+vendors a job uses.
 Harness users can omit these entries because 3.15.0 reads the names from the
 Harness credentials file. Claude Code also expands `${VAR}` in `.mcp.json`, so
 `${DEEPSEEK_API_KEY}` is an alternative to the literal placeholder.
@@ -233,7 +235,8 @@ codex mcp add crewforeman-mcp \
 ```
 
 **Env.** Put `DEEPSEEK_API_KEY` in the `.env` table (or pass `--env`); add
-`ANTHROPIC_API_KEY` or `MOONSHOT_API_KEY` only if those vendors are used.
+`ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY` or `MIMO_API_KEY` only for the
+vendors a job uses.
 Harness users can omit these entries because 3.15.0 reads the names from the
 Harness credentials file. `env_vars = ["DEEPSEEK_API_KEY"]` forwards a variable
 from Codex's own environment instead of writing a literal value.
@@ -272,6 +275,48 @@ Equivalent command line:
 ```bash
 DEEPSEEK_API_KEY=YOUR_DEEPSEEK_API_KEY /path/to/crewforeman-mcp
 ```
+
+## MiMo Code worker
+
+A client that runs MiMo Code jobs needs no extra server: the same
+`crewforeman-mcp` process drives `mimo` as a second-vendor builder,
+reviewer, crosscheck crew or backup.
+
+**Config.** Install MiMo Code separately and log its `xiaomi` provider in
+with `mimo providers login`. Then set the worker's environment in the same
+`env` block that carries the other keys: `MIMO_BIN` (or the `mimo_bin`
+config key) names the binary, `MIMO_API_KEY` names a key variable when the
+provider credential is not already stored by `mimo providers login`, and
+`DSH_MIMO_SKIP_PERMISSIONS` is the dangerous, documented opt-in that is
+normally left unset. The connector writes a per-run `mimocode.jsonc` for
+every MiMo child, so a client never configures MiMo permissions by hand.
+
+```json
+{
+  "mcpServers": {
+    "crewforeman-mcp": {
+      "command": "/path/to/crewforeman-mcp",
+      "env": {
+        "DEEPSEEK_API_KEY": "YOUR_DEEPSEEK_API_KEY",
+        "MIMO_BIN": "mimo",
+        "MIMO_API_KEY": "YOUR_MIMO_API_KEY"
+      }
+    }
+  }
+}
+```
+
+**Confirm.** Send a small `harness_deepseek` job with
+`"builder_provider": "mimo"`; the run record names the MiMo model and the
+per-vendor cost split. Setup details are in [INSTALL.md](INSTALL.md);
+routing, permissions, concurrency and cost are in
+[OPERATIONS.md](OPERATIONS.md).
+
+**Pitfall.** `mimo` must be on the PATH the client gives the server
+process (or named by `MIMO_BIN` as an absolute path); a login done in one
+shell is not visible to a client that starts the server elsewhere. Harness
+users can omit `MIMO_API_KEY` because 3.15.0 reads key names from the
+Harness credentials file.
 
 ## Verify without a client
 

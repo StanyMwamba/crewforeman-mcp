@@ -101,6 +101,11 @@ unchanged; an explicit declaration always wins over inference. A per-job
 `auto_parallel=false` keeps the job serial, but it still starts when no
 same-repository peer is running.
 
+MiMo children are not sized by the Harness probe: their ceiling is
+`workflow.maxConcurrentAgents` from the mimocode configuration (else
+`min(16, 2 x CPU cores)`), with limit backoff recorded - see
+[OPERATIONS.md](OPERATIONS.md).
+
 ## Troubleshooting
 
 - Job stayed serial: inspect `pipeline.unavailable_reason` or

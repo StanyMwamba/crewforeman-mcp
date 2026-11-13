@@ -199,6 +199,8 @@ record, checkpoint or trace, and the generated provider/model overlay carries
 - `MOONSHOT_API_KEY` - Kimi/Moonshot; some setups name it `KIMI_API_KEY`.
   Use whichever name your provider entry puts in `api_key_env`.
 - `OPENAI_API_KEY` - OpenAI models.
+- `MIMO_API_KEY` - the MiMo Code `xiaomi` provider when its key is not
+  already stored by `mimo providers login`.
 
 Add only the variables for vendors you actually use. If you run jobs through
 the Harness, its credentials file normally already holds them, so you can
@@ -364,6 +366,49 @@ reviewer wrapper, `reviewer_vendor`/`reviewer_model` label it, and
 `backup_dsh_bin` is the second candidate. A non-empty `reviewers` list makes
 those legacy fields ignored, so move an existing wrapper into a `reviewers[]`
 entry (or keep `reviewers` empty) when migrating.
+
+## MiMo worker setup
+
+MiMo Code (`mimo`, v0.1.17) is a second-vendor worker: it can be the builder,
+the independent reviewer, a crosscheck crew or a backup when DeepSeek is
+quarantined or failing. Install MiMo Code separately (it is not bundled with
+this package), then log its `xiaomi` provider in:
+
+```sh
+mimo providers login
+```
+
+That stores the provider credential inside MiMo's own configuration. If you
+prefer a key in the environment instead, name the variable in the provider
+entry's `api_key_env` (for example `MIMO_API_KEY`); the connector resolves
+the **name** like every other provider key and never copies the value into a
+run record.
+
+Point CrewForeman at the binary with `mimo_bin`, or with `MIMO_BIN` /
+`DSH_MIMO_BIN` / `DEEPSEEK_MIMO_BIN` in the environment; the default is
+`mimo` on `PATH`. The build/review/crosscheck model defaults to
+`xiaomi/mimo-v2.6-pro` and the probe model to `xiaomi/mimo-v2.6-flash`
+(`mimo_default_model` / `mimo_probe_model`). Routes are chosen per seat:
+`builder_provider` / `reviewer_provider` set to `mimo` send that phase to
+MiMo, and `crosscheck_crew_provider` / `crosscheck_crew_model` choose the
+crosscheck checker crew (see [TEAMS.md](TEAMS.md),
+[REVIEWER.md](REVIEWER.md) and [CROSSCHECK.md](CROSSCHECK.md)).
+
+```json
+{
+  "mimo_bin": "mimo",
+  "mimo_default_model": "xiaomi/mimo-v2.6-pro",
+  "mimo_probe_model": "xiaomi/mimo-v2.6-flash"
+}
+```
+
+Each MiMo child runs under a per-run `mimocode.jsonc` generated from the
+sandbox preset (read-only reviewers cannot edit or run mutating commands);
+`--dangerously-skip-permissions` is never passed unless the documented
+`mimo_skip_permissions` opt-in is set. Permissions, concurrency detection
+(`workflow.maxConcurrentAgents`) and MiMo pricing are documented in
+[OPERATIONS.md](OPERATIONS.md); known limits are in
+[LIMITATIONS.md](LIMITATIONS.md).
 
 ## Troubleshooting
 

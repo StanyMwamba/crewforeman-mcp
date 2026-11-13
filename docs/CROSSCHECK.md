@@ -39,6 +39,19 @@ part keeps that rule.
     "depends_on": ["p1"]}]}
 ```
 
+### Checker crew vendor (new in 3.15.0)
+
+The checker crew is a different **vendor** from its builder, not only a
+different crew. `crosscheck_crew_provider` / `crosscheck_crew_model` (config
+keys and tool parameters, same names) pick the checker explicitly;
+auto-selection picks a vendor different from the builder's - `mimo` with
+`xiaomi/mimo-v2.6-pro` when the builder is DeepSeek, and a DeepSeek target
+when the builder is MiMo. An explicit choice whose vendor equals the
+builder's vendor raises `CrosscheckCrewVendorConflict` before any paid call,
+so "the checker crew is a different vendor" is enforced, not advisory.
+MiMo checker crews run under the same per-run `mimocode.jsonc` permission
+presets as every MiMo child (see [OPERATIONS.md](OPERATIONS.md)).
+
 ## Build and cross-check waves
 
 Wave 1: every builder crew builds its parts. Wave 2: each crew reviews only

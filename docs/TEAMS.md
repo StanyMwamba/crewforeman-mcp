@@ -177,6 +177,31 @@ ceiling and settlement. The switch is not sticky: later waves and revisions
 use the configured main builder again. The backup builder's vendor joins the
 reviewer's builder-vendor set because it may have built the job.
 
+## MiMo Code workers (new in 3.15.0)
+
+MiMo Code (`mimo`, v0.1.17) is a second-vendor worker. Any seat can be
+MiMo: the parent builder (`builder_provider: "mimo"`), the independent
+reviewer (`reviewer_provider: "mimo"`), a crosscheck builder or checker
+crew (`crosscheck_crew_provider`), or a backup builder/reviewer when
+DeepSeek is quarantined or failing. The default model is
+`xiaomi/mimo-v2.6-pro` (`mimo_default_model`) for build, review and
+crosscheck work; probes and readiness pings use `xiaomi/mimo-v2.6-flash`
+(`mimo_probe_model`). A MiMo reviewer is cross-vendor against DeepSeek
+builders, so the "never grade your own work" rule keeps holding, and the
+`READY` preflight ping works for MiMo candidates too.
+
+The adapter runs `mimo run "<task>" --format json --dir <folder> -m
+<provider/model>` and maps the live event stream to the normal progress,
+events and run record. Parallel MiMo agents can share one `mimo serve`
+server (`mimo_use_serve`) with `mimo run --attach <url>`. Every child gets
+a per-run `mimocode.jsonc` mapped from the sandbox preset (a read-only
+reviewer cannot edit or run mutating commands) and never a blanket
+`--dangerously-skip-permissions`; that flag is only behind the documented
+`mimo_skip_permissions` opt-in. MiMo child concurrency comes from
+`workflow.maxConcurrentAgents` in the mimocode configuration (see
+[OPERATIONS.md](OPERATIONS.md)), and per-vendor token and cost rows appear
+in the run record and the spend reports.
+
 ## Pipelined builds (new in 3.11.0)
 
 A job may declare a `write_set` (repo-relative prefixes or globs) or a `slice`
