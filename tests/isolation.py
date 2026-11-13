@@ -85,13 +85,27 @@ CLEARED_ENV_VARS = (
     "DEEPSEEK_DSH_SESSIONS_DIR",
 )
 
+# Ambient git identity vars are cleared for the same reason: an operator (or
+# harness) environment that exports GIT_AUTHOR_*/GIT_COMMITTER_* silently
+# overrides a test fixture's ``git -c user.name=...`` or hostile gitconfig, so
+# identity tests that build foreign commits stop being foreign and the
+# metadata gate rightly sees nothing to block.  A test that wants these vars
+# sets them explicitly on its own child env; they are restored in ``finally``.
+GIT_IDENTITY_ENV_VARS = (
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+)
+
 # Internal marker so nested ``isolated_case`` calls (explicit setUp under a
 # runner that already isolates, or a pytest fixture) can be detected without
 # changing the product configuration.
 CASE_ENV_VAR = "DSH_TEST_CASE_DIR"
 
 ISOLATED_ENV_VARS = DIR_ENV_VARS + FILE_ENV_VARS + CONFIG_ENV_VARS
-TRACKED_ENV_VARS = ISOLATED_ENV_VARS + CLEARED_ENV_VARS + (CASE_ENV_VAR,)
+TRACKED_ENV_VARS = (ISOLATED_ENV_VARS + CLEARED_ENV_VARS
+                    + GIT_IDENTITY_ENV_VARS + (CASE_ENV_VAR,))
 
 
 def case_env(case):
@@ -437,8 +451,9 @@ def isolated_case():
         Path(overlay["DEEPSEEK_MCP_CONFIG"]).write_text("{}\n", encoding="utf-8")
         # Clear inherited per-key aliases before applying the overlay.  Leaving
         # them in place would let an outer operator environment override the
-        # state-root-derived log/jobs/sessions paths.
-        for name in CLEARED_ENV_VARS:
+        # state-root-derived log/jobs/sessions paths.  Ambient git identity
+        # vars go too: they would override a fixture's own ``-c`` identity.
+        for name in CLEARED_ENV_VARS + GIT_IDENTITY_ENV_VARS:
             os.environ.pop(name, None)
         os.environ.update(overlay)
         # Keep the suite's fake DSH from trying to nest sandbox-exec.
