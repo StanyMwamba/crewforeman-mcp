@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live crosscheck acceptance driver for CrewForeman 3.14.3 (stdlib only).
+"""Live crosscheck acceptance driver for CrewForeman 3.15.0 (stdlib only).
 
 Drives the INSTALLED connector exactly as an MCP client would:
 
@@ -516,7 +516,7 @@ def _print_record(record, path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Live crosscheck acceptance driver for CrewForeman 3.14.3")
+        description="Live crosscheck acceptance driver for CrewForeman 3.15.0")
     parser.add_argument("--connector", default=CONNECTOR)
     parser.add_argument("--workspace", default=DEFAULT_WORKSPACE)
     parser.add_argument("--result-name", default=RESULT_NAME)

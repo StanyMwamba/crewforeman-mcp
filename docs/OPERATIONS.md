@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.14.3)
+# Operations: configuration, safety, budgets, traces and retention (v3.15.0)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;

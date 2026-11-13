@@ -40,13 +40,13 @@ FEATURE_KEYS = (
 
 class VersionTests(unittest.TestCase):
     def test_version_is_3110_everywhere(self):
-        self.assertEqual(deepseek_mcp.__version__, "3.14.3")
-        self.assertEqual(config.SERVER_VERSION, "3.14.3")
-        self.assertEqual(observability.SERVICE_VERSION, "3.14.3")
+        self.assertEqual(deepseek_mcp.__version__, "3.15.0")
+        self.assertEqual(config.SERVER_VERSION, "3.15.0")
+        self.assertEqual(observability.SERVICE_VERSION, "3.15.0")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         match = re.search(r'^version = "([^"]+)"', pyproject, re.M)
-        self.assertEqual(match.group(1), "3.14.3")
-        self.assertIn('"version": "3.14.3"', SMOKE.read_text(encoding="utf-8"))
+        self.assertEqual(match.group(1), "3.15.0")
+        self.assertIn('"version": "3.15.0"', SMOKE.read_text(encoding="utf-8"))
 
 
 class ConfigContractTests(unittest.TestCase):
@@ -92,7 +92,7 @@ class DocsContractTests(unittest.TestCase):
         text = README.read_text(encoding="utf-8")
         self.assertLessEqual(len(text.splitlines()), 110)
         self.assertNotIn("$", text)
-        self.assertIn("CrewForeman 3.14.3", text)
+        self.assertIn("CrewForeman 3.15.0", text)
         for token in ("deterministic gate", "PLAN.json", "failure notes",
                       "write-set"):
             self.assertIn(token, text)

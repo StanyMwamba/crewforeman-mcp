@@ -1,6 +1,6 @@
 # CrewForeman [![CI](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/StanyMwamba/crewforeman-mcp/actions/workflows/ci.yml)
 
-CrewForeman 3.14.3 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
+CrewForeman 3.15.0 is a local stdio MCP server. It runs Harness on your machine, sizes a team, builds in waves, has an independent reviewer score the result, and saves a record of every run.
 
 ## Roles
 | Role | Who | What it does |

@@ -1,4 +1,4 @@
-"""3.14.3 release metadata: version, README constraints, changelog, docs.
+"""3.15.0 release metadata: version, README constraints, changelog, docs.
 
 Windows-compatible: pure file reads plus ``re``, no shell, no git.
 """
@@ -12,7 +12,7 @@ import deepseek_mcp
 from deepseek_mcp import config, harness, observability
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "3.14.3"
+VERSION = "3.15.0"
 
 
 class VersionTests(unittest.TestCase):

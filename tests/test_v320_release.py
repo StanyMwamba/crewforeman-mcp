@@ -81,18 +81,18 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
 
     def test_version_is_current(self):
-        self.assertEqual(__version__, "3.14.3")
-        self.assertEqual(config.SERVER_VERSION, "3.14.3")
+        self.assertEqual(__version__, "3.15.0")
+        self.assertEqual(config.SERVER_VERSION, "3.15.0")
 
         cfg = load_config(config_path=self.root / "missing.json", env={})
         response = server.dispatch(
             "initialize", {"protocolVersion": "2025-06-18"}, cfg=cfg)
         self.assertNotIn("error", response)
-        self.assertEqual(response["result"]["serverInfo"]["version"], "3.14.3")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "3.15.0")
 
         readme = README.read_text(encoding="utf-8")
         self.assertIn("# CrewForeman", readme.splitlines()[0])
-        self.assertIn("CrewForeman 3.14.3", readme)
+        self.assertIn("CrewForeman 3.15.0", readme)
 
         changelog = CHANGELOG.read_text(encoding="utf-8")
         self.assertIn("## 3.5.0", changelog)

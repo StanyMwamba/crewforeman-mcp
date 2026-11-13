@@ -1,4 +1,4 @@
-"""3.14.3 docs contract: per-OS limits match what the boundary suite is designed to prove."""
+"""3.15.0 docs contract: per-OS limits match what the boundary suite is designed to prove."""
 
 from pathlib import Path
 import unittest
@@ -35,7 +35,7 @@ class SafetyDocsTest(unittest.TestCase):
         text = read("README.md")
         self.assertLessEqual(len(text.splitlines()), 110)
         self.assertNotIn("$", text)
-        self.assertIn("CrewForeman 3.14.3", text)
+        self.assertIn("CrewForeman 3.15.0", text)
 
     def test_limitations_has_full_per_os_text(self):
         text = read("docs/LIMITATIONS.md")
@@ -44,7 +44,7 @@ class SafetyDocsTest(unittest.TestCase):
                      "delete_outside=unverified", "UNC", "ABI 1-2",
                      "network", "Reviewer"):
             self.assertIn(word, text)
-        self.assertIn("## Platform boundaries (3.14.3)", text)
+        self.assertIn("## Platform boundaries (3.15.0)", text)
 
     def test_install_documents_linux_and_windows(self):
         text = " ".join(read("docs/INSTALL.md").lower().split())
@@ -76,8 +76,10 @@ class SafetyDocsTest(unittest.TestCase):
 
     def test_changelog_has_current_release(self):
         text = read("CHANGELOG.md")
+        self.assertIn("## 3.15.0", text)
         self.assertIn("## 3.14.3", text)
         self.assertIn("## 3.13.1", text)
+        self.assertLess(text.index("## 3.15.0"), text.index("## 3.14.3"))
         self.assertLess(text.index("## 3.14.3"), text.index("## 3.13.1"))
         self.assertLess(text.index("## 3.13.1"), text.index("## 3.12.2"))
         self.assertIn("windows-2025", text)

@@ -1,4 +1,4 @@
-"""DeepSeek MCP server package (3.14.3).
+"""DeepSeek MCP server package (3.15.0).
 
 Public entry point: ``deepseek_mcp.py`` in the repository root, or
 ``python -m deepseek_mcp``. Standard library only.

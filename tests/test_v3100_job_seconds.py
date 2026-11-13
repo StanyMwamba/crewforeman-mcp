@@ -123,7 +123,7 @@ class JobMaxSecondsTests(unittest.TestCase):
 
     def test_release_sanity(self):
         # This slice must not bump the version; the lead owns 3.12.0.
-        self.assertEqual(SERVER_VERSION, "3.14.3")
+        self.assertEqual(SERVER_VERSION, "3.15.0")
         self.assertEqual(DEFAULTS["job_max_seconds"], 7200.0)
 
 

@@ -1,4 +1,4 @@
-# Crosscheck mode (3.14.3)
+# Crosscheck mode (3.15.0)
 
 `crosscheck` is opt-in. A job enters it with:
 
