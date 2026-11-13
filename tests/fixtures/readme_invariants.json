@@ -4,7 +4,11 @@
     "|---|---|---|",
     "| Builder | Harness, any model (default DeepSeek) | Sizes the team, builds in waves, revises on notes. |",
     "| Independent reviewer | Configurable, any vendor (e.g. Kimi) | Scores 0–10 and lists blocking defects. |",
-    "| Client / coordinator | Your MCP client (e.g. Claude) | Sends the brief and reads the result. |"
+    "| Client / coordinator | Your MCP client (e.g. Claude) | Sends the brief and reads the result. |",
+    "| MiMo builder | mimo, xiaomi/mimo-v2.6-pro | Builds and revises; backup when DeepSeek fails. |",
+    "| MiMo reviewer | mimo, xiaomi/mimo-v2.6-pro | Scores 0–10 from a second vendor. |",
+    "| MiMo crosscheck crew | mimo, xiaomi/mimo-v2.6-pro | Cross-checks parts in crosscheck mode. |",
+    "| MiMo backup | mimo | Takes over when DeepSeek is quarantined or failing. |"
   ],
   "bold_vendor_line": "**Using a reviewer from a different vendor means a model never grades its own work.**",
   "convergence": "| Round | What the reviewer checked | Review length | Score | Blocking defects |\n|---:|---|---|---:|---:|\n| 1 | Full review | Long | 7.5 | 1 |\n| 2 | Flagged defects + new changes | Shorter | 8.5 | 0 |\n",

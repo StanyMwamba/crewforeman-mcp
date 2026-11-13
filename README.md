@@ -8,15 +8,14 @@ CrewForeman 3.15.0 is a local stdio MCP server. It runs Harness on your machine,
 | Builder | Harness, any model (default DeepSeek) | Sizes the team, builds in waves, revises on notes. |
 | Independent reviewer | Configurable, any vendor (e.g. Kimi) | Scores 0–10 and lists blocking defects. |
 | Client / coordinator | Your MCP client (e.g. Claude) | Sends the brief and reads the result. |
+| MiMo builder | mimo, xiaomi/mimo-v2.6-pro | Builds and revises; backup when DeepSeek fails. |
+| MiMo reviewer | mimo, xiaomi/mimo-v2.6-pro | Scores 0–10 from a second vendor. |
+| MiMo crosscheck crew | mimo, xiaomi/mimo-v2.6-pro | Cross-checks parts in crosscheck mode. |
+| MiMo backup | mimo | Takes over when DeepSeek is quarantined or failing. |
 
 **Using a reviewer from a different vendor means a model never grades its own work.**
-Use a reviewer from any vendor - see [docs/REVIEWER.md](docs/REVIEWER.md).
-MiMo Code (`mimo`, v0.1.17) is a second-vendor worker: builder, independent reviewer or crosscheck crew - see [docs/TEAMS.md](docs/TEAMS.md).
-Permissions, concurrency and per-vendor cost for MiMo runs are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
-
-The lead sizes the team and merges the best candidates - see [docs/TEAMS.md](docs/TEAMS.md).
-Opt-in `mode="crosscheck"` builds independent parts with one crew and cross-checks each part with another; the connector scores the gate - see [docs/CROSSCHECK.md](docs/CROSSCHECK.md).
-Jobs without a write set can run in parallel when the inferred sets are disjoint and confident - see [docs/PARALLEL.md](docs/PARALLEL.md).
+Use a reviewer from any vendor - see [docs/REVIEWER.md](docs/REVIEWER.md). The lead sizes the team and merges the best candidates - see [docs/TEAMS.md](docs/TEAMS.md).
+Opt-in `mode="crosscheck"` builds independent parts with one crew and cross-checks each part with another; the connector scores the gate - see [docs/CROSSCHECK.md](docs/CROSSCHECK.md). Jobs without a write set can run in parallel when the inferred sets are disjoint and confident - see [docs/PARALLEL.md](docs/PARALLEL.md).
 
 ## Method
 CrewForeman creates one work item for each brief. If the same work is already running, it returns that run. Otherwise it sizes a team and plans waves, enforcing a deterministic gate (secrets, lint, tests) before any cross-vendor review.
@@ -71,6 +70,14 @@ Add to client configuration:
 ```json
 {"mcpServers": {"crewforeman-mcp": {"command": "crewforeman-mcp",
   "env": {"DEEPSEEK_API_KEY": "...", "DSH_BIN": "/path/to/dsh"}}}}
+```
+
+## MiMo Code worker
+MiMo Code (`mimo`, v0.1.17) is the second-vendor worker. Check `mimo --version`, then run `mimo providers login` with a pay-as-you-go sk- key or a Token Plan tp- key and its own base URL. Build, review and crosscheck default to `xiaomi/mimo-v2.6-pro`; probes use `xiaomi/mimo-v2.6-flash`. Pick MiMo per job with `builder_provider`/`builder_model`, `reviewer_provider`/`reviewer_model` or `crosscheck_crew_provider`/`crosscheck_crew_model`; `mimo_bin` or `MIMO_BIN` names the binary.
+Concurrency detects `workflow.maxConcurrentAgents`, else min(16, 2 x cores), uses the max, and backs off on 429 or limit errors. Permissions are allow rules passed in `MIMOCODE_CONFIG_CONTENT`: never `--yolo`, and skip-permissions only via the explicit `mimo_skip_permissions` opt-in. Serve/attach shares one server under a per-server password in `MIMOCODE_SERVER_PASSWORD`. Usage and cost are recorded per vendor, vendor-reported cost first; CI runs a fake `mimo` only.
+```json
+{"builder_provider": "mimo", "reviewer_provider": "mimo",
+ "mimo_bin": "mimo", "mimo_default_model": "xiaomi/mimo-v2.6-pro"}
 ```
 ## Guarantees
 - Local JSON-RPC; no hosted service or network listener.
