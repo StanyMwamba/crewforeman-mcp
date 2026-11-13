@@ -83,7 +83,7 @@ class ReadmeInvariants(unittest.TestCase):
 
     def test_roles_table_is_exact(self):
         rows = _roles_rows(self.text)
-        self.assertEqual(len(rows), 5, rows)
+        self.assertEqual(len(rows), 9, rows)
         self.assertEqual(rows, self.fixture["roles_table"])
         self.assertIn(BUILDER_ROW, rows)
 
