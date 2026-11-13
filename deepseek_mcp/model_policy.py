@@ -21,6 +21,12 @@ DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 MAX_TEXT = 200
 
+MIMO_PROVIDER = "mimo"
+MIMO_VENDOR = "Xiaomi (MiMo)"
+MIMO_API_KEY_ENV = "MIMO_API_KEY"
+DEFAULT_MIMO_MODEL = "xiaomi/mimo-v2.6-pro"
+DEFAULT_MIMO_PROBE_MODEL = "xiaomi/mimo-v2.6-flash"
+
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SLICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -33,6 +39,7 @@ _VENDOR_MARKERS = (
     ("OpenAI", ("openai", "gpt")),
     ("Google", ("google", "gemini")),
     ("DeepSeek", ("deepseek",)),
+    ("Xiaomi (MiMo)", ("mimo", "xiaomi")),
 )
 
 _PLAN_TAIL = (
@@ -193,6 +200,50 @@ def _builtin(cfg):
     }
 
 
+def _builtin_mimo(cfg):
+    """Builtin MiMo provider: no providers[] entry or key value is required.
+
+    ``api_key_env_explicit`` stays false like the DeepSeek builtin: MiMo
+    credentials may come from ``mimo providers login``, not only from env.
+    """
+    models = []
+    for value in (
+        DEFAULT_MIMO_MODEL,
+        "mimo-v2.6-pro",
+        DEFAULT_MIMO_PROBE_MODEL,
+        "mimo-v2.6-flash",
+        _cfg_text(cfg, "mimo_default_model", ""),
+        _cfg_text(cfg, "mimo_probe_model", ""),
+        _cfg_text(cfg, "mimo_model", ""),
+    ):
+        text = _text(value, 128)
+        if text and text not in models:
+            models.append(text)
+    return {
+        "name": MIMO_PROVIDER,
+        "base_url": "",
+        "api": "openai-chat",
+        "vendor": MIMO_VENDOR,
+        "api_key_env": MIMO_API_KEY_ENV,
+        "api_key_env_explicit": False,
+        "models": sorted(models),
+    }
+
+
+def _is_mimo_name(name):
+    text = _text(name, 128).lower()
+    if not text:
+        return False
+    try:
+        module = importlib.import_module("deepseek_mcp.reviewer_vendor")
+        resolver = getattr(module, "canonical_vendor", None)
+        if callable(resolver):
+            return resolver(text) == MIMO_VENDOR
+    except Exception:
+        pass
+    return any(marker in text for marker in ("mimo", "xiaomi"))
+
+
 def _provider_entries(cfg):
     entries = [_builtin(cfg)]
     listed = _cfg_get(cfg, "providers", [])
@@ -202,6 +253,7 @@ def _provider_entries(cfg):
         item = _entry("provider-%d" % index, raw)
         if item:
             entries.append(item)
+    entries.append(_builtin_mimo(cfg))
     return entries
 
 
@@ -211,12 +263,18 @@ def _find_provider(cfg, name):
     for item in _provider_entries(cfg):
         if item["name"] == name:
             return item
+    # A mimo alias (e.g. "xiaomi") resolves to the builtin MiMo provider so
+    # provider "mimo" and its aliases need no providers[] entry.
+    if _is_mimo_name(name):
+        return _builtin_mimo(cfg)
     return None
 
 
 def _infer_provider_optional(cfg, model):
-    matches = [item["name"] for item in _provider_entries(cfg)
-               if model in item["models"]]
+    matches = []
+    for item in _provider_entries(cfg):
+        if model in item["models"] and item["name"] not in matches:
+            matches.append(item["name"])
     if len(matches) > 1:
         raise BuilderModelError(
             "builder_model_provider_ambiguous",
@@ -357,6 +415,10 @@ def resolve_target(cfg, provider="", model="", source="config", allow_legacy=Fal
             "builder_model_provider_unknown",
             "provider %s is neither %s nor a configured providers entry"
             % (chosen_provider, DEFAULT_PROVIDER))
+    # Alias-matched builtin entries report their canonical provider id (for
+    # example "xiaomi" resolves to the builtin provider "mimo"); configured
+    # entries already carry the requested name so this is a no-op for them.
+    chosen_provider = entry.get("name") or chosen_provider
 
     if not bool(_cfg_get(cfg, "builder_allow_unlisted_models", False)):
         if chosen_model not in entry["models"]:

@@ -24,7 +24,8 @@ try:  # Public validator; local fallback keeps this module dependency-free.
 except Exception:  # pragma: no cover - defensive only
     _validate_attention = None
 
-VENDORS = ("Anthropic", "Kimi (Moonshot)", "OpenAI", "Google", "DeepSeek")
+VENDORS = ("Anthropic", "Kimi (Moonshot)", "OpenAI", "Google", "DeepSeek",
+           "Xiaomi (MiMo)")
 
 QUESTION = (
     "No reviewer from a different vendor passed preflight. "
@@ -38,6 +39,10 @@ SAME_VENDOR_MARKER = "same-vendor review (chosen by user)"
 # Most specific aliases first.  Matching is case-insensitive and deliberately
 # substring-based, exactly like the 3.11 reviewer_backup markers.
 _ALIASES = (
+    ("mimo-v2.6", "Xiaomi (MiMo)"),
+    ("mimo-v2", "Xiaomi (MiMo)"),
+    ("xiaomi", "Xiaomi (MiMo)"),
+    ("mimo", "Xiaomi (MiMo)"),
     ("anthropic", "Anthropic"),
     ("claude", "Anthropic"),
     ("sonnet", "Anthropic"),
@@ -57,6 +62,7 @@ _PROVIDERS = {
     "OpenAI": "openai",
     "Google": "google",
     "DeepSeek": "deepseek",
+    "Xiaomi (MiMo)": "mimo",
 }
 
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -460,7 +466,13 @@ def builder_vendor_set(cfg, targets=None, run=None):
 def assert_reviewer_eligible(candidate, builder_vendors, chosen_by_user=False,
                              same_vendor=False):
     """Raise :class:`ReviewerVendorConflict` unless the candidate is allowed."""
-    vendor = canonical_vendor(_raw_get(candidate, "vendor", ""))
+    explicit = _text(_raw_get(candidate, "vendor", ""))
+    vendor = canonical_vendor(explicit)
+    if vendor is None and not explicit:
+        # An empty vendor may still be named by provider/model markers (a
+        # MiMo candidate can be identified by its model string alone).
+        vendor = (canonical_vendor(_raw_get(candidate, "provider", ""))
+                  or canonical_vendor(_raw_get(candidate, "model", "")))
     if vendor is None:
         raise ReviewerVendorConflict("reviewer_vendor_unknown")
     builders = _canonical_set(builder_vendors)
