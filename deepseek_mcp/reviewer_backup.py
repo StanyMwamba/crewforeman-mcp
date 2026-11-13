@@ -35,6 +35,10 @@ CONFIG_KEYS = (
 
 # Most specific wrapper-name markers first.
 _VENDOR_MARKERS = (
+    ("mimo-v2.6", "Xiaomi (MiMo)"),
+    ("mimo-v2", "Xiaomi (MiMo)"),
+    ("xiaomi", "Xiaomi (MiMo)"),
+    ("mimo", "Xiaomi (MiMo)"),
     ("anthropic", "Anthropic"),
     ("claude", "Anthropic"),
     ("sonnet", "Anthropic"),
@@ -54,7 +58,12 @@ _VENDOR_KEYS = (
     ("openai", "OPENAI_API_KEY"),
     ("gpt", "OPENAI_API_KEY"),
     ("deepseek", "DEEPSEEK_API_KEY"),
+    ("mimo", "MIMO_API_KEY"),
+    ("xiaomi", "MIMO_API_KEY"),
 )
+
+MIMO_VENDOR = "Xiaomi (MiMo)"
+DEFAULT_MIMO_PROBE_MODEL = "xiaomi/mimo-v2.6-flash"
 
 _SUCCESS_STATUSES = frozenset(("ok", "done", "completed", "success", "succeeded"))
 _NO_SWITCH_STATUSES = frozenset(
@@ -286,6 +295,46 @@ def eligible_backup(cfg, builder_vendors, chosen_by_user=False):
     if candidate is None or error is not None:
         return None
     return candidate
+
+
+def _target_text(target, key):
+    if target is None:
+        return ""
+    if isinstance(target, dict):
+        return _text(target.get(key)).strip()
+    return _text(getattr(target, key, "")).strip()
+
+
+def _is_mimo(target):
+    """True when vendor/provider/model resolves to the Xiaomi (MiMo) vendor."""
+    for key in ("vendor", "provider", "model"):
+        text = _target_text(target, key)
+        if not text:
+            continue
+        try:
+            from .reviewer_vendor import canonical_vendor
+            if canonical_vendor(text) == MIMO_VENDOR:
+                return True
+        except Exception:
+            pass
+        low = text.lower()
+        if "mimo" in low or "xiaomi" in low:
+            return True
+    return False
+
+
+def probe_model(target, cfg=None):
+    """Return the model for a backup preflight/readiness ping.
+
+    A MiMo target pings the probe default (``mimo_probe_model``, else
+    ``xiaomi/mimo-v2.6-flash``); every other vendor keeps its own model,
+    which is the pre-existing preflight behavior.
+    """
+    model = _target_text(target, "model")
+    if not _is_mimo(target):
+        return model
+    probe = _text(_value(cfg, "mimo_probe_model")).strip()
+    return probe or DEFAULT_MIMO_PROBE_MODEL
 
 
 def identity(cfg, execution=None):

@@ -52,6 +52,8 @@ _PROVIDER_HINTS = (
     ("gemini", "google"),
     ("kimi", "moonshot"),
     ("moonshot", "moonshot"),
+    ("xiaomi", "mimo"),
+    ("mimo", "mimo"),
 )
 _ABS_PATH_RE = re.compile(
     r"(?<![\w.])/(?:Users|home|tmp|private|var|opt|root)/[^\s'\"]+"
@@ -179,13 +181,17 @@ def _target_from_model_policy(cfg, settings):
     except Exception:
         return None
     if isinstance(target, dict):
-        merged = dict(settings)
+        data = target
+    else:
+        data = {}
         for key in ("provider", "vendor", "model"):
-            value = _text(target.get(key)).strip()
-            if value:
-                merged[key] = value
-        return merged
-    return None
+            data[key] = getattr(target, key, "")
+    merged = dict(settings)
+    for key in ("provider", "vendor", "model"):
+        value = _text(data.get(key)).strip()
+        if value:
+            merged[key] = value
+    return merged
 
 
 def resolve_backup_target(cfg):
@@ -195,6 +201,27 @@ def resolve_backup_target(cfg):
         return None
     resolved = _target_from_model_policy(cfg, settings)
     return resolved if resolved is not None else settings
+
+
+def probe_model(settings, cfg=None):
+    """Return the model for a backup preflight/readiness ping.
+
+    A MiMo backup target pings the probe default (``mimo_probe_model``,
+    else ``xiaomi/mimo-v2.6-flash``); every other vendor keeps its own
+    model, which is the pre-existing preflight behavior.  Delegates to
+    :mod:`deepseek_mcp.reviewer_backup` so the vendor rule lives in one
+    place.
+    """
+    if _reviewer_backup is not None:
+        try:
+            fn = getattr(_reviewer_backup, "probe_model", None)
+            if callable(fn):
+                return fn(settings, cfg)
+        except Exception:
+            pass
+    if isinstance(settings, dict):
+        return _text(settings.get("model")).strip()
+    return _text(getattr(settings, "model", "")).strip()
 
 
 def effective_ceiling(backup_cap, whole_remaining=None, cost_known=True):
