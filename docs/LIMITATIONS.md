@@ -92,10 +92,26 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
 - **Real `mimo` is never exercised in CI.** The suite drives fake `mimo`
   programs only (recorded JSONL event streams, auth/limit/network errors,
   slow and silent runs, serve/attach) on macOS, Ubuntu and Windows under
-  Python 3.9 and 3.15. The serve/attach CLI and health facts below were
-  verified by hand against real `mimo` v0.1.17 and the fakes reproduce
-  them; anything not listed there - for example the JSONL event schema of
-  a long run - is not proven by CI and needs an adapter update first.
+  Python 3.9 and 3.15. The event schema, serve/attach CLI and health facts
+  below were verified by hand against real `mimo` v0.1.17 and the fakes
+  reproduce them; anything not listed there is not proven by CI and needs
+  an adapter update first.
+- **Event schema (verified on `mimo` v0.1.17).** `mimo run --format json`
+  emits JSONL events with top-level `type`, `timestamp` (ms), `sessionID`
+  and a `part` payload (except `error`): `text` carries `part.text`,
+  `step_start` is `part.type == "step-start"`, `step_finish` carries
+  `part.reason`, `part.tokens` (`{total, input, output, reasoning, cache:
+  {read, write}}` - the cache field is a dict) and `part.cost` (the CLI's
+  own USD for that step); `tool_use` carries `part.tool`, `part.callID`
+  and `part.state.{status, input, output, metadata, title}` (subagents
+  appear as `tool == "actor"` with a spawn operation); `error` carries
+  `error.name` and `error.data.{message, statusCode, isRetryable,
+  metadata}`. Recorded, sanitized samples live in `tests/fixtures/mimo/`
+  and are replayed by both the parser tests and the fake programs. Cost
+  prefers the CLI-reported `part.cost` sum (`cost_source: "vendor"`),
+  falls back to the price table (`"price_table"`), and is unknown - never
+  zero-filled - when neither exists. Legacy `data`-shaped events remain
+  accepted as a tolerant fallback only.
 - **Serve/attach contract (verified on `mimo` v0.1.17).** `mimo serve`
   takes `--hostname <h>` (default 127.0.0.1) and `--port <n>` (0 =
   OS-assigned) - there is no `--host` flag - and prints
@@ -107,8 +123,8 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
   and to every `mimo run --attach <url>` (never in argv, never recorded),
   and sends HTTP basic auth on health probes. `--dir` stays the absolute
   workspace path (it is the path on the remote server when attaching).
-  Still assumed: `--attach` runs speak the same JSONL event stream as a
-  direct run.
+  Attached runs speak the same JSONL event stream as a direct run
+  (verified).
 - **`mimocode.jsonc` is MiMo's permission system, not an OS sandbox.** The
   per-run file scopes what the MiMo worker may do inside its own rules; the
   OS file-write boundary (Seatbelt / Landlock / restricted token) is a
