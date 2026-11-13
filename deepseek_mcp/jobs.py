@@ -372,7 +372,14 @@ def _worker_env(cfg):
                 keep.append(name)
     except Exception:
         pass
-    env = safety.scrubbed_env(keep=tuple(keep))
+    # The state-root aliases are path configuration, not secrets: keep them
+    # in the scrubbed env so a child can never lose the parent's state root
+    # to a scrubber rule change.
+    env = safety.scrubbed_env(
+        keep=tuple(keep),
+        extra_keep=("CREWFOREMAN_STATE_DIR", "DSH_STATE_DIR",
+                    "DEEPSEEK_MCP_STATE_DIR", "DEEPSEEK_MCP_LOG_DIR",
+                    "DEEPSEEK_MCP_JOBS_DIR"))
     try:
         # The credentials path is configuration, not a secret: a detached
         # worker must resolve provider keys from the same file as the parent
@@ -380,6 +387,17 @@ def _worker_env(cfg):
         # scrubber drops because its name contains "CREDENTIAL").
         from . import credentials as credentials_mod
         env["CREWFOREMAN_CREDENTIALS_FILE"] = credentials_mod.credentials_path(cfg)
+    except Exception:
+        pass
+    try:
+        # Same for the config pointer (the scrubber always drops
+        # DEEPSEEK_MCP_CONFIG): a job child without a spec-level config_path
+        # reloads config through it, and without this it would resolve the
+        # operator's default config and fall back to the home state root.  A
+        # spec-level config_path still wins over the env default.
+        config_path = cfg.get("_config_path")
+        if config_path:
+            env["DEEPSEEK_MCP_CONFIG"] = str(config_path)
     except Exception:
         pass
     try:
