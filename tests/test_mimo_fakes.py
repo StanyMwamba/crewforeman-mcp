@@ -1,13 +1,19 @@
 """Smoke tests for ``tests.mimo_fakes`` — the fake ``mimo`` programs.
 
-Each mode must emit the documented JSONL event stream (see the module
-docstring of ``tests.mimo_fakes``), ``serve`` must answer the real-CLI HTTP
-surface (``/global/health`` 200, ``/healthz`` 503, ``/doc`` 200), reject
-``--host``, print the real ready line, enforce ``MIMOCODE_SERVER_PASSWORD``
-basic auth when set, ``attach`` must record argv plus password-env presence,
-and the error modes must carry the right ``statusCode``.  No network beyond
-127.0.0.1, no real ``mimo``, and no long sleeps (``FAKE_MIMO_SLEEP`` is kept
-small).
+Each mode must emit the real mimo 0.1.17 JSONL event shape recorded in
+``tests/fixtures/mimo/`` (see the module docstring of ``tests.mimo_fakes``):
+top-level ``type``/``timestamp``/``sessionID`` plus a ``part`` payload (no
+legacy ``data``), ``part.tokens.cache`` as a ``{read, write}`` dict,
+``part.cost`` on ``step_finish``, ``actor``/``spawn`` tool_use for
+subagents, and ``error.name``/``error.data.{statusCode,isRetryable}`` on
+errors.  ``ok``/READY/``error_auth`` must replay the fixture recordings
+exactly.  ``serve`` must answer the real-CLI HTTP surface
+(``/global/health`` 200, ``/healthz`` 503, ``/doc`` 200), reject ``--host``,
+print the real ready line, enforce ``MIMOCODE_SERVER_PASSWORD`` basic auth
+(username ``mimocode``) when set, ``attach`` must record argv plus
+password-env presence, and the error modes must carry the right
+``statusCode``.  No network beyond 127.0.0.1, no real ``mimo``, and no long
+sleeps (``FAKE_MIMO_SLEEP`` is kept small).
 """
 
 import base64
@@ -24,12 +30,30 @@ import urllib.request
 from pathlib import Path
 
 from tests import build_fake_mimo, tempdir
-from tests.mimo_fakes import base_env, write_fake_mimo
+from tests.mimo_fakes import (
+    ATTACH_READY_FIXTURE,
+    ERROR_401_FIXTURE,
+    RUN_EVENTS_FIXTURE,
+    base_env,
+    fixture_events,
+    fixture_lines,
+    write_fake_mimo,
+)
 
 TOKEN_KEYS = ("total", "input", "output", "reasoning", "cache")
+CACHE_KEYS = ("read", "write")
 FINAL_ANSWER = "Fake mimo final answer: done."
 READY_LINE_RE = re.compile(r"^mimocode server listening on "
                            r"http://127\.0\.0\.1:(\d+)$")
+
+# Ground truth: the real recordings (the fakes generate from these).
+_RUN_EVENTS = fixture_events(RUN_EVENTS_FIXTURE)
+_READY_EVENTS = fixture_events(ATTACH_READY_FIXTURE)
+_ERROR_401 = fixture_events(ERROR_401_FIXTURE)[0]
+OK_ANSWER = [e for e in _RUN_EVENTS if e["type"] == "text"][-1]["part"]["text"]
+OK_FINISHES = [e for e in _RUN_EVENTS if e["type"] == "step_finish"]
+OK_COSTS = [e["part"]["cost"] for e in OK_FINISHES]
+OK_TOKENS = [e["part"]["tokens"] for e in OK_FINISHES]
 
 
 def parse_jsonl(text):
@@ -40,6 +64,83 @@ def parse_jsonl(text):
         if line.startswith("{"):
             events.append(json.loads(line))
     return events
+
+
+def last_text(events):
+    """``part.text`` of the last text event (the final answer)."""
+    texts = [e["part"]["text"] for e in events if e["type"] == "text"]
+    return texts[-1] if texts else None
+
+
+def assert_real_event(case, event):
+    """Assert *event* matches the real 0.1.17 schema (no legacy ``data``)."""
+    case.assertIsInstance(event, dict)
+    case.assertIn("type", event)
+    case.assertIsInstance(event.get("timestamp"), int)
+    case.assertNotIsInstance(event.get("timestamp"), bool)
+    case.assertIn("sessionID", event)
+    case.assertNotIn("data", event,
+                     "legacy data payload must not appear: %r" % (event,))
+    if event.get("type") == "error":
+        case.assertNotIn("part", event, "error events carry no part")
+        error = event.get("error") or {}
+        case.assertIn("name", error)
+        data = error.get("data") or {}
+        for key in ("message", "statusCode", "isRetryable", "metadata"):
+            case.assertIn(key, data, "error.data missing %r" % key)
+        return
+    case.assertIn("part", event)
+    part = event["part"]
+    case.assertIn("sessionID", part)
+    case.assertNotIn("data", part)
+    typ = event["type"]
+    if typ == "text":
+        case.assertEqual(part.get("type"), "text")
+        case.assertIn("text", part)
+        time_ = part.get("time") or {}
+        case.assertIsInstance(time_.get("start"), int)
+        case.assertIsInstance(time_.get("end"), int)
+    elif typ == "step_start":
+        case.assertEqual(part.get("type"), "step-start")
+        case.assertIn("snapshot", part)
+    elif typ == "step_finish":
+        case.assertEqual(part.get("type"), "step-finish")
+        case.assertIn("reason", part)
+        case.assertIn("snapshot", part)
+        case.assertIn("cost", part)
+        tokens = part.get("tokens") or {}
+        for key in TOKEN_KEYS:
+            case.assertIn(key, tokens)
+        cache = tokens.get("cache")
+        case.assertIsInstance(cache, dict,
+                              "tokens.cache must be a dict, not an int")
+        for key in CACHE_KEYS:
+            case.assertIn(key, cache)
+    elif typ == "tool_use":
+        case.assertEqual(part.get("type"), "tool")
+        case.assertIn("tool", part)
+        case.assertIn("callID", part)
+        state = part.get("state") or {}
+        for key in ("status", "input", "output", "metadata", "title"):
+            case.assertIn(key, state)
+    else:
+        case.fail("unexpected event type %r" % typ)
+
+
+def spawn_tools(events):
+    """The actor/spawn (subagent) tool_use events of *events*."""
+    found = []
+    for event in events:
+        if event.get("type") != "tool_use":
+            continue
+        part = event.get("part") or {}
+        if part.get("tool") != "actor":
+            continue
+        operation = ((part.get("state") or {}).get("input") or {}).get(
+            "operation") or {}
+        if operation.get("action") == "spawn":
+            found.append(event)
+    return found
 
 
 def fetch(url, password=None, username="mimocode"):
@@ -101,6 +202,14 @@ class MimoFakesSmokeTest(unittest.TestCase):
                               env=env or self._env(), timeout=timeout,
                               cwd=str(self.ws))
 
+    def _run_mode(self, mode, *extra, **kwargs):
+        """Run the ``ok`` argv on a fresh fake baked with *mode*."""
+        fake = write_fake_mimo(self.root / "bin" / ("mimo-" + mode), mode=mode)
+        return subprocess.run([str(fake)] + self._argv(*extra),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=20,
+                              cwd=str(self.ws), **kwargs)
+
     # -- fixtures ---------------------------------------------------------
 
     def test_write_fake_mimo_returns_executable(self):
@@ -158,25 +267,133 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         events = parse_jsonl(result.stdout)
         self.assertTrue(events, "no JSONL events on stdout")
-        self.assertEqual(events[0]["type"], "text")
-        self.assertIn("text", events[0]["data"])
+        for event in events:
+            assert_real_event(self, event)
         starts = [e for e in events if e["type"] == "step_start"]
         finishes = [e for e in events if e["type"] == "step_finish"]
         tools = [e for e in events if e["type"] == "tool_use"]
-        self.assertGreaterEqual(len(starts), 2, "ok must include a couple of steps")
-        self.assertGreaterEqual(len(finishes), 2, "token accumulation needs steps")
-        for event in finishes:
-            tokens = event["data"]["tokens"]
-            for key in TOKEN_KEYS:
-                self.assertIn(key, tokens)
-        totals = [e["data"]["tokens"]["total"] for e in finishes]
+        texts = [e for e in events if e["type"] == "text"]
+        self.assertTrue(starts, "ok must include a step_start")
+        self.assertGreaterEqual(len(finishes), 2,
+                                "token accumulation needs two step_finish")
+        self.assertTrue(tools, "ok must include tool_use events")
+        self.assertTrue(texts, "ok must include the answer text")
+        totals = [e["part"]["tokens"]["total"] for e in finishes]
         self.assertGreater(sum(totals), max(totals),
                            "step_finish usage must accumulate across steps")
         for event in tools:
-            self.assertIn("name", event["data"])
-            self.assertIn("input", event["data"])
-        self.assertEqual(events[-1]["type"], "text")
-        self.assertEqual(events[-1]["data"]["text"], FINAL_ANSWER)
+            self.assertIn("tool", event["part"])
+            self.assertIn("callID", event["part"])
+            self.assertIn("input", event["part"]["state"])
+        self.assertEqual(last_text(events), OK_ANSWER)
+
+    def test_ok_mode_replays_run_events_fixture_verbatim(self):
+        result = self._run(self._argv())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(lines, fixture_lines(RUN_EVENTS_FIXTURE),
+                         "ok mode must replay the run-events recording raw")
+        self.assertEqual(parse_jsonl(result.stdout), _RUN_EVENTS,
+                         "ok mode must replay the run-events recording exactly")
+
+    def test_events_carry_part_timestamp_session_id_and_no_legacy_data(self):
+        streams = {"ok": self._run(self._argv()).stdout,
+                   "verbose": self._run_mode("verbose").stdout,
+                   "text_only": self._run_mode("text_only").stdout,
+                   "slow": self._run_mode(
+                       "slow", env=self._env(FAKE_MIMO_SLEEP="0.4")).stdout}
+        for name, stdout in streams.items():
+            events = parse_jsonl(stdout)
+            self.assertTrue(events, "%s emitted no events" % name)
+            for event in events:
+                assert_real_event(self, event)
+                self.assertIn("timestamp", event, name)
+                self.assertIn("sessionID", event, name)
+                if event["type"] in ("text", "step_start", "step_finish",
+                                     "tool_use"):
+                    self.assertIn("part", event, name)
+                    self.assertNotIn("data", event, name)
+
+    def test_step_finish_tokens_cache_dict_and_totals_sum(self):
+        for name, stdout in (("ok", self._run(self._argv()).stdout),
+                             ("slow", self._run_mode(
+                                 "slow",
+                                 env=self._env(FAKE_MIMO_SLEEP="0.4")).stdout)):
+            for event in parse_jsonl(stdout):
+                if event["type"] != "step_finish":
+                    continue
+                tokens = event["part"]["tokens"]
+                cache = tokens["cache"]
+                self.assertIsInstance(cache, dict, name)
+                self.assertEqual(sorted(cache), sorted(CACHE_KEYS), name)
+                for key in CACHE_KEYS:
+                    self.assertIsInstance(cache[key], int, name)
+                self.assertEqual(
+                    tokens["total"],
+                    tokens["input"] + tokens["output"] + tokens["reasoning"]
+                    + cache["read"] + cache["write"],
+                    "%s: tokens.total must equal the parts' sum" % name)
+        # ok replays the recording's own usage numbers.
+        self.assertEqual([e["part"]["tokens"] for e in parse_jsonl(
+            self._run(self._argv()).stdout) if e["type"] == "step_finish"],
+            OK_TOKENS)
+
+    def test_step_finish_carries_vendor_cost(self):
+        costs = [e["part"]["cost"] for e in parse_jsonl(
+            self._run(self._argv()).stdout) if e["type"] == "step_finish"]
+        self.assertEqual(costs, OK_COSTS,
+                         "ok must carry the recording's part.cost values")
+        for cost in costs:
+            self.assertIsInstance(cost, float)
+            self.assertGreater(cost, 0.0)
+        slow = [e["part"]["cost"] for e in parse_jsonl(
+            self._run_mode("slow",
+                           env=self._env(FAKE_MIMO_SLEEP="0.4")).stdout)
+            if e["type"] == "step_finish"]
+        self.assertTrue(slow, "slow must emit step_finish events")
+        for cost in slow:
+            self.assertIsInstance(cost, float)
+
+    def test_ready_ping_matches_attach_ready_fixture(self):
+        result = self._run(["run", "Reply with exactly READY and nothing else.",
+                            "--format", "json", "--dir", str(self.ws),
+                            "-m", "xiaomi/mimo-v2.6-flash"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = parse_jsonl(result.stdout)
+        self.assertEqual(events, _READY_EVENTS,
+                         "READY must replay the attach-ready recording exactly")
+        fixture_text = next(e for e in _READY_EVENTS if e["type"] == "text")
+        text_events = [e for e in events if e["type"] == "text"]
+        self.assertEqual(len(text_events), 1)
+        self.assertEqual(text_events[0], fixture_text,
+                         "the READY text event must equal the fixture line")
+        self.assertEqual(text_events[0]["part"]["text"], "READY")
+
+    def test_verbose_and_ok_include_actor_spawn_tool_use(self):
+        for name, events in (("ok", parse_jsonl(self._run(self._argv()).stdout)),
+                             ("verbose", parse_jsonl(
+                                 self._run_mode("verbose").stdout))):
+            spawns = spawn_tools(events)
+            self.assertTrue(spawns,
+                            "%s must include an actor/spawn tool_use" % name)
+            part = spawns[0]["part"]
+            self.assertEqual(part["tool"], "actor")
+            self.assertEqual(
+                part["state"]["input"]["operation"]["action"], "spawn")
+            self.assertIn("output", part["state"])
+
+    def test_dash_s_session_is_substituted_into_events(self):
+        result = self._run(self._argv("-s", "sess-7"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = parse_jsonl(result.stdout)
+        self.assertEqual(len(events), len(_RUN_EVENTS))
+        for event in events:
+            self.assertEqual(event["sessionID"], "sess-7")
+            self.assertEqual(event["part"]["sessionID"], "sess-7")
+        # Everything else is still the recording's own content.
+        self.assertEqual(last_text(events), OK_ANSWER)
+        self.assertEqual([e["part"]["tokens"] for e in events
+                          if e["type"] == "step_finish"], OK_TOKENS)
 
     def test_text_only_mode_emits_only_text(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-text", mode="text_only")
@@ -189,7 +406,8 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertTrue(events)
         for event in events:
             self.assertEqual(event["type"], "text")
-        self.assertEqual(events[-1]["data"]["text"], FINAL_ANSWER)
+            assert_real_event(self, event)
+        self.assertEqual(last_text(events), FINAL_ANSWER)
 
     def test_verbose_mode_has_extra_tool_use(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-verbose", mode="verbose")
@@ -203,7 +421,9 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(len(verbose_tools), 5,
                                 "verbose must emit extra tool_use events")
         self.assertGreater(len(verbose_tools), len(ok_tools))
-        self.assertEqual(verbose_events[-1]["data"]["text"], FINAL_ANSWER)
+        for event in verbose_events:
+            assert_real_event(self, event)
+        self.assertEqual(last_text(verbose_events), OK_ANSWER)
 
     def test_slow_mode_honours_fake_mimo_sleep(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-slow", mode="slow")
@@ -221,8 +441,10 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertIn("text", types)
         self.assertIn("step_start", types)
         self.assertIn("step_finish", types)
+        for event in events:
+            assert_real_event(self, event)
         self.assertEqual(events[-1]["type"], "text")
-        self.assertEqual(events[-1]["data"]["text"], FINAL_ANSWER)
+        self.assertEqual(last_text(events), FINAL_ANSWER)
 
     def test_silent_mode_emits_nothing_and_stalls(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-silent", mode="silent")
@@ -242,6 +464,8 @@ class MimoFakesSmokeTest(unittest.TestCase):
         events = parse_jsonl(first.stdout)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["type"], "error")
+        assert_real_event(self, events[0])
+        self.assertEqual(events[0]["error"]["name"], "APIError")
         self.assertIn("ECONNRESET", events[0]["error"]["data"]["message"])
         second = subprocess.run([str(fake)] + self._argv(),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -249,7 +473,9 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                 timeout=20, cwd=str(self.ws))
         self.assertEqual(second.returncode, 0, second.stderr)
         events = parse_jsonl(second.stdout)
-        self.assertEqual(events[-1]["data"]["text"], FINAL_ANSWER)
+        self.assertEqual(events, _RUN_EVENTS,
+                         "flaky recovery must behave like ok")
+        self.assertEqual(last_text(events), OK_ANSWER)
         self.assertTrue(any(e["type"] == "step_start" for e in events))
 
     def test_env_mode_overrides_baked_mode(self):
@@ -269,8 +495,7 @@ class MimoFakesSmokeTest(unittest.TestCase):
                             "-m", "xiaomi/mimo-v2.6-flash"])
         self.assertEqual(result.returncode, 0, result.stderr)
         events = parse_jsonl(result.stdout)
-        self.assertEqual(events[-1]["type"], "text")
-        self.assertEqual(events[-1]["data"]["text"], "READY")
+        self.assertEqual(last_text(events), "READY")
 
     # -- error modes ------------------------------------------------------
 
@@ -281,13 +506,19 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                 universal_newlines=True, env=self._env(),
                                 timeout=20, cwd=str(self.ws))
         self.assertEqual(result.returncode, 1)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(lines, fixture_lines(ERROR_401_FIXTURE),
+                         "error_auth must replay the 401 recording raw")
         events = parse_jsonl(result.stdout)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["type"], "error")
+        self.assertEqual(events, [_ERROR_401],
+                         "error_auth must replay the 401 recording exactly")
+        assert_real_event(self, events[0])
+        self.assertEqual(events[0]["error"]["name"], "APIError")
         data = events[0]["error"]["data"]
         self.assertEqual(data["statusCode"], 401)
-        self.assertIn("Unauthorized", data["message"])
-        self.assertIn("api key", data["message"])
+        self.assertIs(data["isRetryable"], False)
+        self.assertIn("API Key", data["message"])
+        self.assertIn("metadata", data)
 
     def test_error_limit_carries_status_code_429(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-limit", mode="error_limit")
@@ -299,9 +530,13 @@ class MimoFakesSmokeTest(unittest.TestCase):
         events = parse_jsonl(result.stdout)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["type"], "error")
+        assert_real_event(self, events[0])
+        self.assertEqual(events[0]["error"]["name"], "APIError")
         data = events[0]["error"]["data"]
         self.assertEqual(data["statusCode"], 429)
+        self.assertIs(data["isRetryable"], True)
         self.assertIn("rate limit", data["message"].lower())
+        self.assertIn("metadata", data)
 
     def test_error_network_message_and_exit(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-net", mode="error_network")
@@ -313,9 +548,42 @@ class MimoFakesSmokeTest(unittest.TestCase):
         events = parse_jsonl(result.stdout)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["type"], "error")
-        message = events[0]["error"]["data"]["message"]
+        assert_real_event(self, events[0])
+        self.assertEqual(events[0]["error"]["name"], "APIError")
+        data = events[0]["error"]["data"]
+        message = data["message"]
         self.assertIn("fetch failed: ECONNRESET", message)
         self.assertIn("network", message.lower())
+        self.assertEqual(data["statusCode"], 0,
+                         "network errors carry no HTTP status (0)")
+        self.assertIs(data["isRetryable"], True)
+
+    def test_error_modes_carry_real_error_shape(self):
+        for mode, code, retryable in (("error_auth", 401, False),
+                                      ("error_limit", 429, True),
+                                      ("error_network", 0, True)):
+            fake = write_fake_mimo(self.root / "bin" / ("mimo-" + mode),
+                                   mode=mode)
+            result = subprocess.run([str(fake)] + self._argv(),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    universal_newlines=True, env=self._env(),
+                                    timeout=20, cwd=str(self.ws))
+            self.assertEqual(result.returncode, 1, mode)
+            events = parse_jsonl(result.stdout)
+            self.assertEqual(len(events), 1, mode)
+            event = events[0]
+            assert_real_event(self, event)
+            self.assertEqual(event["type"], "error", mode)
+            self.assertIn("sessionID", event, mode)
+            self.assertNotIn("part", event, mode)
+            error = event["error"]
+            self.assertEqual(error["name"], "APIError", mode)
+            data = error["data"]
+            self.assertEqual(data["statusCode"], code, mode)
+            self.assertIs(data["isRetryable"], retryable, mode)
+            self.assertTrue(data["message"], mode)
+            self.assertIsInstance(data["metadata"], dict, mode)
 
     # -- attach / argv capture -------------------------------------------
 
@@ -331,8 +599,13 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                 cwd=str(self.ws))
         self.assertEqual(result.returncode, 0, result.stderr)
         events = parse_jsonl(result.stdout)
-        self.assertEqual(events[-1]["data"]["text"], FINAL_ANSWER)
+        self.assertEqual(len(events), len(_RUN_EVENTS),
+                         "attach must behave like ok")
+        self.assertEqual(last_text(events), OK_ANSWER)
         self.assertTrue(any(e["type"] == "step_finish" for e in events))
+        for event in events:
+            assert_real_event(self, event)
+            self.assertEqual(event["sessionID"], "sess-7")
         recorded = json.loads(Path(env["FAKE_MIMO_ARGV"]).read_text(
             encoding="utf-8"))
         self.assertEqual(recorded[1:], args)
@@ -464,6 +737,10 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                  password=server_pw, username="")
             self.assertEqual(status, 401,
                              "empty username must be 401 (real CLI expects mimocode)")
+            status, body = fetch(served.url + "/global/health",
+                                 password=server_pw, username="admin")
+            self.assertEqual(status, 401,
+                             "only the mimocode username may authenticate")
             status, body = fetch(served.url + "/global/health",
                                  password=server_pw)
             self.assertEqual(status, 200,
