@@ -396,12 +396,46 @@ class CrosscheckReproGateTest(unittest.TestCase):
         """P3-4: the 20 KB record tail must not decide the match."""
         marker = "NEEDLE"
         code = "import sys; sys.stdout.write(%r + 'x' * 25000)" % marker
-        command = crosscheck.shlex.join([sys.executable, "-c", code])
+        command = python_command(code)
         item = self.finding(executable=True,
                             repro={"command": command, "output": marker})
         kept, filtered, stats = crosscheck.verify_findings([item], self.ws)
         self.assertEqual(len(kept), 1, filtered)
         self.assertEqual(stats["false_alarm_filtered"], 0)
+
+    def test_real_runner_uses_a_disposable_workspace_copy(self):
+        victim = Path(self.ws) / "victim.txt"
+        victim.write_text("original", encoding="utf-8")
+        command = python_command(
+            "import pathlib; pathlib.Path('victim.txt').write_text('mutated'); "
+            "print('workspace changed')")
+        item = self.finding(executable=True,
+                            repro={"command": command,
+                                   "output": "workspace changed"})
+        kept, filtered, _stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(len(kept), 1, filtered)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "original")
+
+    def test_repro_home_is_isolated_from_the_operator(self):
+        command = python_command(
+            "import os; print('HOME=' + os.environ.get('HOME', ''))")
+        item = self.finding(executable=True,
+                            repro={"command": command, "output": "HOME="})
+        kept, filtered, _stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(len(kept), 1, filtered)
+        output = kept[0]["repro_result"]["output"].strip()
+        self.assertIn("HOME=", output)
+        self.assertNotEqual(output, "HOME=" + os.path.expanduser("~"))
+
+    def test_too_short_expected_output_is_dropped(self):
+        item = self.finding(executable=True,
+                            repro={"command": "python repro.py",
+                                   "output": "1"})
+        kept, filtered, stats = crosscheck.verify_findings(
+            [item], self.ws, runner=StubRunner((0, "anything 1")))
+        self.assertEqual(kept, [])
+        self.assertEqual(filtered[0]["false_alarm_reason"],
+                         "repro_output_too_short")
 
 
 if __name__ == "__main__":

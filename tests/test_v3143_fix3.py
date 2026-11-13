@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 _HERE = Path(__file__).resolve()
-_REPO = os.environ.get("CF_REPO") or str(_HERE.parents[2] / "repo")
+_REPO = os.environ.get("CF_REPO") or str(_HERE.parents[1])
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
@@ -70,10 +70,28 @@ class ZeroJobDeadlineAuthorityTest(unittest.TestCase):
         env = self._direct(cfg)  # no tool arg at all
         self.assertEqual(env.job_max_seconds, 0)
 
-    def test_operator_ceiling_still_clamps_zero(self):
+    def test_operator_ceiling_does_not_cap_explicit_zero(self):
         cfg = make_cfg(explicit_seconds=True, job_max_seconds=3600.0)
         env = self._direct(cfg, job_max_seconds=0)
+        self.assertEqual(env.job_max_seconds, 0)
+        self.assertEqual(env.to_dict()["job_max_seconds"], 0)
+
+    def test_operator_ceiling_still_caps_a_positive_request(self):
+        cfg = make_cfg(explicit_seconds=True, job_max_seconds=3600.0)
+        env = self._direct(cfg, job_max_seconds=9000)
         self.assertEqual(env.job_max_seconds, 3600.0)
+
+    def test_resumed_explicit_zero_is_not_recapped(self):
+        cfg = make_cfg(explicit_seconds=True, job_max_seconds=3600.0)
+        run = {"workspace": self.workspace, "job_max_seconds": 0}
+        env = authority.legacy_default(
+            run, cfg, {"spec": {"workspace": self.workspace,
+                                "job_max_seconds": 0}})
+        self.assertEqual(env.job_max_seconds, 0)
+
+    def test_zero_marker_survives_an_unbounded_narrow(self):
+        self.assertEqual(authority._stricter_budget(
+            0, None, "job_max_seconds", unlimited_zero=True), 0.0)
 
     def test_none_is_unchanged(self):
         env = self._direct()

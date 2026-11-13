@@ -1,20 +1,31 @@
 #!/bin/sh
 # CrewForeman pre-push privacy gate.
 #
-# Install once per clone:
+# The connector installs this hook automatically in repositories where it
+# creates commits or rebases.  To install it by hand in a clone:
 #     git config core.hooksPath scripts/hooks
 #
 # It scans the commit METADATA (author and committer name+email) and the added
 # file content of every commit being pushed, and blocks the push when anything
 # is outside the allowlist (config `git_identity`, `noreply@example.com` and
 # the email-shaped entries of `git_identity_exceptions`).
-#
-# The connector never installs this hook itself: release pushes are a
-# human-approved step (docs/OPERATIONS.md, "Release safety").
 
+zero="0000000000000000000000000000000000000000"
+PYTHON="${CF_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "pre-push: no python interpreter found; refusing." >&2
+    exit 1
+fi
 remote="$1"
 status=0
-zero="0000000000000000000000000000000000000000"
 
 while read local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue          # branch deletion
@@ -27,7 +38,7 @@ while read local_ref local_sha remote_ref remote_sha; do
         status=1
         continue
     fi
-    if ! python3 -m deepseek_mcp.git_identity \
+    if ! "$PYTHON" -m deepseek_mcp.git_identity \
             --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
         status=1
     fi

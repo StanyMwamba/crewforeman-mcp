@@ -11,6 +11,7 @@ Covers the two field failures:
 Windows-compatible: no shell, no network, tempfile only.
 """
 
+import sys
 import unittest
 
 from deepseek_mcp import harness, jobs, status
@@ -149,7 +150,7 @@ class TerminalGateTests(unittest.TestCase):
         from deepseek_mcp import reviewer_vendor
         candidate = {"name": "kimi", "vendor": "Kimi (Moonshot)",
                      "model": "", "enabled": True, "error": None,
-                     "dsh_bin": "/bin/echo", "patch": "",
+                     "dsh_bin": sys.executable, "patch": "",
                      "api_key_env": "", "legacy_wrapper": False}
 
         def ping(_candidate):

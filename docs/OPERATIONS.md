@@ -1354,10 +1354,11 @@ phase and is recorded as `job_max_seconds: 0` with
 `job_max_seconds_display: "unlimited"`; the internal 7200 s stall ceiling is
 not re-applied to a phase that has no deadline. A negative tool argument or configured
 value is rejected with a clear error.
-An operator-configured positive ceiling still caps a per-job `0`; remove the
-key (or set it to `null`) to let callers disable the deadline. Progress-gated
-stall detection (`stall_seconds`, `stall_max_seconds`) is unchanged and still
-protects against a silent child.
+An explicit `0` is never re-capped, not even when the operator configured a
+positive `job_max_seconds` ceiling: the ceiling caps positive per-job requests
+only. Remove the key (or set it to `null`) if you also want the operator
+default to be unlimited. Progress-gated stall detection (`stall_seconds`,
+`stall_max_seconds`) is unchanged and still protects against a silent child.
 
 ### `depends_on_policy`
 
@@ -1394,22 +1395,31 @@ name and address, the default `crewforeman-mcp` / `noreply@example.com`, and
 the email-shaped entries from `git_identity_exceptions`). An exception remote
 is exempt from the metadata check but its added content is still scanned.
 
-`git_identity_exceptions` lists remote names or URL substrings that keep their
-own repo-local identity, for example a personal fork such as
-`"StanyMwamba/Cypraea"`. The list is matched against the remote name and URL;
-no personal address is built in anywhere.
+`git_identity_exceptions` lists remotes that keep their own repo-local
+identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
+Matching is **exact**, not a substring: an entry may be the remote name
+(`origin`), `owner/repo`, or a full URL (with or without `.git`). A substring
+match would let an entry such as `owner/repo` exempt an unrelated
+`evil.example/fork-of-owner/repo` push target. No personal address is built
+in anywhere.
 
 ```bash
 python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \
     --remote origin        # exit 1 blocks the push
 ```
 
-To block every push automatically, install the checked-in hook once per clone:
+The connector installs `scripts/hooks/pre-push` automatically the first time
+it creates a commit or rebase in a clone, so later `git push` runs the gate
+even if `core.hooksPath` was never configured. An operator's existing
+`pre-push` hook is never overwritten. To install it by hand instead:
 
 ```bash
 git config core.hooksPath scripts/hooks
 ```
 
+Connector-controlled release tooling calls
+`git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)`: it runs
+the same gate and returns before `git push` on any violation.
 `scripts/hooks/pre-push` runs the same gate for each pushed ref, using the
 remote's advertised sha as the base (or the merge-base for a new branch). It
 scans metadata and content and exits non-zero on any violation.

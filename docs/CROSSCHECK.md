@@ -174,17 +174,22 @@ quotes:
 ```
 
 Before a finding is counted, the **connector** re-runs the reproduction once
-in the workspace. Identical rows (same id and same `repro`) share one run; the
-same id with different evidence is verified separately, so a decoy cannot hide
-a real finding. The command is split into an argv and is never run through
-a shell, with a scrubbed environment (`PATH`, `HOME`/desktop, `TMPDIR`/`TEMP`,
-locale and the platform's process variables survive; API keys do not), a hard
-10 s cap, and a process-group kill on timeout. The
-observed output must contain the claimed output; an explicit `exit_code`
-pins the status when the finder cares about it. A spec quote is checked
-against the file at the recorded line. Findings that do not reproduce are
-dropped, marked `filtered_by: "connector_repro"` with `repro_status` `failed`
-or `unverified`, and counted as `false_alarm_filtered`; a dropped finding can
-never be an open BLOCKING item. The per-job record reports `raw_findings`,
+in a disposable copy of the workspace. Identical rows (same id and same
+`repro`) share one run; the same id with different evidence is verified
+separately, so a decoy cannot hide a real finding. The command is split into
+an argv and is never run through a shell, with a scrubbed environment
+(`PATH`, `TMPDIR`/`TEMP`, locale and the platform's process variables
+survive; API keys do not), a hard 10 s cap, and a process-group kill on
+timeout. `HOME`, `USERPROFILE`, `APPDATA` and the XDG directories point at a
+fresh temporary directory, so a repro cannot read the operator's credential
+store by absolute path, and the copy is removed afterwards so a repro cannot
+mutate the operator's tree. The observed output must contain the claimed
+output (at least four characters, so `1` or `x` cannot match by accident);
+an explicit `exit_code` pins the status when the finder cares about it. A
+spec quote is checked against the file at the recorded line. Findings that do
+not reproduce are dropped, marked `filtered_by: "connector_repro"` with
+`repro_status` `failed` or `unverified`, and counted as
+`false_alarm_filtered`; a dropped finding can never be an open BLOCKING item.
+The per-job record reports `raw_findings`,
 `unique`, `real`, `false_alarm`, `false_alarm_filtered`, `unverified` and the
 breaker/spec split, so a noisy round is visible as numbers rather than prose.

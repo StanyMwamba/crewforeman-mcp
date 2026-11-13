@@ -35,8 +35,9 @@ that stops crosscheck false alarms from being counted.
   "unset"; negative tool values are rejected. The run record shows
   `job_max_seconds: 0` with `job_max_seconds_display: "unlimited"`, and the
   built-in 7200 s stall ceiling no longer re-imposes the deadline the caller
-  disabled. An operator-configured positive ceiling still caps a per-job `0`,
-  and the shipped `config.example.json` no longer pins one.
+  disabled. An operator-configured positive ceiling caps positive per-job
+  requests only: an explicit `0` is never re-capped. The shipped
+  `config.example.json` no longer pins a ceiling.
 - **Commit-identity gate.** New `deepseek_mcp/git_identity.py` sets the
   repo-local identity from config `git_identity` (default
   `crewforeman-mcp` with the reserved `noreply` address at `example.com`) for every commit and rebase the
@@ -44,9 +45,13 @@ that stops crosscheck false alarms from being counted.
   and committer name+email of every commit in `base..head`) as well as added
   file contents. Any identity outside the allowlist blocks the push.
   `git_identity_exceptions` lists remotes that keep their own identity (for
-  example a personal fork such as `StanyMwamba/Cypraea`); no personal address
-  is hardcoded. CLI: `python -m deepseek_mcp.git_identity --repo DIR --base A
-  --head B`.
+  example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
+  on the remote name, `owner/repo` or full URL, so a lookalike remote cannot
+  borrow the exception, and no personal address is hardcoded. The connector
+  installs the `pre-push` hook on the first commit/rebase it creates (an
+  operator's own hook is left alone) and exposes
+  `git_identity.push_with_gate` for connector-controlled pushes. CLI:
+  `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
   builders get the OS boundary when the platform can provide it; a per-job
   `danger-full-access` is labelled
@@ -57,8 +62,10 @@ that stops crosscheck false alarms from being counted.
 - **Crosscheck findings must reproduce.** Every finding now carries a
   reproduction command and output (or, for non-executable spec findings, a
   `file:line` + exact quote the connector verifies). The connector re-runs
-  each repro once before the finding counts; findings that do not reproduce
-  are dropped and counted as `false_alarm_filtered`. Records report
+  each repro once before the finding counts, in a disposable workspace copy
+  with a fresh HOME/desktop profile, and requires at least four characters of
+  claimed output; findings that do not reproduce are dropped and counted as
+  `false_alarm_filtered`. Records report
   `raw_findings`, `unique`, `real`, `false_alarm`, `false_alarm_filtered`,
   `unverified` and breaker/spec counts.
 - **Release hygiene.** Version 3.14.3 across package metadata and server

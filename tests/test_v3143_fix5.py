@@ -135,7 +135,13 @@ class RealConfigTest(unittest.TestCase):
     def test_macos_default_workspace_writer_gets_a_boundary(self):
         if platforms.normalize_system() != "Darwin":
             self.skipTest("macOS-only proof of the default boundary")
-        policy = safety.sandbox_policy({}, args={"sandbox": "workspace-write"})
+        # The probe result is host-dependent (sandbox-exec cannot nest inside
+        # the test runner's own sandbox); pin the enforced probe so this test
+        # proves the policy default, not the CI host's nesting ability.
+        with mock.patch.object(safety, "sandbox_status",
+                               lambda **kw: _enforced_seatbelt()):
+            policy = safety.sandbox_policy(
+                {}, args={"sandbox": "workspace-write"})
         self.assertEqual(policy["os_sandbox_mode"], "auto")
         self.assertTrue(policy["os_sandbox"])
         self.assertEqual(policy["enforcement"], "enforced")

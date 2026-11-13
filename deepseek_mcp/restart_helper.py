@@ -295,15 +295,27 @@ def read_status(path):
 
 
 def write_status(path, record):
-    """Atomically write the small, human-readable JSON status file."""
+    """Atomically write the small, human-readable JSON status file.
+
+    Windows denies ``os.replace`` while another process has the destination
+    open without ``FILE_SHARE_DELETE`` (a polling reader is enough), so retry
+    the replace briefly instead of reporting a spurious helper failure.
+    """
     path = Path(os.path.expanduser(str(path)))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(str(tmp), "w", encoding="utf-8") as handle:
         json.dump(record, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    os.replace(str(tmp), str(path))
-    return str(path)
+    last_error = None
+    for attempt in range(6):
+        try:
+            os.replace(str(tmp), str(path))
+            return str(path)
+        except PermissionError as exc:  # Windows sharing violation
+            last_error = exc
+            time.sleep(0.02 * (attempt + 1))
+    raise last_error
 
 
 def _number(value, default, low, high, label, integer=False):

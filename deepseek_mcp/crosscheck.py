@@ -20,9 +20,11 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 try:  # Keep the module importable in isolation.
@@ -708,18 +710,68 @@ def _repro_timeout(timeout):
     return min(max(value, 0.1), REPRO_TIMEOUT)
 
 
+def _repro_workspace_copy(workspace):
+    """Return ``(path, cleanup)`` for a disposable copy of *workspace*.
+
+    Model-authored findings must not be able to mutate the operator's tree.
+    The copy keeps relative repro paths working; ``.git`` and test scratch
+    directories are skipped so the copy stays small.  If copying fails, the
+    original path is used and the caller still gets the isolated HOME and
+    scrubbed environment.
+    """
+    root = os.path.abspath(str(workspace or ""))
+    if not root or not os.path.isdir(root):
+        return str(workspace or ""), (lambda: None)
+    parent = ""
+    try:
+        parent = tempfile.mkdtemp(prefix="cf-repro-")
+        target = os.path.join(parent, "workspace")
+        shutil.copytree(
+            root, target, symlinks=True,
+            ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.pyc", ".dsh-tmp-tests",
+                ".pytest_cache", "node_modules"))
+        return target, (lambda: shutil.rmtree(parent, ignore_errors=True))
+    except Exception:  # noqa: BLE001 - fall back to the original path
+        if parent:
+            shutil.rmtree(parent, ignore_errors=True)
+        return root, (lambda: None)
+
+
 def _repro_run(command, cwd, timeout):
-    """Default runner: one argv command in the workspace, short timeout."""
+    """Default runner: one argv command in a disposable workspace copy.
+
+    HOME and the platform profile variables point at a fresh temporary
+    directory so a model-authored repro cannot read the operator's credential
+    store even when it uses an absolute path below ``~``.
+    """
     argv = _repro_argv(command)
     kwargs = {}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(
-        argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        errors="replace", env=_repro_env(), **kwargs)
+    try:
+        home = tempfile.mkdtemp(prefix=".repro-home-", dir=str(cwd))
+    except OSError:
+        home = tempfile.mkdtemp(prefix="cf-repro-home-")
+    env = _repro_env()
+    env["HOME"] = home
+    env["USERPROFILE"] = home
+    env["APPDATA"] = home
+    env["LOCALAPPDATA"] = home
+    env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
+    env["XDG_CACHE_HOME"] = os.path.join(home, ".cache")
+    env["XDG_DATA_HOME"] = os.path.join(home, ".local", "share")
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            errors="replace", env=env, **kwargs)
+    finally:
+        if proc is None:
+            shutil.rmtree(home, ignore_errors=True)
     try:
         output, _unused = proc.communicate(timeout=_repro_timeout(timeout))
     except subprocess.TimeoutExpired:
@@ -729,6 +781,8 @@ def _repro_run(command, cwd, timeout):
         except Exception:
             pass
         raise
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
     return {"returncode": proc.returncode,
             "output": (output or "")[-_REPRO_MATCH_LIMIT:]}
 
@@ -822,6 +876,10 @@ def _verify_one(item, workspace, runner, timeout):
     expected = str(repro.get("output") or "").strip()
     if not expected:
         return False, "missing_repro_output", ""
+    if len(expected) < 4:
+        # A one-character marker ("1", "x") reproduces against almost any
+        # command; require the same minimum as a spec quote.
+        return False, "repro_output_too_short", ""
     try:
         result = (runner or _repro_run)(command, str(workspace or ""), timeout)
         code, output = _repro_result(result)
@@ -868,34 +926,43 @@ def verify_findings(findings, workspace, runner=None, timeout=REPRO_TIMEOUT):
     cache = {}
     kept = []
     filtered = []
-    for item in rows:
-        if _finding_status(item) == "false_alarm":
-            filtered.append(item)
-            continue
-        ident = _repro_cache_key(item)
-        if ident not in cache:
-            cache[ident] = _verify_one(item, workspace, runner, limit)
-        ok, reason, observed = cache[ident]
-        row = dict(item)
-        if ok:
-            row["repro_status"] = "verified"
-            row["repro_verified"] = True
-            row["repro_result"] = {
-                "status": "verified", "reason": reason,
-                "output": _truncate(observed, 800)}
-            kept.append(row)
-        else:
-            unverified = reason in ("repro_timeout", "runner_error") or str(
-                reason).startswith("runner_error")
-            row["status"] = "false_alarm"
-            row["repro_status"] = "unverified" if unverified else "failed"
-            row["repro_verified"] = False
-            row["filtered_by"] = "connector_repro"
-            row["false_alarm_reason"] = reason
-            row["repro_result"] = {
-                "status": row["repro_status"], "reason": reason,
-                "output": _truncate(observed, 800)}
-            filtered.append(row)
+    # Real reproduction commands run against a disposable copy; a custom
+    # runner (tests, future remote runner) keeps the path it was given.
+    repro_workspace = workspace
+    cleanup = lambda: None
+    if runner is None:
+        repro_workspace, cleanup = _repro_workspace_copy(workspace)
+    try:
+        for item in rows:
+            if _finding_status(item) == "false_alarm":
+                filtered.append(item)
+                continue
+            ident = _repro_cache_key(item)
+            if ident not in cache:
+                cache[ident] = _verify_one(item, repro_workspace, runner, limit)
+            ok, reason, observed = cache[ident]
+            row = dict(item)
+            if ok:
+                row["repro_status"] = "verified"
+                row["repro_verified"] = True
+                row["repro_result"] = {
+                    "status": "verified", "reason": reason,
+                    "output": _truncate(observed, 800)}
+                kept.append(row)
+            else:
+                unverified = reason in ("repro_timeout", "runner_error") or str(
+                    reason).startswith("runner_error")
+                row["status"] = "false_alarm"
+                row["repro_status"] = "unverified" if unverified else "failed"
+                row["repro_verified"] = False
+                row["filtered_by"] = "connector_repro"
+                row["false_alarm_reason"] = reason
+                row["repro_result"] = {
+                    "status": row["repro_status"], "reason": reason,
+                    "output": _truncate(observed, 800)}
+                filtered.append(row)
+    finally:
+        cleanup()
     lens = [_repro_lens(item) for item in rows]
     stats = {
         "raw_findings": len(rows),

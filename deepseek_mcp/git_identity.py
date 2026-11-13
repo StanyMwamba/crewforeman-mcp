@@ -196,7 +196,126 @@ def apply_identity(repo, cfg=None):
         rc, _out, err = _git(repo, ["config", "--local", key, value])
         if rc != 0:
             return False, (err or "git_config_failed").strip()
+    # Any later `git push` from this clone must hit the same gate, even when
+    # the operator never ran `git config core.hooksPath scripts/hooks`.
+    ok, detail = ensure_pre_push_hook(repo, cfg)
+    if not ok:
+        return False, detail
     return True, ""
+
+
+_PRE_PUSH_MARKER = "# CrewForeman pre-push gate (auto-installed)"
+_PRE_PUSH_HOOK = r"""#!/bin/sh
+# CrewForeman pre-push gate (auto-installed)
+#
+# The connector installs this hook in every repository where it creates a
+# commit or rebase.  It scans the commit METADATA (author and committer
+# name+email) and the added file content of every pushed commit, and blocks
+# the push when anything is outside the allowlist.
+zero="0000000000000000000000000000000000000000"
+PYTHON="${CF_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "pre-push: no python interpreter found; refusing." >&2
+    exit 1
+fi
+remote="$1"
+status=0
+while read local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    base="$remote_sha"
+    case "$base" in
+        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+    esac
+    if [ -z "$base" ]; then
+        echo "pre-push: cannot determine a base for $local_ref; refusing." >&2
+        status=1
+        continue
+    fi
+    if ! "$PYTHON" -m deepseek_mcp.git_identity \
+            --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
+        status=1
+    fi
+done
+if [ "$status" -ne 0 ]; then
+    echo "pre-push: blocked by the CrewForeman privacy/identity gate." >&2
+fi
+exit "$status"
+"""
+
+
+def ensure_pre_push_hook(repo, cfg=None):
+    """Install the pre-push gate in *repo*; keep an operator's own hook.
+
+    Returns ``(ok, detail)``.  A repository that already carries a different
+    pre-push hook is left untouched (``existing_hook_kept``) so the connector
+    never overwrites an operator's gate; the shipped hook remains available
+    at ``scripts/hooks/pre-push`` and is documented in OPERATIONS.md.
+    """
+
+    rc, out, err = _git(repo, ["rev-parse", "--git-path", "hooks"])
+    if rc != 0:
+        return False, (err or "git_hooks_path_failed").strip()
+    hooks = out.strip()
+    if not hooks:
+        return False, "git_hooks_path_empty"
+    if not os.path.isabs(hooks):
+        hooks = os.path.join(str(repo), hooks)
+    path = os.path.join(hooks, "pre-push")
+    try:
+        os.makedirs(hooks, exist_ok=True)
+        existing = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                existing = handle.read()
+        if existing and _PRE_PUSH_MARKER not in existing:
+            return True, "existing_hook_kept"
+        if existing.strip() == _PRE_PUSH_HOOK.strip():
+            return True, "already_installed"
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_PRE_PUSH_HOOK)
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+        return True, "installed"
+    except OSError as exc:
+        return False, "hook_install_failed:%s" % (exc,)
+
+
+def push_with_gate(cfg, repo, remote, refspec=None, base="", head="HEAD",
+                   extra_args=None):
+    """Push only after the connector's metadata/content gate passes.
+
+    This is the connector-controlled push path used by release tooling: a
+    violation returns ``(1, "", message)`` and no ``git push`` runs.
+    """
+
+    if not base:
+        rc, out, _err = _git(
+            repo, ["merge-base", str(head), "refs/remotes/%s/HEAD" % remote])
+        if rc == 0 and out.strip():
+            base = out.strip()
+    report = check_push(cfg, repo=repo, base=base, head=head, remote=remote)
+    if not report.get("ok"):
+        detail = "; ".join(report.get("messages") or [])
+        return 1, "", detail or "identity_gate_blocked"
+    args = ["push", str(remote)]
+    if refspec:
+        if isinstance(refspec, (list, tuple)):
+            args.extend(str(item) for item in refspec)
+        else:
+            args.append(str(refspec))
+    if extra_args:
+        args.extend(str(item) for item in extra_args)
+    return _git(repo, args)
 
 
 def commit_with_identity(cfg, repo, message, extra_args=None):
@@ -242,22 +361,67 @@ def _remote_candidates(repo, remote):
     return values
 
 
+def _remote_path(url):
+    """Normalise a git remote URL to a lower-case ``host/path`` string.
+
+    Handles URL and SCP-style forms, and leaves a plain local path alone so
+    an exact-match comparison still works for file remotes.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    elif "@" in text and ":" in text.split("@", 1)[1]:
+        # SCP-style git@host:owner/repo
+        host, path = text.split("@", 1)[1].split(":", 1)
+        return (host + "/" + path).strip("/").lower()
+    if "@" in text:
+        text = text.split("@", 1)[1]
+    return text.lower().strip("/")
+
+
 def exception_for_remote(cfg, repo, remote):
     """Return the exception entry matching this remote, or ``""``.
 
-    Matching is a case-insensitive substring test against the remote name and
-    its configured URL, e.g. the documented example entry
-    ``"StanyMwamba/Cypraea"`` matches
-    ``https://github.com/StanyMwamba/Cypraea.git``.
+    Matching is EXACT, not a substring: an entry may be the remote name
+    (``origin``), ``owner/repo``, or a full URL.  A substring match would let
+    an entry such as ``owner/repo`` exempt ``evil.example/fork-of-owner/repo``
+    and silence the identity gate for an unrelated push target.
     """
 
     entries = exceptions_from_config(cfg)
     if not entries or not remote:
         return ""
-    haystack = [value.lower() for value in _remote_candidates(repo, remote)]
+    name = str(remote).strip().lower()
+    candidates = {name}
+    for value in _remote_candidates(repo, remote):
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        lowered = raw.rstrip("/").lower()
+        candidates.add(lowered)
+        if lowered.endswith(".git"):
+            candidates.add(lowered[:-4])
+        path = _remote_path(raw)
+        if path:
+            candidates.add(path)
+            # owner/repo is the last two path segments (GitHub/GitLab style).
+            segments = [part for part in path.split("/") if part]
+            if len(segments) >= 2:
+                candidates.add("/".join(segments[-2:]))
     for entry in entries:
-        needle = entry.lower()
-        if any(needle in value for value in haystack):
+        needle = entry.strip().lower().rstrip("/")
+        if needle.endswith(".git"):
+            needle = needle[:-4]
+        if "://" in needle or "@" in needle:
+            parsed = _remote_path(needle)
+            if parsed:
+                needle = parsed
+        if needle in candidates:
             return entry
     return ""
 

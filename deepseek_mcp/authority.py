@@ -366,7 +366,10 @@ def _stricter_budget(old, new, field, unlimited_zero=False):
             if old_bound is not None:
                 raise WideningError(
                     "%s cannot be widened (removing the bound)" % field)
-            return 0.0 if new_value == 0 else None
+            # Preserve an explicit-zero marker already in the envelope too;
+            # decaying it to None would turn "unlimited" into "unset" on a
+            # later resume and re-impose the built-in default.
+            return 0.0 if (new_value == 0 or old_value == 0) else None
         if old_bound is not None and new_bound > old_bound:
             raise WideningError("%s cannot be widened" % field)
         return new_bound
@@ -787,15 +790,12 @@ def direct(args, cfg, origin="harness_deepseek", now=None):
     if requested_seconds is None:
         requested_seconds = cfg_seconds
     elif (_cfg_explicit(cfg, "job_max_seconds")
-          and cfg_seconds is not None and cfg_seconds > 0):
-        # The built-in 7200 default must not clamp an explicit caller value;
-        # an operator-configured lower ceiling may.  An operator 0 means the
-        # operator removed the ceiling, so it never clamps a caller request.
-        # An explicit caller 0 stays unlimited unless such a ceiling exists.
-        if requested_seconds == 0:
-            requested_seconds = cfg_seconds
-        else:
-            requested_seconds = min(requested_seconds, cfg_seconds)
+          and cfg_seconds is not None and cfg_seconds > 0
+          and requested_seconds > 0):
+        # A positive operator ceiling caps a positive per-job request.  An
+        # explicit caller 0 means "no whole-job deadline" and is never
+        # re-capped: 0 is the documented unlimited value.
+        requested_seconds = min(requested_seconds, cfg_seconds)
     cfg_cost = _seconds(_cfg(cfg, "job_max_cost_usd", None))
     requested_cost = _requested(args.get("job_max_cost_usd"),
                                 "job_max_cost_usd")
@@ -946,15 +946,14 @@ def legacy_default(run, cfg, metadata=None):
     if saved_seconds is None:
         saved_seconds = _budget_seconds(spec.get("job_max_seconds"))
     cfg_seconds = _budget_seconds(_cfg(cfg, "job_max_seconds", None))
-    cfg_explicit = _cfg_explicit(cfg, "job_max_seconds")
     if saved_seconds is None:
         seconds = cfg_seconds
     elif cfg_seconds is None or cfg_seconds <= 0:
         seconds = saved_seconds
     elif saved_seconds <= 0:
-        # A saved explicit 0 is "unlimited" and must not be clamped by the
-        # built-in 7200 default; only an operator-configured ceiling may.
-        seconds = cfg_seconds if cfg_explicit else saved_seconds
+        # A saved explicit 0 is "unlimited" and is never re-capped, not even
+        # by an operator-configured positive ceiling.
+        seconds = saved_seconds
     else:
         seconds = min(saved_seconds, cfg_seconds)
     saved_cost = _seconds(run.get("job_max_cost_usd"))

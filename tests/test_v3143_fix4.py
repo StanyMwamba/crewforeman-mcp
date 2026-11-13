@@ -212,6 +212,81 @@ class GitIdentityTest(unittest.TestCase):
         self.assertTrue(allowed["ok"], allowed["messages"])
         self.assertEqual(allowed["exception"], "example-org/Cypraea")
 
+    def test_exception_is_exact_not_a_substring(self):
+        """An entry must not exempt evil.example/fork-of-owner/repo."""
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign")
+        self.git("remote", "add", "evil",
+                 "https://evil.example/fork-of-example-org/Cypraea.git")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["example-org/Cypraea"]}
+        report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
+                                         head="HEAD", remote="evil")
+        self.assertFalse(report["ok"], report)
+
+    def test_exception_matches_full_url_and_remote_name(self):
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign")
+        self.git("remote", "add", "upstream",
+                 "https://github.com/example-org/Cypraea.git")
+        for entry in ("https://github.com/example-org/Cypraea",
+                      "https://github.com/example-org/Cypraea.git",
+                      "upstream"):
+            cfg = {"git_identity": dict(CFG["git_identity"]),
+                   "git_identity_exceptions": [entry]}
+            report = git_identity.check_push(
+                cfg, repo=str(self.repo), base=base, head="HEAD",
+                remote="upstream")
+            self.assertTrue(report["ok"], (entry, report["messages"]))
+
+    def test_connector_installs_the_pre_push_hook(self):
+        self.commit("first")
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        self.assertTrue(hook.is_file())
+        text = hook.read_text(encoding="utf-8")
+        self.assertIn("CrewForeman pre-push gate (auto-installed)", text)
+        self.assertIn("deepseek_mcp.git_identity", text)
+
+    def test_existing_operator_hook_is_never_overwritten(self):
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\necho operator-hook\n", encoding="utf-8")
+        self.commit("first")
+        self.assertEqual(hook.read_text(encoding="utf-8"),
+                         "#!/bin/sh\necho operator-hook\n")
+
+    def test_push_with_gate_blocks_foreign_then_allows_connector_identity(self):
+        bare = self.root / "remote.git"
+        _run(["init", "--bare", str(bare)], self.root)
+        base = self.commit("base", "base.txt")
+        self.git("remote", "add", "origin", str(bare))
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        self.foreign_commit("foreign")
+        old_pythonpath = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = str(REPO_ROOT)
+        try:
+            rc, _out, err = git_identity.push_with_gate(
+                CFG, self.repo, "origin", "main:refs/heads/main", base=base)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("allowlist", err)
+            remote_heads = _run(["rev-parse", "--verify", "main"], bare)
+            self.assertNotEqual(remote_heads.returncode, 0,
+                                "a blocked push must not reach the remote")
+            # Fixing the history (not stacking on the foreign commit) makes
+            # the same range pass the gate.
+            self.git("reset", "--hard", base)
+            self.commit("mine", "mine.txt")
+            rc, _out, err = git_identity.push_with_gate(
+                CFG, self.repo, "origin", "main:refs/heads/main", base=base)
+            self.assertEqual(rc, 0, err)
+            remote_heads = _run(["rev-parse", "--verify", "main"], bare)
+            self.assertEqual(remote_heads.returncode, 0)
+        finally:
+            if old_pythonpath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = old_pythonpath
+
     def test_content_scan_still_catches_secret(self):
         base = self.commit("base", "base.txt")
         self.commit("secret", "notes.txt",
