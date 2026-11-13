@@ -154,3 +154,5 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
 | Browser | `take_screenshot` needs an installed Chrome/Edge or an OS screenshot helper and, on macOS, Screen Recording permission. | Returns `unsupported` with the missing dependency; it does not install anything. |
 | Transport | The server is local stdio only. There is no network listener, authentication layer or multi-user mode. | Run one server process per client; use the client's own access control. |
 | Keys | The server reads `DEEPSEEK_API_KEY` from its environment and never writes it to run records. | Configure the key in the MCP client's `env` block, not in prompts. |
+
+- MiMo Code 0.1.17 itself adds a `"$schema"` key to an existing project `mimocode.jsonc` when it loads it (observed with plain `mimo debug config`). CrewForeman never writes that file; the settings are kept, only the key is added by the CLI.

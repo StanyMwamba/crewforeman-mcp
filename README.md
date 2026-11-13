@@ -8,7 +8,7 @@ CrewForeman 3.15.0 is a local stdio MCP server. It runs Harness on your machine,
 | Builder | Harness, any model (default DeepSeek) | Sizes the team, builds in waves, revises on notes. |
 | Independent reviewer | Configurable, any vendor (e.g. Kimi) | Scores 0–10 and lists blocking defects. |
 | Client / coordinator | Your MCP client (e.g. Claude) | Sends the brief and reads the result. |
-| MiMo builder | mimo, xiaomi/mimo-v2.6-pro | Builds and revises; backup when DeepSeek fails. |
+| MiMo builder | mimo, xiaomi/mimo-v2.6-pro | Builds and revises, like the DeepSeek builder. |
 | MiMo reviewer | mimo, xiaomi/mimo-v2.6-pro | Scores 0–10 from a second vendor. |
 | MiMo crosscheck crew | mimo, xiaomi/mimo-v2.6-pro | Cross-checks parts in crosscheck mode. |
 | MiMo backup | mimo | Takes over when DeepSeek is quarantined or failing. |
@@ -75,8 +75,9 @@ Add to client configuration:
 ## MiMo Code worker
 MiMo Code (`mimo`, v0.1.17) is the second-vendor worker. Check `mimo --version`, then run `mimo providers login` with a pay-as-you-go sk- key or a Token Plan tp- key and its own base URL. Build, review and crosscheck default to `xiaomi/mimo-v2.6-pro`; probes use `xiaomi/mimo-v2.6-flash`. Pick MiMo per job with `builder_provider`/`builder_model`, `reviewer_provider`/`reviewer_model` or `crosscheck_crew_provider`/`crosscheck_crew_model`; `mimo_bin` or `MIMO_BIN` names the binary.
 Concurrency detects `workflow.maxConcurrentAgents`, else min(16, 2 x cores), uses the max, and backs off on 429 or limit errors. Permissions are allow rules passed in `MIMOCODE_CONFIG_CONTENT`: never `--yolo`, and skip-permissions only via the explicit `mimo_skip_permissions` opt-in. Serve/attach shares one server under a per-server password in `MIMOCODE_SERVER_PASSWORD`. Usage and cost are recorded per vendor, vendor-reported cost first; CI runs a fake `mimo` only.
+Example: DeepSeek keeps building and MiMo reviews, so the reviewer is a different vendor.
 ```json
-{"builder_provider": "mimo", "reviewer_provider": "mimo",
+{"reviewer_provider": "mimo",
  "mimo_bin": "mimo", "mimo_default_model": "xiaomi/mimo-v2.6-pro"}
 ```
 ## Guarantees
