@@ -715,7 +715,8 @@ _REPRO_COPY_IGNORE = (
     ".git", "__pycache__", "*.pyc", ".dsh-tmp-tests", ".pytest_cache",
     "node_modules", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
     "*.kdbx", "credentials", "credentials.*", ".ssh", ".aws", ".dsh",
-    "id_rsa*", "id_ed25519*",
+    "id_rsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc",
+    ".git-credentials", "secrets.*", "*.secret", "*.token", ".docker",
 )
 
 
@@ -745,6 +746,17 @@ def _repro_workspace_copy(workspace):
         return None, (lambda: None)
     if _tree_bytes(root, _REPRO_COPY_MAX_BYTES) > _REPRO_COPY_MAX_BYTES:
         return None, (lambda: None)
+    # A symlink pointing outside the workspace would let the repro read an
+    # arbitrary absolute path; fail closed rather than copy such a tree.
+    prefix = root + os.sep
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in list(dirnames) + filenames:
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            target = os.path.realpath(path)
+            if target != root and not target.startswith(prefix):
+                return None, (lambda: None)
     parent = ""
     try:
         parent = tempfile.mkdtemp(prefix="cf-repro-")
@@ -984,7 +996,7 @@ def verify_findings(findings, workspace, runner=None, timeout=REPRO_TIMEOUT):
                 row["repro_verified"] = True
                 row["repro_result"] = {
                     "status": "verified", "reason": reason,
-                    "output": _truncate(observed, 800)}
+                    "output": _truncate(redact_secrets(observed), 800)}
                 kept.append(row)
             else:
                 unverified = reason in ("repro_timeout", "runner_error") or str(
@@ -996,7 +1008,7 @@ def verify_findings(findings, workspace, runner=None, timeout=REPRO_TIMEOUT):
                 row["false_alarm_reason"] = reason
                 row["repro_result"] = {
                     "status": row["repro_status"], "reason": reason,
-                    "output": _truncate(observed, 800)}
+                    "output": _truncate(redact_secrets(observed), 800)}
                 filtered.append(row)
     finally:
         cleanup()

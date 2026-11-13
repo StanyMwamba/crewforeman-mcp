@@ -1,16 +1,28 @@
 #!/bin/sh
-# CrewForeman pre-push privacy gate.
+# CrewForeman pre-push gate (checked-in copy; the connector auto-installs the
+# same gate in repositories where it creates commits or rebases).
 #
-# The connector installs this hook automatically in repositories where it
-# creates commits or rebases.  To install it by hand in a clone:
+# Install by hand with:
 #     git config core.hooksPath scripts/hooks
 #
-# It scans the commit METADATA (author and committer name+email) and the added
-# file content of every commit being pushed, and blocks the push when anything
-# is outside the allowlist (config `git_identity`, `noreply@example.com` and
-# the email-shaped entries of `git_identity_exceptions`).
-
+# It scans the commit METADATA (author and committer name+email, plus message
+# and trailer addresses) and the added file content of every pushed commit,
+# and blocks the push when anything is outside the allowlist (configured
+# `git_identity` plus `noreply@example.com`).  Exceptions are exact
+# `owner/repo` or URL matches; bare remote names are ignored.
+#
+# An operator hook in the same directory is preserved as pre-push.local and
+# runs first.
 zero="0000000000000000000000000000000000000000"
+HOOK_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+ROOT=$(CDPATH='' cd -- "$HOOK_DIR/../.." && pwd -P) || exit 1
+refs="$HOOK_DIR/.pre-push-refs.$$"
+trap 'rm -f "$refs"' EXIT HUP INT TERM
+cat > "$refs" || exit 1
+status=0
+if [ -x "$HOOK_DIR/pre-push.local" ]; then
+    "$HOOK_DIR/pre-push.local" "$@" < "$refs" || status=1
+fi
 PYTHON="${CF_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
     for candidate in python3 python; do
@@ -24,11 +36,18 @@ if [ -z "$PYTHON" ]; then
     echo "pre-push: no python interpreter found; refusing." >&2
     exit 1
 fi
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) CF_SEP=';' ;;
+    *) CF_SEP=':' ;;
+esac
+CF_PYTHONPATH="$ROOT"
+if [ -n "${PYTHONPATH:-}" ]; then
+    CF_PYTHONPATH="$CF_PYTHONPATH$CF_SEP$PYTHONPATH"
+fi
+export PYTHONPATH="$CF_PYTHONPATH"
 remote="$1"
-status=0
-
 while read local_ref local_sha remote_ref remote_sha; do
-    [ "$local_sha" = "$zero" ] && continue          # branch deletion
+    [ "$local_sha" = "$zero" ] && continue
     base="$remote_sha"
     case "$base" in
         "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base="" ;;
@@ -38,8 +57,7 @@ while read local_ref local_sha remote_ref remote_sha; do
             --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
         status=1
     fi
-done
-
+done < "$refs"
 if [ "$status" -ne 0 ]; then
     echo "pre-push: blocked by the CrewForeman privacy/identity gate." >&2
 fi

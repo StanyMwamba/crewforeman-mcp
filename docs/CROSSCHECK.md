@@ -182,9 +182,12 @@ an argv and is never run through a shell, with a scrubbed environment
 survive; API keys do not), a hard 10 s cap, and a process-group kill on
 timeout. `HOME`, `USERPROFILE`, `APPDATA` and the XDG directories point at a
 fresh temporary directory, and common secret files (`.env`, keys,
-`credentials*`, `.ssh`, `.dsh`) are left out of the copy, so the default
-profile stores are not exposed. A copy that is too large (over 256 MiB) or
-cannot be read fails closed: the affected findings are unverified and no
+`credentials*`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `secrets.*`,
+`.ssh`, `.docker`, `.dsh`) are left out of the copy, so the default profile
+stores are not exposed. A symlink that resolves outside the workspace fails
+closed, and the observed output is passed through the connector's secret
+redactor before it is stored in the run record. A copy that is too large (over
+256 MiB) or cannot be read fails closed: the affected findings are unverified and no
 command runs in the operator's tree. This is **not** a security sandbox: a
 repro that names an absolute path outside the copy can still read it, and the
 command runs with the operator's network access. Treat crosscheck findings as

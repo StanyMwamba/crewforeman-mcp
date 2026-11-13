@@ -68,9 +68,10 @@ that stops crosscheck false alarms from being counted.
   reproduction command and output (or, for non-executable spec findings, a
   `file:line` + exact quote the connector verifies). The connector re-runs
   each repro once before the finding counts, in a disposable workspace copy
-  with a fresh HOME/desktop profile (common secret files are not copied;
-  a copy that is too large or unreadable fails closed instead of running in
-  place), and requires at least four characters of claimed output; findings that do not reproduce are dropped and counted as
+  with a fresh HOME/desktop profile (common secret files are not copied,
+  out-of-tree symlinks and oversized/unreadable trees fail closed instead of
+  running in place, and output is secret-redacted before it is stored), and
+  requires at least four characters of claimed output; findings that do not reproduce are dropped and counted as
   `false_alarm_filtered`. Records report
   `raw_findings`, `unique`, `real`, `false_alarm`, `false_alarm_filtered`,
   `unverified` and breaker/spec counts.

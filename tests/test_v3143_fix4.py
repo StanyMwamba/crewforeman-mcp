@@ -442,6 +442,29 @@ class GitIdentityTest(unittest.TestCase):
                             and v.get("email") == "personal@example.org"
                             for v in report["violations"]), report)
 
+    @unittest.skipUnless(shutil.which("sh"), "sh is required")
+    def test_checked_in_hook_blocks_and_allows(self):
+        hook = REPO_ROOT / "scripts" / "hooks" / "pre-push"
+        self.assertTrue(hook.is_file())
+        base = self.commit("base", "base.txt")
+        self.git("remote", "add", "origin",
+                 "https://github.com/example-org/crewforeman-mcp.git")
+        self.foreign_commit("foreign")
+        refs = "refs/heads/main HEAD refs/heads/main %s\n" % base
+        proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
+                              cwd=str(self.repo), input=refs, text=True,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("allowlist", proc.stdout)
+        self.git("reset", "--hard", base)
+        self.commit("mine", "mine.txt")
+        proc = subprocess.run([shutil.which("sh"), str(hook), "origin"],
+                              cwd=str(self.repo), input=refs, text=True,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
     def test_content_scan_still_catches_secret(self):
         base = self.commit("base", "base.txt")
         self.commit("secret", "notes.txt",

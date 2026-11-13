@@ -1,6 +1,7 @@
 """Tests for the crosscheck reproduction gate (fix 6)."""
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -429,19 +430,52 @@ class CrosscheckReproGateTest(unittest.TestCase):
         self.assertNotEqual(output, "HOME=" + os.path.expanduser("~"))
 
     def test_secret_files_are_not_copied_into_the_repro(self):
-        Path(self.ws, ".env").write_text("# placeholder\n", encoding="utf-8")
-        Path(self.ws, "server.pem").write_text("# placeholder\n", encoding="utf-8")
+        for name in (".env", "server.pem", ".netrc", "secrets.txt"):
+            Path(self.ws, name).write_text("# placeholder\n", encoding="utf-8")
         command = python_command(
             "import pathlib; "
-            "print('env=' + str(pathlib.Path('.env').exists()) + "
-            "' key=' + str(pathlib.Path('server.pem').exists()))")
+            "print(' '.join(name + '=' + str(pathlib.Path(name).exists()) "
+            "for name in ('.env', 'server.pem', '.netrc', 'secrets.txt')))")
         item = self.finding(executable=True,
                             repro={"command": command,
-                                   "output": "env=False key=False"})
+                                   "output": ("env=False server.pem=False "
+                                              ".netrc=False secrets.txt=False")})
         kept, filtered, _stats = crosscheck.verify_findings([item], self.ws)
         self.assertEqual(len(kept), 1, filtered)
-        self.assertIn("env=False key=False",
-                      kept[0]["repro_result"]["output"])
+        output = kept[0]["repro_result"]["output"]
+        for name in (".env", "server.pem", ".netrc", "secrets.txt"):
+            self.assertIn(name + "=False", output)
+
+    def test_repro_output_is_redacted_before_it_is_stored(self):
+        secret = "sk-" + "a" * 30
+        command = python_command("print('token=' + %r)" % secret)
+        item = self.finding(executable=True,
+                            repro={"command": command,
+                                   "output": "token=" + secret})
+        kept, filtered, _stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(len(kept), 1, filtered)
+        stored = kept[0]["repro_result"]["output"]
+        self.assertNotIn(secret, stored)
+        self.assertIn("token=", stored)
+
+    def test_out_of_tree_symlink_fails_closed(self):
+        outside_dir = tempfile.mkdtemp(prefix="cf-outside-")
+        self.addCleanup(shutil.rmtree, outside_dir, True)
+        outside = Path(outside_dir) / "secret.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        link = Path(self.ws) / "link.txt"
+        try:
+            os.symlink(str(outside), str(link))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available")
+        item = self.finding(executable=True,
+                            repro={"command": python_command("print('okay')"),
+                                   "output": "okay"})
+        kept, filtered, stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(kept, [])
+        self.assertEqual(filtered[0]["false_alarm_reason"],
+                         "repro_copy_failed")
+        self.assertEqual(stats["false_alarm_filtered"], 1)
 
     def test_copy_failure_fails_closed_without_running_in_place(self):
         victim = Path(self.ws) / "victim.txt"
