@@ -1839,6 +1839,9 @@ def _structured_status(args, state, run_id, cfg):
         })
     payload["reviewer_usage"] = run.get("reviewer_usage") or {}
     payload["review_rounds"] = rounds_view
+    # Per-vendor token/cost split (3.15.0): same shape as the run record's
+    # model_usage aggregate, so callers need not open the run record.
+    payload["model_usage"] = run.get("model_usage") or {}
     if run.get("reviewer_preflight"):
         payload["reviewer_preflight"] = run.get("reviewer_preflight")
     try:

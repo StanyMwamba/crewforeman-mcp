@@ -10805,6 +10805,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             except Exception:
                 pass
         run["model_usage"] = usage_aggregate.finish()
+        # The per-vendor split belongs in the waste report too; the report is
+        # collected before this aggregate exists, so merge it here.
+        by_vendor = (run["model_usage"] or {}).get("by_vendor")
+        if by_vendor and isinstance(run.get("waste_report"), dict):
+            run["waste_report"] = dict(run["waste_report"])
+            run["waste_report"]["by_vendor"] = by_vendor
         # R3: feed the model axis into the bounded failure-note store. The
         # token is (run_id, "model"), so a resume/rebuild never double-counts.
         for label, row in (run["model_usage"].get("models") or {}).items():
