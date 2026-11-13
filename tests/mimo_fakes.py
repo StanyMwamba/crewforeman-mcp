@@ -2,12 +2,42 @@
 
 This module owns the fake ``mimo`` programs used by the whole 3.15 suite --
 tests never run the real ``mimo`` or touch the network.  The fake honours the
-CLI contract produced by ``mimo_worker.build_argv``::
+CLI contract produced by ``mimo_worker.build_argv`` and verified against the
+real mimo 0.1.17 CLI (MIMO_FIX1.md)::
 
     mimo run "<task>" --format json --dir <folder> -m <model>
         [--variant <v>] [-s <session>] [--attach <url>]
         [--dangerously-skip-permissions]
-    mimo serve --host <H> --port <P>
+    mimo serve --hostname <h> --port <p>
+
+``mimo serve`` has no ``--host`` flag: like the real CLI the fake prints a
+usage blurb and exits non-zero when ``--host`` (or ``--host=...``) appears
+anywhere in argv, and never starts a server.  ``--port 0`` binds an ephemeral
+port and the ready line reports the port actually bound.  After binding, the
+fake prints exactly (real CLI format)::
+
+    mimocode server listening on http://<hostname>:<port>
+
+on stdout (``<hostname>`` defaults to ``127.0.0.1``), so with defaults the
+line is ``mimocode server listening on http://127.0.0.1:<port>``.  This plain
+line (not JSONL) is the contract ``mimo_worker`` parses to learn the bound
+port.
+
+HTTP surface of ``mimo serve`` (stdlib server on 127.0.0.1 only):
+
+- ``GET /global/health`` -> 200, body ``ok``.
+- ``GET /healthz``       -> 503.
+- ``GET /doc``           -> 200.
+- anything else          -> 404.
+
+When ``MIMOCODE_SERVER_PASSWORD`` is set (non-empty) in the serve process,
+EVERY HTTP request must carry ``Authorization: Basic base64(":" + password)``
+(empty username, password part matching) or it is answered 401.  Without the
+env var no auth is required (the real CLI's unsecured case).  When
+``mimo run --attach <url>`` runs with ``MIMOCODE_SERVER_PASSWORD`` set, the
+fake records its PRESENCE (never the value) as ``"password_env": true`` in
+the state capture (``FAKE_MIMO_STATE``) so tests can assert attach runs were
+given the password; the password never appears in stdout/stderr or captures.
 
 and emits the pinned event-stream contract (JSONL on stdout)::
 
@@ -20,7 +50,10 @@ and emits the pinned event-stream contract (JSONL on stdout)::
     {"type": "serve", "url": "http://host:port"}
 
 The last ``text`` event of a successful run is the final answer.  Token usage
-accumulates across ``step_finish`` events.
+accumulates across ``step_finish`` events.  The ``serve`` event is an extra
+helpful marker emitted after the ready line; the ready line itself is the
+contract, and the serve URL capture file (``FAKE_MIMO_SERVE_URL``) is still
+written for tests.
 
 Modes (``write_fake_mimo(path, mode=...)``, overridable with env
 ``FAKE_MIMO_MODE`` when non-empty):
@@ -40,14 +73,19 @@ Modes (``write_fake_mimo(path, mode=...)``, overridable with env
                   own timeout.
 - ``flaky``       first run fails with a network error (state-file counter),
                   later runs behave like ``ok``.
-- ``serve``       runs the ``mimo serve`` behaviour even for ``run`` argv.
+- ``serve``       runs the ``mimo serve`` behaviour even for ``run`` argv:
+                  binds ``--hostname``/``--port``, prints the ready line,
+                  serves the HTTP surface above.
 - ``attach``      behaves like ``ok`` and accepts/ignores ``--attach <url>``.
 - ``verbose``     like ``ok`` with extra ``tool_use`` events.
 
 Environment (see :func:`base_env`): ``FAKE_MIMO_MODE``, ``FAKE_MIMO_SLEEP``,
-``FAKE_MIMO_ARGV`` (argv capture file), ``FAKE_MIMO_STATE`` (flaky counter),
-``FAKE_MIMO_SESSIONS`` (session record directory), ``FAKE_MIMO_SERVE_URL``
-(serve URL capture file), ``FAKE_MIMO_SERVE_PORT`` (default serve port).
+``FAKE_MIMO_ARGV`` (argv capture file), ``FAKE_MIMO_STATE`` (flaky counter and
+``password_env`` presence flag), ``FAKE_MIMO_SESSIONS`` (session record
+directory), ``FAKE_MIMO_SERVE_URL`` (serve URL capture file),
+``FAKE_MIMO_SERVE_PORT`` (default serve port), ``FAKE_MIMO_SERVE_HOST``
+(default serve hostname), ``MIMOCODE_SERVER_PASSWORD`` (serve auth password /
+run-side presence recording; the value is never echoed).
 
 The fake is a plain Python script; on Windows the returned path is the
 compiled launcher from ``tests.build_fake_dsh.build_launcher`` so it is
@@ -66,6 +104,7 @@ MODES = ("ok", "text_only", "error_auth", "error_limit", "error_network",
 # The generated script.  ``__DEFAULT_MODE__`` is replaced at write time.
 _FAKE_MIMO_BODY = r'''#!/usr/bin/env python3
 """Fake mimo CLI for the CrewForeman test suite (JSONL event stream)."""
+import base64
 import json
 import os
 import signal
@@ -77,10 +116,21 @@ from pathlib import Path
 DEFAULT_MODE = __DEFAULT_MODE__
 FINAL_ANSWER = "Fake mimo final answer: done."
 
+# Real CLI (mimo 0.1.17): mimo serve has NO --host flag; it is --hostname/--port.
+SERVE_USAGE = (
+    "usage: mimo serve [--hostname HOSTNAME] [--port PORT]\n"
+    "\n"
+    "Serve the MiMo HTTP server.\n"
+    "\n"
+    "optional arguments:\n"
+    "  --hostname HOSTNAME  bind hostname (default: 127.0.0.1)\n"
+    "  --port PORT          bind port (0 = OS-assigned)\n"
+)
+
 VALUE_FLAGS = {
     "--format": "format", "--dir": "dir", "-m": "model", "--model": "model",
     "--variant": "variant", "-s": "session", "--session": "session",
-    "--attach": "attach", "--host": "host", "--port": "port",
+    "--attach": "attach", "--hostname": "hostname", "--port": "port",
 }
 BOOL_FLAGS = {"--dangerously-skip-permissions": "skip_permissions",
               "--yolo": "skip_permissions"}
@@ -90,7 +140,7 @@ def parse_cli(argv):
     """Parse the mimo CLI loosely: flags in any order, task after 'run'."""
     opts = {"subcommand": None, "task": None, "format": None, "dir": None,
             "model": None, "variant": None, "session": None, "attach": None,
-            "host": None, "port": None, "skip_permissions": False}
+            "hostname": None, "port": None, "skip_permissions": False}
     positionals = []
     args = list(argv[1:])
     index = 0
@@ -203,7 +253,8 @@ def maybe_session_record(opts):
 def run_serve(opts):
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
-    host = opts.get("host") or os.environ.get("FAKE_MIMO_SERVE_HOST") or "127.0.0.1"
+    host = (opts.get("hostname") or os.environ.get("FAKE_MIMO_SERVE_HOST")
+            or "127.0.0.1")
     raw_port = opts.get("port")
     if raw_port is None or raw_port == "":
         raw_port = os.environ.get("FAKE_MIMO_SERVE_PORT") or "0"
@@ -216,23 +267,57 @@ def run_serve(opts):
         def log_message(self, fmt, *args):
             pass
 
-        def do_GET(self):
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
-            if path == "/healthz":
-                body = b"ok"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
+        def _authorized(self):
+            password = os.environ.get("MIMOCODE_SERVER_PASSWORD")
+            if not password:
+                return True
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                return False
+            try:
+                decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+            except Exception:
+                return False
+            user, sep, supplied = decoded.partition(":")
+            return sep == ":" and user == "" and supplied == password
+
+        def _send(self, status, body, write_body):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            if status == 401:
+                self.send_header("WWW-Authenticate", 'Basic realm="mimocode"')
+            self.end_headers()
+            if write_body:
                 self.wfile.write(body)
+
+        def _respond(self, write_body):
+            if not self._authorized():
+                self._send(401, b"unauthorized", write_body)
+                return
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == "/global/health":
+                self._send(200, b"ok", write_body)
+            elif path == "/healthz":
+                self._send(503, b"unhealthy", write_body)
+            elif path == "/doc":
+                self._send(200, b"doc", write_body)
             else:
-                self.send_response(404)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                self._send(404, b"", write_body)
+
+        def do_GET(self):
+            self._respond(True)
+
+        def do_HEAD(self):
+            self._respond(False)
+
+        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_GET
 
     httpd = HTTPServer((host, port), Handler)
     bound = httpd.server_address[1]
     url = "http://%s:%s" % (host, bound)
+    # Real CLI ready line, printed after the bind with the real bound port.
+    print("mimocode server listening on %s" % url, flush=True)
     emit({"type": "serve", "url": url})
     capture = os.environ.get("FAKE_MIMO_SERVE_URL")
     if capture:
@@ -264,6 +349,12 @@ def run_serve(opts):
     sys.exit(0)
 
 
+def state_path(opts):
+    workspace = Path(opts["dir"] or os.getcwd())
+    return Path(os.environ.get("FAKE_MIMO_STATE")
+                or str(workspace / ".fake-mimo-state.json"))
+
+
 def load_state(state_path):
     try:
         return json.loads(Path(state_path).read_text(encoding="utf-8"))
@@ -278,6 +369,14 @@ def save_state(state_path, state):
         pass
 
 
+def record_password_env(opts):
+    """Record that MIMOCODE_SERVER_PASSWORD was present; never its value."""
+    path = state_path(opts)
+    state = load_state(path)
+    state["password_env"] = True
+    save_state(path, state)
+
+
 def main():
     opts = parse_cli(sys.argv)
     if os.environ.get("FAKE_MIMO_ARGV"):
@@ -286,9 +385,20 @@ def main():
                 json.dumps(sys.argv), encoding="utf-8")
         except OSError:
             pass
+    # Real CLI has no --host flag: it prints usage/help and exits non-zero
+    # without starting a server.
+    for arg in sys.argv[1:]:
+        if arg == "--host" or arg.startswith("--host="):
+            sys.stderr.write(SERVE_USAGE)
+            sys.stderr.write(
+                "mimo serve: error: unrecognized arguments: %s\n" % arg)
+            sys.exit(2)
     mode = os.environ.get("FAKE_MIMO_MODE") or DEFAULT_MODE
     if opts["subcommand"] == "serve" or mode == "serve":
         run_serve(opts)
+    # Run-side (incl. --attach): note password-env presence, never the value.
+    if os.environ.get("MIMOCODE_SERVER_PASSWORD"):
+        record_password_env(opts)
     if mode == "silent":
         time.sleep(300)
         sys.exit(0)
@@ -303,12 +413,10 @@ def main():
         emit_error("fetch failed: ECONNRESET (network unreachable)")
         sys.exit(1)
     if mode == "flaky":
-        workspace = Path(opts["dir"] or os.getcwd())
-        state_path = Path(os.environ.get("FAKE_MIMO_STATE")
-                          or str(workspace / ".fake-mimo-state.json"))
-        state = load_state(state_path)
+        counter_path = state_path(opts)
+        state = load_state(counter_path)
         state["flaky"] = int(state.get("flaky", 0)) + 1
-        save_state(state_path, state)
+        save_state(counter_path, state)
         if state["flaky"] == 1:
             emit_error("fetch failed: ECONNRESET (network unreachable)")
             sys.exit(1)

@@ -1,14 +1,20 @@
 """Smoke tests for ``tests.mimo_fakes`` — the fake ``mimo`` programs.
 
 Each mode must emit the documented JSONL event stream (see the module
-docstring of ``tests.mimo_fakes``), ``serve`` must answer ``GET /healthz``,
-``attach`` must record argv, and the error modes must carry the right
-``statusCode``.  No network beyond 127.0.0.1, no real ``mimo``, and no long
-sleeps (``FAKE_MIMO_SLEEP`` is kept small).
+docstring of ``tests.mimo_fakes``), ``serve`` must answer the real-CLI HTTP
+surface (``/global/health`` 200, ``/healthz`` 503, ``/doc`` 200), reject
+``--host``, print the real ready line, enforce ``MIMOCODE_SERVER_PASSWORD``
+basic auth when set, ``attach`` must record argv plus password-env presence,
+and the error modes must carry the right ``statusCode``.  No network beyond
+127.0.0.1, no real ``mimo``, and no long sleeps (``FAKE_MIMO_SLEEP`` is kept
+small).
 """
 
+import base64
+import contextlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -22,15 +28,45 @@ from tests.mimo_fakes import base_env, write_fake_mimo
 
 TOKEN_KEYS = ("total", "input", "output", "reasoning", "cache")
 FINAL_ANSWER = "Fake mimo final answer: done."
+READY_LINE_RE = re.compile(r"^mimocode server listening on "
+                           r"http://127\.0\.0\.1:(\d+)$")
 
 
 def parse_jsonl(text):
+    """Parse the JSONL events; skip plain-text lines (e.g. the ready line)."""
     events = []
     for line in text.splitlines():
         line = line.strip()
-        if line:
+        if line.startswith("{"):
             events.append(json.loads(line))
     return events
+
+
+def fetch(url, password=None, username=""):
+    """GET *url*; return ``(status, body)`` without raising on 4xx/5xx."""
+    request = urllib.request.Request(url)
+    if password is not None:
+        token = base64.b64encode(
+            (username + ":" + password).encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", "Basic " + token)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        exc.close()
+        return exc.code, body
+
+
+class _Served:
+    """Handle on a running fake-serve process (outputs set on close)."""
+
+    def __init__(self, proc, url):
+        self.proc = proc
+        self.url = url
+        self.out = ""
+        self.err = ""
+        self.returncode = None
 
 
 class MimoFakesSmokeTest(unittest.TestCase):
@@ -46,6 +82,9 @@ class MimoFakesSmokeTest(unittest.TestCase):
 
     def _env(self, **extra):
         env = dict(os.environ)
+        # Never inherit the real server password: the no-auth cases must see
+        # the env var absent, the auth cases set it explicitly.
+        env.pop("MIMOCODE_SERVER_PASSWORD", None)
         env.update(base_env(self.root, fake_mimo=self.fake, **extra))
         return env
 
@@ -278,7 +317,7 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertIn("fetch failed: ECONNRESET", message)
         self.assertIn("network", message.lower())
 
-    # -- attach / serve / argv capture -----------------------------------
+    # -- attach / argv capture -------------------------------------------
 
     def test_attach_mode_records_argv_and_behaves_like_ok(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-attach", mode="attach")
@@ -298,15 +337,158 @@ class MimoFakesSmokeTest(unittest.TestCase):
             encoding="utf-8"))
         self.assertEqual(recorded[1:], args)
 
-    def test_serve_subcommand_answers_healthz(self):
-        self._check_serve(["serve", "--host", "127.0.0.1", "--port", "0"],
-                          self._env())
+    def test_attach_records_password_presence_without_echoing(self):
+        fake = write_fake_mimo(self.root / "bin" / "mimo-attach-pw",
+                               mode="attach")
+        server_pw = "sekrit-value-42"
+        env = self._env(MIMOCODE_SERVER_PASSWORD=server_pw)
+        args = self._argv("--attach", "http://127.0.0.1:9")
+        result = subprocess.run([str(fake)] + args,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, env=env, timeout=20,
+                                cwd=str(self.ws))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state_file = Path(env["FAKE_MIMO_STATE"])
+        self.assertTrue(state_file.exists(),
+                        "password presence must land in the state capture")
+        state_text = state_file.read_text(encoding="utf-8")
+        state = json.loads(state_text)
+        self.assertTrue(state.get("password_env"),
+                        "attach run must record MIMOCODE_SERVER_PASSWORD "
+                        "presence: %r" % (state,))
+        # Presence only: the value must never be echoed or captured.
+        argv_text = Path(env["FAKE_MIMO_ARGV"]).read_text(encoding="utf-8")
+        for blob in (result.stdout, result.stderr, argv_text, state_text):
+            self.assertNotIn(server_pw, blob)
 
-    def test_serve_mode_answers_healthz(self):
+    def test_run_without_password_env_records_nothing(self):
+        env = self._env()
+        result = self._run(self._argv("--attach", "http://127.0.0.1:9"),
+                           env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state_file = Path(env["FAKE_MIMO_STATE"])
+        state = (json.loads(state_file.read_text(encoding="utf-8"))
+                 if state_file.exists() else {})
+        self.assertNotIn("password_env", state)
+
+    # -- serve: argv contract ---------------------------------------------
+
+    def test_serve_rejects_host_flag(self):
+        # Real CLI has no --host: usage/help to stderr, non-zero exit,
+        # and no server is started.
+        for args in (["serve", "--host", "127.0.0.1", "--port", "0"],
+                     ["serve", "--host=127.0.0.1", "--port", "0"]):
+            env = self._env()
+            try:
+                result = self._run(args, env=env, timeout=8)
+            except subprocess.TimeoutExpired:
+                self.fail("mimo serve --host must not start a server: %r"
+                          % (args,))
+            self.assertNotEqual(result.returncode, 0,
+                                "--host must exit non-zero: %r" % (args,))
+            combined = (result.stdout + result.stderr).lower()
+            self.assertIn("usage", combined,
+                          "--host must print a usage/help blurb: %r" % (args,))
+            self.assertIn("hostname", combined,
+                          "the blurb must name the real --hostname flag")
+            self.assertFalse(Path(env["FAKE_MIMO_SERVE_URL"]).exists(),
+                             "--host must not bind/start a server")
+
+    def test_serve_ready_line_matches_real_cli_format(self):
+        env = self._env()
+        with self._serve(["serve", "--hostname", "127.0.0.1", "--port", "0"],
+                         env) as served:
+            status, body = fetch(served.url + "/global/health")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"ok")
+            port = int(served.url.rsplit(":", 1)[1])
+        self._assert_serve_stopped_cleanly(served)
+        self.assertGreater(port, 0, "port 0 must yield a real bound port")
+        lines = served.out.splitlines()
+        self.assertTrue(lines, "serve must print the ready line")
+        match = READY_LINE_RE.match(lines[0])
+        self.assertIsNotNone(
+            match,
+            "ready line must be exactly 'mimocode server listening on "
+            "http://127.0.0.1:<port>', got %r" % lines[0])
+        self.assertEqual(int(match.group(1)), port,
+                         "ready line must report the actually-bound port")
+        events = parse_jsonl(served.out)
+        serve_events = [e for e in events if e["type"] == "serve"]
+        self.assertTrue(serve_events, "serve must still emit its url event")
+        self.assertEqual(serve_events[0]["url"], served.url)
+
+    # -- serve: HTTP surface ----------------------------------------------
+
+    def test_serve_subcommand_http_surface(self):
+        env = self._env()
+        with self._serve(["serve", "--hostname", "127.0.0.1", "--port", "0"],
+                         env) as served:
+            status, body = fetch(served.url + "/global/health")
+            self.assertEqual(status, 200, "/global/health must be 200")
+            self.assertEqual(body, b"ok")
+            status, body = fetch(served.url + "/healthz")
+            self.assertEqual(status, 503, "/healthz must be 503")
+            status, body = fetch(served.url + "/doc")
+            self.assertEqual(status, 200, "/doc must be 200")
+            status, body = fetch(served.url + "/nope")
+            self.assertEqual(status, 404)
+        self._assert_serve_stopped_cleanly(served)
+
+    def test_serve_mode_http_surface(self):
         fake = write_fake_mimo(self.root / "bin" / "mimo-serve", mode="serve")
-        self._check_serve(["run", "ignored", "--format", "json",
-                           "--dir", str(self.ws), "-m", "xiaomi/mimo-v2.6-pro"],
-                          self._env(), fake=fake)
+        env = self._env()
+        with self._serve(["run", "ignored", "--format", "json",
+                          "--dir", str(self.ws), "-m", "xiaomi/mimo-v2.6-pro"],
+                         env, fake=fake) as served:
+            status, body = fetch(served.url + "/global/health")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"ok")
+            status, body = fetch(served.url + "/healthz")
+            self.assertEqual(status, 503)
+        self._assert_serve_stopped_cleanly(served)
+
+    # -- serve: MIMOCODE_SERVER_PASSWORD ----------------------------------
+
+    def test_serve_password_env_enforces_basic_auth(self):
+        server_pw = "s3kr1t-pass"
+        env = self._env(MIMOCODE_SERVER_PASSWORD=server_pw)
+        with self._serve(["serve", "--hostname", "127.0.0.1", "--port", "0"],
+                         env) as served:
+            status, body = fetch(served.url + "/global/health")
+            self.assertEqual(status, 401, "no auth must be 401")
+            status, body = fetch(served.url + "/global/health",
+                                 password="wrong")
+            self.assertEqual(status, 401, "wrong password must be 401")
+            status, body = fetch(served.url + "/global/health",
+                                 password=server_pw, username="someone")
+            self.assertEqual(status, 401,
+                             "non-empty username must be 401 (empty only)")
+            status, body = fetch(served.url + "/global/health",
+                                 password=server_pw)
+            self.assertEqual(status, 200,
+                             'basic auth of ":" + password must be 200')
+            self.assertEqual(body, b"ok")
+            # The gate covers every request, not just the health endpoint.
+            status, body = fetch(served.url + "/nope")
+            self.assertEqual(status, 401)
+        self._assert_serve_stopped_cleanly(served)
+
+    def test_serve_without_password_env_needs_no_auth(self):
+        env = self._env()
+        self.assertNotIn("MIMOCODE_SERVER_PASSWORD", env)
+        with self._serve(["serve", "--hostname", "127.0.0.1", "--port", "0"],
+                         env) as served:
+            status, body = fetch(served.url + "/global/health")
+            self.assertEqual(status, 200, "no auth required without the env")
+            self.assertEqual(body, b"ok")
+            status, body = fetch(served.url + "/global/health",
+                                 password="ignored")
+            self.assertEqual(status, 200,
+                             "auth headers must be ignored when not required")
+        self._assert_serve_stopped_cleanly(served)
+
+    # -- sessions ---------------------------------------------------------
 
     def test_session_record_when_sessions_dir_set(self):
         env = self._env()
@@ -317,31 +499,37 @@ class MimoFakesSmokeTest(unittest.TestCase):
         data = json.loads(records[0].read_text(encoding="utf-8"))
         self.assertEqual(data["session"], "sess-42")
 
-    def _check_serve(self, args, env, fake=None):
+    # -- serve helpers ----------------------------------------------------
+
+    @contextlib.contextmanager
+    def _serve(self, args, env, fake=None):
+        """Start fake serve, wait for its capture file, yield a ``_Served``.
+
+        The process is stopped on exit; ``out``/``err``/``returncode`` are
+        filled in afterwards for assertions.
+        """
         fake = fake or self.fake
-        proc = subprocess.Popen([str(fake)] + args, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([str(fake)] + list(args),
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 universal_newlines=True, env=env,
                                 cwd=str(self.ws))
+        served = _Served(proc, None)
         try:
             capture = Path(env["FAKE_MIMO_SERVE_URL"])
-            url = None
             deadline = time.time() + 8
             while time.time() < deadline:
                 if capture.exists():
                     try:
-                        url = json.loads(capture.read_text(
+                        served.url = json.loads(capture.read_text(
                             encoding="utf-8"))["url"]
                         break
                     except Exception:
                         pass
                 time.sleep(0.05)
-            self.assertIsNotNone(url, "serve URL capture file never appeared")
-            with urllib.request.urlopen(url + "/healthz", timeout=5) as response:
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.read(), b"ok")
-            with self.assertRaises(urllib.error.HTTPError):
-                urllib.request.urlopen(url + "/nope", timeout=5)
+            self.assertIsNotNone(served.url,
+                                 "serve URL capture file never appeared")
+            yield served
         finally:
             proc.terminate()
             try:
@@ -349,13 +537,17 @@ class MimoFakesSmokeTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 out, err = proc.communicate(timeout=10)
+            served.out, served.err = out, err
+            served.returncode = proc.returncode
+
+    def _assert_serve_stopped_cleanly(self, served):
         if os.name != "nt":
             # SIGTERM must end the fake cleanly.
-            self.assertEqual(proc.returncode, 0, err)
-        events = parse_jsonl(out)
+            self.assertEqual(served.returncode, 0, served.err)
+        events = parse_jsonl(served.out)
         serve_events = [e for e in events if e["type"] == "serve"]
         self.assertTrue(serve_events, "serve mode must print its url event")
-        self.assertEqual(serve_events[0]["url"], url)
+        self.assertEqual(serve_events[0]["url"], served.url)
 
 
 if __name__ == "__main__":
