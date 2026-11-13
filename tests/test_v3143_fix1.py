@@ -344,8 +344,13 @@ class GrandchildShutdownOrderingTests(unittest.TestCase):
     def test_abandoned_group_preserves_stderr_text(self):
         # stderr is a regular temp file, separate from the child's inherited
         # fd: it must be read even when the stdout stream is abandoned.
+        # Force a captured group on every host.  Windows has no pgid, so
+        # without this the fake's stdout reaches EOF and the stream is
+        # correctly *not* abandoned; the test needs the group-alive path.
         with mock.patch.object(
-                harness, "_process_group_alive", return_value=True), \
+                harness, "_process_group", return_value=987654321), \
+                mock.patch.object(
+                    harness, "_process_group_alive", return_value=True), \
                 mock.patch.object(harness, "_terminate_process"), \
                 mock.patch.multiple(
                     harness, EXIT_GROUP_DRAIN_SECONDS=0.25,
