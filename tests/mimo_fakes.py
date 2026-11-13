@@ -81,6 +81,56 @@ is a DICT with ``read``/``write`` counts (never an int) whose parts sum to
 <session>`` is passed the fake substitutes it into the replayed fixture
 events so resume flows see their own id (fixture ids are kept otherwise).
 
+Permission enforcement (``MIMOCODE_CONFIG_CONTENT``): the worker renders the
+permission map as pure JSON (``{"permission": {...}}``) into the
+``MIMOCODE_CONFIG_CONTENT`` environment variable -- never a workspace
+``mimocode.jsonc``.  The fake parses that env var at the start of run/serve
+and ENFORCES it; an absent or empty value means no enforcement (the
+pre-3.15 behaviour).  The rules, matching the
+``deepseek_mcp.mimo_permissions`` map shape (``read``, ``edit``, ``glob``,
+``grep``, ``list``, ``bash``, ``task``, ``actor``, ``skill``, ``webfetch``,
+``external_directory``; values are plain ``allow``/``deny`` strings or
+glob-maps as for ``bash``):
+
+- ``permission.edit == "deny"`` (plain string): every ``edit``/``write``
+  tool_use the fake emits fails (``part.state.status = "error"``,
+  ``part.state.output = "permission denied: edit"``) and the fake never
+  creates or modifies a file for it.  ``"allow"``/absent: tool calls
+  complete normally.
+- ``permission.bash``: a plain ``"deny"``/``"allow"`` string is an
+  all-denied/all-allowed verdict; a glob-map is evaluated against the bash
+  command with ``fnmatch`` (case-sensitive on every platform).  MATCHING
+  RULE: explicit (non-``"*"``) entries decide; among the matching entries
+  the most specific pattern wins -- specificity is the number of non-wildcard
+  characters in the pattern -- and ``"deny"`` wins on equal specificity.
+  With no explicit match the ``"*"`` catch-all fills the gap (read-only
+  ``{"*": "deny", "ls*": "allow"}`` lets ``ls x`` through and denies
+  ``rm x``; workspace-write ``{"*": "allow", "git push*": "deny"}`` denies
+  ``git push``).  With no matching entry at all the command is allowed.
+  Denied bash calls get ``status = "error"``, ``output =
+  "permission denied: bash"``.
+
+Enforcement applies to every mode INCLUDING fixture replays: a replayed
+``tool_use`` whose ``part.tool`` is ``edit``/``write`` (or ``bash`` with a
+denied ``part.state.input.command``) has its ``part.state.status`` flipped
+to ``"error"`` and ``part.state.output`` set to the denial text; the rest of
+the event stays verbatim.  ok/attach runs therefore respect the config they
+receive.
+
+Mode ``write_probe`` proves a read-only reviewer cannot write: it emits a
+real-shaped ``tool_use`` with ``part.tool = "write"`` targeting
+``probe-written.txt`` in the ``--dir`` workspace (the path is in
+``part.state.input``); when edit is permitted the fake ACTUALLY creates that
+file (small content) and the tool is ``completed``; when edit is denied no
+file appears and the tool is ``error`` with the denial output.  Final text
+event: ``"write probe done"``.
+
+State capture: every run/serve records a ``mimocode_config_env`` summary in
+``FAKE_MIMO_STATE`` -- ``{"present": true/false, "edit":
+"allow"|"deny"|null, "bash": <the map or string or null>}`` (presence and
+resolved rules ONLY; the full env value is never dumped).
+``password_env`` recording is unchanged.
+
 Streams are generated FROM the recorded fixture files in
 ``tests/fixtures/mimo/`` (baked into the generated script at
 ``write_fake_mimo`` time):
@@ -119,20 +169,26 @@ Modes (``write_fake_mimo(path, mode=...)``, overridable with env
                   serves the HTTP surface above.
 - ``attach``      behaves like ``ok`` and accepts/ignores ``--attach <url>``.
 - ``verbose``     like ``ok`` with extra ``tool_use`` events.
+- ``write_probe`` emits one real-shaped ``write`` tool_use against
+                  ``probe-written.txt`` (see the permission section above)
+                  and the final text ``"write probe done"``; exit 0.
 
 Environment (see :func:`base_env`): ``FAKE_MIMO_MODE``, ``FAKE_MIMO_SLEEP``,
-``FAKE_MIMO_ARGV`` (argv capture file), ``FAKE_MIMO_STATE`` (flaky counter
-and ``password_env`` presence flag), ``FAKE_MIMO_SESSIONS`` (session record
-directory), ``FAKE_MIMO_SERVE_URL`` (serve URL capture file),
-``FAKE_MIMO_SERVE_PORT`` (default serve port), ``FAKE_MIMO_SERVE_HOST``
-(default serve hostname), ``MIMOCODE_SERVER_PASSWORD`` (serve auth password /
-run-side presence recording; the value is never echoed).
+``FAKE_MIMO_ARGV`` (argv capture file), ``FAKE_MIMO_STATE`` (flaky counter,
+``password_env`` presence flag and the ``mimocode_config_env`` summary),
+``FAKE_MIMO_SESSIONS`` (session record directory), ``FAKE_MIMO_SERVE_URL``
+(serve URL capture file), ``FAKE_MIMO_SERVE_PORT`` (default serve port),
+``FAKE_MIMO_SERVE_HOST`` (default serve hostname), ``MIMOCODE_SERVER_PASSWORD``
+(serve auth password / run-side presence recording; the value is never
+echoed), ``MIMOCODE_CONFIG_CONTENT`` (rendered permission JSON, enforced as
+documented above; ``base_env`` clears it so tests stay hermetic).
 
 The fake is a plain Python script; on Windows the returned path is the
 compiled launcher from ``tests.build_fake_dsh.build_launcher`` so it is
 directly usable as ``MIMO_BIN``.
 """
 
+import inspect
 import json
 import os
 import stat
@@ -140,7 +196,8 @@ from pathlib import Path
 
 # Modes honoured by the fake; anything else falls back to the ``ok`` stream.
 MODES = ("ok", "text_only", "error_auth", "error_limit", "error_network",
-         "slow", "silent", "flaky", "serve", "attach", "verbose")
+         "slow", "silent", "flaky", "serve", "attach", "verbose",
+         "write_probe")
 
 # Real mimo 0.1.17 recordings; the fake's streams are generated from these.
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "mimo"
@@ -160,9 +217,142 @@ def fixture_events(name):
     return [json.loads(line) for line in fixture_lines(name)]
 
 
+# -- MIMOCODE_CONFIG_CONTENT permission enforcement ----------------------
+#
+# These helpers are the single source of truth for enforcement: their source
+# is spliced verbatim into the generated fake script (see
+# ``_permissions_source``) and they are importable here so tests exercise the
+# exact same code.  They must stay self-contained (local imports only) for
+# that splice.  The matching rule is documented in the module docstring.
+
+EDIT_DENIED_OUTPUT = "permission denied: edit"
+BASH_DENIED_OUTPUT = "permission denied: bash"
+
+
+def config_env_summary():
+    """Summary of ``MIMOCODE_CONFIG_CONTENT``: presence and resolved rules.
+
+    Returns ``{"present": bool, "edit": "allow"|"deny"|None, "bash": rule}``
+    where *rule* is the map's bash value (plain string, glob-map dict, or
+    ``None``).  The raw env value is never echoed -- presence and resolved
+    rules ONLY.  Absent/empty/unparseable content means no enforcement
+    (unparseable keeps ``present`` True with null rules).
+    """
+    import json
+    import os
+    summary = {"present": False, "edit": None, "bash": None}
+    raw = os.environ.get("MIMOCODE_CONFIG_CONTENT")
+    if not raw or not raw.strip():
+        return summary
+    summary["present"] = True
+    try:
+        doc = json.loads(raw)
+    except (TypeError, ValueError):
+        return summary
+    permission = doc.get("permission") if isinstance(doc, dict) else None
+    if not isinstance(permission, dict):
+        return summary
+    edit = permission.get("edit")
+    if edit in ("allow", "deny"):
+        summary["edit"] = edit
+    bash = permission.get("bash")
+    if isinstance(bash, str):
+        if bash in ("allow", "deny"):
+            summary["bash"] = bash
+    elif isinstance(bash, dict):
+        summary["bash"] = bash
+    return summary
+
+
+def bash_allows(command, rule):
+    """True when *command* is permitted by the bash permission *rule*.
+
+    * ``None`` -- no enforcement (allowed).
+    * string -- ``"deny"`` denies every command, ``"allow"`` allows all.
+    * glob-map -- ``fnmatch`` patterns to ``"allow"``/``"deny"``.  Explicit
+      (non-``"*"``) entries decide; among matching entries the most specific
+      (most non-wildcard characters) wins, and ``"deny"`` wins on equal
+      specificity.  With no explicit match the ``"*"`` catch-all fills the
+      gap; with no matching entry at all the command is allowed.
+    """
+    if rule is None:
+        return True
+    if isinstance(rule, str):
+        return rule != "deny"
+    if not isinstance(rule, dict) or not rule:
+        return True
+    import fnmatch
+    best = None
+    for pattern, verdict in rule.items():
+        if not isinstance(pattern, str) or pattern == "*":
+            continue
+        if verdict not in ("allow", "deny"):
+            continue
+        if not fnmatch.fnmatchcase(command, pattern):
+            continue
+        specificity = len([ch for ch in pattern if ch not in "*?"])
+        allowed = verdict == "allow"
+        if best is None or specificity > best[0]:
+            best = (specificity, allowed)
+        elif specificity == best[0] and not allowed:
+            best = (specificity, False)  # deny wins on equal specificity
+    if best is not None:
+        return best[1]
+    return rule.get("*") != "deny"
+
+
+def apply_permission(event, summary):
+    """Apply the permission *summary* to one emitted event (in place).
+
+    Denied ``tool_use`` events get ``part.state.status = "error"`` and
+    ``part.state.output`` set to the denial text; everything else in the
+    event stays verbatim.  Returns True when the event was flipped.
+    """
+    if not isinstance(event, dict) or event.get("type") != "tool_use":
+        return False
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return False
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return False
+    rules = summary if isinstance(summary, dict) else {}
+    tool = part.get("tool")
+    if tool in ("edit", "write"):
+        if rules.get("edit") == "deny":
+            state["status"] = "error"
+            state["output"] = EDIT_DENIED_OUTPUT
+            return True
+        return False
+    if tool == "bash":
+        tool_input = state.get("input")
+        command = (tool_input.get("command")
+                   if isinstance(tool_input, dict) else None)
+        if isinstance(command, str) and not bash_allows(
+                command, rules.get("bash")):
+            state["status"] = "error"
+            state["output"] = BASH_DENIED_OUTPUT
+            return True
+    return False
+
+
+def _permissions_source():
+    """Permission helper source, spliced into the generated fake script.
+
+    The generated script must enforce the exact code tests import here, so
+    ``write_fake_mimo`` embeds this text verbatim (placeholders ``__PERMISSIONS__``).
+    """
+    parts = ["EDIT_DENIED_OUTPUT = %r" % EDIT_DENIED_OUTPUT,
+             "BASH_DENIED_OUTPUT = %r" % BASH_DENIED_OUTPUT]
+    parts.extend(inspect.getsource(fn) for fn in
+                 (config_env_summary, bash_allows, apply_permission))
+    return "\n\n".join(parts)
+
+
 # The generated script.  Placeholders ``__DEFAULT_MODE__``, ``__RUN_EVENTS__``,
-# ``__READY_EVENTS__`` and ``__ERROR_401__`` are filled at write_fake_mimo
-# time (the three fixtures are baked in as raw JSONL lines).
+# ``__READY_EVENTS__``, ``__ERROR_401__`` and ``__PERMISSIONS__`` are filled
+# at write_fake_mimo time (the three fixtures are baked in as raw JSONL
+# lines; ``__PERMISSIONS__`` is the enforcement source above).
 _FAKE_MIMO_BODY = r'''#!/usr/bin/env python3
 """Fake mimo CLI for the CrewForeman test suite (real 0.1.17 JSONL events).
 
@@ -207,6 +397,11 @@ VALUE_FLAGS = {
 }
 BOOL_FLAGS = {"--dangerously-skip-permissions": "skip_permissions",
               "--yolo": "skip_permissions"}
+
+# MIMOCODE_CONFIG_CONTENT permission enforcement (spliced from
+# tests/mimo_fakes._permissions_source; see the module docstring of
+# tests.mimo_fakes for the matching rule).
+__PERMISSIONS__
 
 
 def parse_cli(argv):
@@ -268,31 +463,34 @@ def default_session():
         return "ses_fake_mimo"
 
 
-def replay(lines, session=None):
-    """Print baked fixture JSONL lines verbatim.
+def replay(lines, session=None, summary=None):
+    """Print baked fixture JSONL lines, honouring session + permissions.
 
     With *session* (the ``-s`` value) the top-level and ``part.sessionID``
-    fields are substituted so resume flows see their own id; everything else
-    (answer text, tokens, costs, ids) is the recording's own.
+    fields are substituted so resume flows see their own id; with *summary*
+    (the MIMOCODE_CONFIG_CONTENT rules) denied tool_use events are flipped
+    to error status (rest verbatim).  Lines needing no change are printed
+    byte-identically.
     """
     for raw in lines:
-        if not session:
-            emit_raw(raw)
-            continue
-        try:
-            event = json.loads(raw)
-        except Exception:
-            emit_raw(raw)
-            continue
+        event = None
+        if session or summary:
+            try:
+                event = json.loads(raw)
+            except Exception:
+                event = None
         if isinstance(event, dict):
-            if "sessionID" in event:
-                event["sessionID"] = session
-            part = event.get("part")
-            if isinstance(part, dict) and "sessionID" in part:
-                part["sessionID"] = session
-            emit(event)
-        else:
-            emit_raw(raw)
+            flipped = apply_permission(event, summary)
+            if session:
+                if "sessionID" in event:
+                    event["sessionID"] = session
+                part = event.get("part")
+                if isinstance(part, dict) and "sessionID" in part:
+                    part["sessionID"] = session
+            if flipped or session:
+                emit(event)
+                continue
+        emit_raw(raw)
 
 
 def _ms():
@@ -367,9 +565,13 @@ def error_event(message, status_code, is_retryable, session):
                                    "url": "https://api.xiaomimimo.com/v1/chat/completions"}}}}
 
 
-def run_ok(opts, verbose=False):
-    """Replay the run-events recording; verbose appends extra tool_use."""
-    replay(RUN_EVENTS, opts.get("session"))
+def run_ok(opts, verbose=False, summary=None):
+    """Replay the run-events recording; verbose appends extra tool_use.
+
+    Both the replayed and the extra tool_use events honour *summary*
+    (MIMOCODE_CONFIG_CONTENT rules).
+    """
+    replay(RUN_EVENTS, opts.get("session"), summary)
     if not verbose:
         return
     session = opts.get("session") or default_session()
@@ -383,8 +585,10 @@ def run_ok(opts, verbose=False):
          "Wrote file successfully.", "NOTES.md"),
     ]
     for offset, (tool, tool_input, output, title) in enumerate(extras, 1):
-        emit(tool_event(tool, tool_input, output, title, session,
-                        100 + offset))
+        event = tool_event(tool, tool_input, output, title, session,
+                           100 + offset)
+        apply_permission(event, summary)
+        emit(event)
 
 
 def run_text_only(opts):
@@ -415,6 +619,29 @@ def run_slow(opts):
         time.sleep(min(0.2, remaining))
         emit(step_finish_event(seq, "tool-calls", session, seq * 10 + 3))
     emit(text_event(FINAL_ANSWER, session, seq * 10 + 9))
+
+
+def run_write_probe(opts, summary):
+    """write_probe mode: one real write tool_use against probe-written.txt.
+
+    When edit is permitted the file is actually created under ``--dir`` and
+    the tool completes; when edit is denied no file appears and the tool
+    fails with the denial output.  Final text event: "write probe done".
+    """
+    session = opts.get("session") or default_session()
+    workspace = Path(opts["dir"] or os.getcwd())
+    target = workspace / "probe-written.txt"
+    event = tool_event("write",
+                       {"file_path": str(target), "content": "probe write\n"},
+                       "Wrote file successfully.", "probe-written.txt",
+                       session, 1)
+    if not apply_permission(event, summary):
+        try:
+            target.write_text("probe write\n", encoding="utf-8")
+        except OSError:
+            pass
+    emit(event)
+    emit(text_event("write probe done", session, 2))
 
 
 def maybe_session_record(opts):
@@ -563,6 +790,14 @@ def record_password_env(opts):
     save_state(path, state)
 
 
+def record_config_env(opts, summary):
+    """Record the mimocode_config_env summary (presence + resolved rules)."""
+    path = state_path(opts)
+    state = load_state(path)
+    state["mimocode_config_env"] = summary
+    save_state(path, state)
+
+
 def main():
     opts = parse_cli(sys.argv)
     if os.environ.get("FAKE_MIMO_ARGV"):
@@ -580,6 +815,10 @@ def main():
                 "mimo serve: error: unrecognized arguments: %s\n" % arg)
             sys.exit(2)
     mode = os.environ.get("FAKE_MIMO_MODE") or DEFAULT_MODE
+    # Parse + enforce MIMOCODE_CONFIG_CONTENT at the start of run/serve
+    # behaviour (absent/empty = no enforcement) and capture the summary.
+    summary = config_env_summary()
+    record_config_env(opts, summary)
     if opts["subcommand"] == "serve" or mode == "serve":
         run_serve(opts)
     # Run-side (incl. --attach): note password-env presence, never the value.
@@ -591,7 +830,7 @@ def main():
     session = opts.get("session") or default_session()
     if mode == "error_auth":
         # The real 401 recording (APIError / statusCode 401).
-        replay([ERROR_401], opts.get("session"))
+        replay([ERROR_401], opts.get("session"), summary)
         sys.exit(1)
     if mode == "error_limit":
         emit(error_event(
@@ -616,7 +855,7 @@ def main():
     task = opts["task"] or ""
     if task.lstrip().startswith("Reply with exactly READY"):
         # The real attach-ready recording (text part "READY").
-        replay(READY_EVENTS, opts.get("session"))
+        replay(READY_EVENTS, opts.get("session"), summary)
         sys.exit(0)
     if mode == "slow":
         run_slow(opts)
@@ -624,10 +863,13 @@ def main():
     if mode == "text_only":
         run_text_only(opts)
         sys.exit(0)
-    if mode == "verbose":
-        run_ok(opts, verbose=True)
+    if mode == "write_probe":
+        run_write_probe(opts, summary)
         sys.exit(0)
-    run_ok(opts)
+    if mode == "verbose":
+        run_ok(opts, verbose=True, summary=summary)
+        sys.exit(0)
+    run_ok(opts, summary=summary)
     sys.exit(0)
 
 
@@ -646,7 +888,10 @@ def write_fake_mimo(path, mode="ok"):
     run a shebang script, so the compiled test-only launcher is returned
     instead (a missing compiler is fatal).  *mode* is the default behaviour;
     a non-empty ``FAKE_MIMO_MODE`` environment value overrides it at run time.
-    The ok/READY/401 streams are baked from ``tests/fixtures/mimo/`` here.
+    The ok/READY/401 streams are baked from ``tests/fixtures/mimo/`` here;
+    the ``MIMOCODE_CONFIG_CONTENT`` enforcement helpers are spliced in from
+    :func:`_permissions_source` so the script enforces exactly what tests
+    import from this module.
     """
     content = _FAKE_MIMO_BODY
     content = content.replace("__DEFAULT_MODE__", repr(mode))
@@ -656,6 +901,7 @@ def write_fake_mimo(path, mode="ok"):
         "__READY_EVENTS__", json.dumps(fixture_lines(ATTACH_READY_FIXTURE)))
     content = content.replace(
         "__ERROR_401__", json.dumps(fixture_lines(ERROR_401_FIXTURE)[0]))
+    content = content.replace("__PERMISSIONS__", _permissions_source())
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -680,6 +926,8 @@ def base_env(root, fake_mimo=None, **extra):
     ``FAKE_MIMO_SERVE_PORT``, ``FAKE_MIMO_STATE``.  ``FAKE_MIMO_MODE`` is set
     to ``""`` meaning "defer to the mode baked into the fake by
     ``write_fake_mimo``"; pass e.g. ``FAKE_MIMO_MODE="slow"`` to override.
+    ``MIMOCODE_CONFIG_CONTENT`` is cleared (``""`` = no enforcement) so runs
+    stay hermetic; pass a JSON string in *extra* to exercise enforcement.
     *extra* keys update the returned dict.
     """
     root = Path(root)
@@ -710,6 +958,8 @@ def base_env(root, fake_mimo=None, **extra):
         "FAKE_MIMO_STATE": str(root / "fake-mimo-state.json"),
         "FAKE_MIMO_SESSIONS": str(root / "fake-mimo-sessions"),
         "FAKE_MIMO_SERVE_URL": str(root / "fake-mimo-serve-url.json"),
+        # "" clears any inherited config: no permission enforcement.
+        "MIMOCODE_CONFIG_CONTENT": "",
     }
     env.update(extra)
     return env

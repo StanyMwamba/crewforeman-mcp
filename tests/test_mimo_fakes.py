@@ -12,8 +12,15 @@ exactly.  ``serve`` must answer the real-CLI HTTP surface
 print the real ready line, enforce ``MIMOCODE_SERVER_PASSWORD`` basic auth
 (username ``mimocode``) when set, ``attach`` must record argv plus
 password-env presence, and the error modes must carry the right
-``statusCode``.  No network beyond 127.0.0.1, no real ``mimo``, and no long
-sleeps (``FAKE_MIMO_SLEEP`` is kept small).
+``statusCode``.  The ``MIMOCODE_CONFIG_CONTENT`` permission rules must be
+read and enforced in every mode (including fixture replays): edit-deny fails
+``edit``/``write`` tool_use and the ``write_probe`` mode must not create
+``probe-written.txt``; the bash glob-map rule (``ls x`` allowed / ``rm x``
+denied under a read-only map, ``git push`` denied under a workspace-write
+map) decides bash tool_use; the state capture records the
+``mimocode_config_env`` summary; absence of the env var keeps the old
+unenforced behaviour.  No network beyond 127.0.0.1, no real ``mimo``, and no
+long sleeps (``FAKE_MIMO_SLEEP`` is kept small).
 """
 
 import base64
@@ -34,7 +41,9 @@ from tests.mimo_fakes import (
     ATTACH_READY_FIXTURE,
     ERROR_401_FIXTURE,
     RUN_EVENTS_FIXTURE,
+    apply_permission,
     base_env,
+    bash_allows,
     fixture_events,
     fixture_lines,
     write_fake_mimo,
@@ -64,6 +73,21 @@ def parse_jsonl(text):
         if line.startswith("{"):
             events.append(json.loads(line))
     return events
+
+
+def config_content(edit=None, bash=None):
+    """Render a ``MIMOCODE_CONFIG_CONTENT`` JSON value with the given rules.
+
+    *edit* is the plain ``edit`` string rule; *bash* is the bash rule
+    (plain string or glob-map).  Absent rules are omitted from the map.
+    """
+    permission = {}
+    if edit is not None:
+        permission["edit"] = edit
+    if bash is not None:
+        permission["bash"] = bash
+    return json.dumps({"$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+                       "permission": permission})
 
 
 def last_text(events):
@@ -205,6 +229,7 @@ class MimoFakesSmokeTest(unittest.TestCase):
     def _run_mode(self, mode, *extra, **kwargs):
         """Run the ``ok`` argv on a fresh fake baked with *mode*."""
         fake = write_fake_mimo(self.root / "bin" / ("mimo-" + mode), mode=mode)
+        kwargs.setdefault("env", self._env())
         return subprocess.run([str(fake)] + self._argv(*extra),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True, timeout=20,
@@ -775,6 +800,235 @@ class MimoFakesSmokeTest(unittest.TestCase):
         self.assertTrue(records, "FAKE_MIMO_SESSIONS must receive a record")
         data = json.loads(records[0].read_text(encoding="utf-8"))
         self.assertEqual(data["session"], "sess-42")
+
+    # -- MIMOCODE_CONFIG_CONTENT permission enforcement -------------------
+
+    def _write_probe(self, **env_extra):
+        """Run ``write_probe``; return ``(result, env, events)``."""
+        env = self._env(**env_extra)
+        result = self._run_mode("write_probe", env=env)
+        return result, env, parse_jsonl(result.stdout)
+
+    def test_write_probe_edit_allow_creates_file_and_completes(self):
+        result, env, events = self._write_probe(
+            MIMOCODE_CONFIG_CONTENT=config_content(edit="allow"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tools = [e for e in events if e["type"] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        assert_real_event(self, tools[0])
+        part = tools[0]["part"]
+        self.assertEqual(part["tool"], "write")
+        self.assertEqual(Path(part["state"]["input"]["file_path"]).name,
+                         "probe-written.txt")
+        self.assertEqual(part["state"]["status"], "completed",
+                         "edit-allow must complete the write tool_use")
+        probe = self.ws / "probe-written.txt"
+        self.assertTrue(probe.is_file(),
+                        "edit-allow write_probe must create the file")
+        self.assertTrue(probe.read_text(encoding="utf-8").strip())
+        self.assertEqual(last_text(events), "write probe done")
+
+    def test_write_probe_edit_deny_no_file_and_errors(self):
+        result, env, events = self._write_probe(
+            MIMOCODE_CONFIG_CONTENT=config_content(edit="deny"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tools = [e for e in events if e["type"] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        assert_real_event(self, tools[0])
+        part = tools[0]["part"]
+        self.assertEqual(part["tool"], "write")
+        self.assertEqual(Path(part["state"]["input"]["file_path"]).name,
+                         "probe-written.txt")
+        self.assertEqual(part["state"]["status"], "error",
+                         "edit-deny must fail the write tool_use")
+        self.assertEqual(part["state"]["output"], "permission denied: edit")
+        self.assertFalse((self.ws / "probe-written.txt").exists(),
+                         "edit-deny write_probe must not create the file")
+        self.assertEqual(last_text(events), "write probe done")
+
+    def test_absent_config_content_means_no_enforcement(self):
+        # (e) absence of MIMOCODE_CONFIG_CONTENT = old behaviour.
+        env = self._env()
+        env.pop("MIMOCODE_CONFIG_CONTENT", None)
+        result = self._run_mode("write_probe", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = parse_jsonl(result.stdout)
+        tools = [e for e in events if e["type"] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["part"]["state"]["status"], "completed")
+        self.assertTrue((self.ws / "probe-written.txt").is_file(),
+                        "without the config env the write_probe writes")
+        # And the fixture replay stays byte-identical (no flips).
+        result = self._run(self._argv("--attach", "http://127.0.0.1:9"),
+                           env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [line for line in result.stdout.splitlines() if line.strip()],
+            fixture_lines(RUN_EVENTS_FIXTURE),
+            "absent config must replay the recording verbatim")
+
+    def test_bash_map_matching_rule(self):
+        # (b) the documented matching rule (see the mimo_fakes docstring):
+        # read-only map: ls x allowed / rm x denied; workspace-write map:
+        # git push denied.
+        read_only = {"*": "deny", "ls*": "allow"}
+        self.assertTrue(bash_allows("ls x", read_only))
+        self.assertFalse(bash_allows("rm x", read_only))
+        workspace_write = {"*": "allow", "git push*": "deny"}
+        self.assertFalse(bash_allows("git push", workspace_write))
+        self.assertTrue(bash_allows("ls x", workspace_write))
+        # Plain strings: all-denied / all-allowed / absent rule.
+        self.assertFalse(bash_allows("ls x", "deny"))
+        self.assertFalse(bash_allows("rm x", "deny"))
+        self.assertTrue(bash_allows("git push", "allow"))
+        self.assertTrue(bash_allows("rm x", None))
+        # Explicit entries decide over the catch-all either way.
+        self.assertFalse(bash_allows("rm x", {"*": "allow", "rm*": "deny"}))
+        self.assertTrue(bash_allows("rm x", {"*": "deny", "rm*": "allow"}))
+
+    def test_bash_map_specificity_and_tie_break(self):
+        # More specific patterns win; deny wins on equal specificity.
+        self.assertTrue(bash_allows(
+            "git log", {"git *": "deny", "git log*": "allow"}))
+        self.assertFalse(bash_allows(
+            "git push", {"git *": "deny", "git log*": "allow"}))
+        self.assertFalse(bash_allows(
+            "xy", {"*x*": "allow", "*y*": "deny"}))
+
+    def test_fixture_replay_denied_edit_write_flip_statuses(self):
+        # (c) fixture-replay tool_use flips under edit-deny.
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(edit="deny"))
+        result = self._run(self._argv(), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = parse_jsonl(result.stdout)
+        self.assertEqual(len(events), len(_RUN_EVENTS))
+        by_tool = {}
+        for event in events:
+            if event["type"] == "tool_use":
+                by_tool[event["part"]["tool"]] = event
+        for tool in ("edit", "write"):
+            state = by_tool[tool]["part"]["state"]
+            self.assertEqual(state["status"], "error", tool)
+            self.assertEqual(state["output"], "permission denied: edit", tool)
+        self.assertEqual(by_tool["read"]["part"]["state"]["status"],
+                         "completed",
+                         "only edit/write may flip under edit-deny")
+        self.assertEqual(last_text(events), OK_ANSWER)
+        # Non-tool events stay the recording's own.
+        self.assertEqual([e for e in events if e["type"] != "tool_use"],
+                         [e for e in _RUN_EVENTS if e["type"] != "tool_use"])
+
+    def test_fixture_replay_tool_use_completed_under_edit_allow(self):
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            edit="allow", bash={"*": "allow"}))
+        result = self._run(self._argv(), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Nothing flips: the recording stays byte-identical even with the
+        # config env present.
+        self.assertEqual(
+            [line for line in result.stdout.splitlines() if line.strip()],
+            fixture_lines(RUN_EVENTS_FIXTURE),
+            "edit-allow must replay the recording verbatim")
+        for event in parse_jsonl(result.stdout):
+            if event["type"] == "tool_use":
+                self.assertEqual(event["part"]["state"]["status"], "completed")
+
+    def test_fixture_replay_bash_map_enforced(self):
+        # The recording's bash call ("ls -la ..."): allowed by the read-only
+        # map's ls* entry, denied by a bare {"*": "deny"} map.
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            bash={"*": "deny", "ls*": "allow"}))
+        events = parse_jsonl(self._run(self._argv(), env=env).stdout)
+        bash = [e for e in events if e["type"] == "tool_use"
+                and e["part"]["tool"] == "bash"][0]
+        self.assertEqual(bash["part"]["state"]["status"], "completed",
+                         "ls x style commands are allowed by ls*")
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            bash={"*": "deny"}))
+        events = parse_jsonl(self._run(self._argv(), env=env).stdout)
+        bash = [e for e in events if e["type"] == "tool_use"
+                and e["part"]["tool"] == "bash"][0]
+        self.assertEqual(bash["part"]["state"]["status"], "error")
+        self.assertEqual(bash["part"]["state"]["output"],
+                         "permission denied: bash")
+
+    def test_verbose_extra_tool_use_honours_permissions(self):
+        # Synthetic tool_use events are enforced like replayed ones: the
+        # verbose write extra fails under edit-deny, the bash "ls" extra is
+        # allowed by the read-only map.
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            edit="deny", bash={"*": "deny", "ls*": "allow"}))
+        events = parse_jsonl(self._run_mode("verbose", env=env).stdout)
+        by_tool = {}
+        for event in events:
+            if event["type"] == "tool_use":
+                by_tool.setdefault(event["part"]["tool"], []).append(event)
+        self.assertEqual(by_tool["write"][-1]["part"]["state"]["status"],
+                         "error")
+        self.assertEqual(by_tool["write"][-1]["part"]["state"]["output"],
+                         "permission denied: edit")
+        self.assertEqual(by_tool["bash"][-1]["part"]["state"]["status"],
+                         "completed")
+        self.assertEqual(by_tool["read"][-1]["part"]["state"]["status"],
+                         "completed")
+
+    def test_apply_permission_flips_bash_tool_events(self):
+        # The shared flip logic denies "rm x" and "git push" per the rule.
+        event = {"type": "tool_use",
+                 "part": {"tool": "bash",
+                          "state": {"status": "completed",
+                                    "input": {"command": "rm x"}}}}
+        summary = {"present": True, "edit": None,
+                   "bash": {"*": "deny", "ls*": "allow"}}
+        self.assertTrue(apply_permission(event, summary))
+        self.assertEqual(event["part"]["state"]["status"], "error")
+        self.assertEqual(event["part"]["state"]["output"],
+                         "permission denied: bash")
+        event = {"type": "tool_use",
+                 "part": {"tool": "bash",
+                          "state": {"status": "completed",
+                                    "input": {"command": "git push"}}}}
+        summary = {"present": True, "edit": None,
+                   "bash": {"*": "allow", "git push*": "deny"}}
+        self.assertTrue(apply_permission(event, summary))
+        self.assertEqual(event["part"]["state"]["output"],
+                         "permission denied: bash")
+
+    def test_state_capture_records_mimocode_config_env(self):
+        # (d) the summary records presence + resolved rules only.
+        rules = {"*": "deny", "ls*": "allow"}
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            edit="deny", bash=rules))
+        result = self._run(self._argv(), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(Path(env["FAKE_MIMO_STATE"]).read_text(
+            encoding="utf-8"))
+        summary = state["mimocode_config_env"]
+        self.assertEqual(sorted(summary), ["bash", "edit", "present"])
+        self.assertTrue(summary["present"])
+        self.assertEqual(summary["edit"], "deny")
+        self.assertEqual(summary["bash"], rules)
+        # Never the full rendered config: no $schema and only resolved keys.
+        self.assertNotIn("$schema", json.dumps(summary))
+
+    def test_state_capture_mimocode_config_env_plain_bash_and_absent(self):
+        env = self._env(MIMOCODE_CONFIG_CONTENT=config_content(
+            edit="allow", bash="deny"))
+        self._run(self._argv(), env=env)
+        summary = json.loads(Path(env["FAKE_MIMO_STATE"]).read_text(
+            encoding="utf-8"))["mimocode_config_env"]
+        self.assertTrue(summary["present"])
+        self.assertEqual(summary["edit"], "allow")
+        self.assertEqual(summary["bash"], "deny")
+        # Absence is recorded as present=False with null rules.
+        env = self._env()
+        env.pop("MIMOCODE_CONFIG_CONTENT", None)
+        self._run(self._argv(), env=env)
+        summary = json.loads(Path(env["FAKE_MIMO_STATE"]).read_text(
+            encoding="utf-8"))["mimocode_config_env"]
+        self.assertFalse(summary["present"])
+        self.assertIsNone(summary["edit"])
+        self.assertIsNone(summary["bash"])
 
     # -- serve helpers ----------------------------------------------------
 
