@@ -427,6 +427,21 @@ class GitIdentityTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(push.called)
 
+    def test_commit_message_trailer_identity_is_scanned(self):
+        base = self.commit("base", "base.txt")
+        self.write("trailer.txt", "x")
+        self.git("add", "-A")
+        rc, _out, err = git_identity.commit_with_identity(
+            CFG, self.repo,
+            "feature\n\nCo-authored-by: Personal <personal@example.org>")
+        self.assertEqual(rc, 0, err)
+        report = git_identity.check_push(
+            CFG, repo=str(self.repo), base=base, head="HEAD")
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any(v.get("field") == "message"
+                            and v.get("email") == "personal@example.org"
+                            for v in report["violations"]), report)
+
     def test_content_scan_still_catches_secret(self):
         base = self.commit("base", "base.txt")
         self.commit("secret", "notes.txt",

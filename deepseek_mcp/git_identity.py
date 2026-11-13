@@ -495,12 +495,12 @@ def commit_metadata(repo, base, head, cfg=None):
         rc, out, err = _git(
             repo,
             ["show", "-s", "--no-color",
-             "--format=%H%x00%an%x00%ae%x00%cn%x00%ce", sha],
+             "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B", sha],
         )
         if rc != 0:
             raise GitIdentityError((err or "git_show_failed").strip())
-        parts = out.rstrip("\n").split("\x00")
-        if len(parts) < 5:
+        parts = out.rstrip("\n").split("\x00", 5)
+        if len(parts) < 6:
             raise GitIdentityError("unparsable_git_log_record")
         commits.append({
             "sha": parts[0],
@@ -508,6 +508,7 @@ def commit_metadata(repo, base, head, cfg=None):
             "author_email": parts[2],
             "committer_name": parts[3],
             "committer_email": parts[4],
+            "message": parts[5],
         })
     return commits
 
@@ -537,6 +538,17 @@ def scan_metadata(repo, base, head, cfg=None):
                     "name": name, "email": commit[role + "_email"],
                     "identity": identity,
                 })
+        # Co-authored-by / Signed-off-by trailers and message bodies are
+        # identity metadata too; scan every address for the same allowlist.
+        for address in _EMAIL_RE.findall(commit.get("message") or ""):
+            if _normalise_email(address) in allowed:
+                continue
+            violations.append({
+                "kind": "metadata", "field": "message",
+                "sha": commit["sha"], "role": "message",
+                "name": "", "email": address,
+                "identity": address,
+            })
     return violations
 
 

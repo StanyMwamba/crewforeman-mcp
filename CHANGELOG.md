@@ -42,8 +42,8 @@ that stops crosscheck false alarms from being counted.
   repo-local identity from config `git_identity` (default
   `crewforeman-mcp` with the reserved `noreply` address at `example.com`) for every commit and rebase the
   connector creates, and its pre-push gate scans commit **metadata** (author
-  and committer name+email of every commit in `base..head`) as well as added
-  file contents. Any identity outside the allowlist blocks the push.
+  and committer name+email, plus message/trailer addresses, for every commit
+  in `base..head`) as well as added file contents. Any identity outside the allowlist blocks the push.
   `git_identity_exceptions` lists remotes that keep their own identity (for
   example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
   on `owner/repo` or the full URL (a bare remote name is ignored), so a
