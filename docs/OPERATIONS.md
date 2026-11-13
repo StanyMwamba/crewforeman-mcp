@@ -1391,9 +1391,10 @@ including through a rebase. Before a push, the privacy gate scans both the
 content of the pushed commits and their **metadata** - the author and
 committer name+email of every commit in `base..head` - and blocks the push
 when any identity is outside the allowlist (the configured `git_identity`
-name and address, the default `crewforeman-mcp` / `noreply@example.com`, and
-the email-shaped entries from `git_identity_exceptions`). An exception remote
-is exempt from the metadata check but its added content is still scanned.
+name and address and the default `crewforeman-mcp` / `noreply@example.com`).
+Exception entries are remotes, never emails; an email-shaped exception does
+not widen the global allowlist. An exception remote is exempt from the
+metadata check but its added content is still scanned.
 
 `git_identity_exceptions` lists remotes that keep their own repo-local
 identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
@@ -1422,9 +1423,9 @@ git config core.hooksPath scripts/hooks
 ```
 
 Connector-controlled release tooling calls
-`git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)`: it runs
-the same gate and returns before `git push` on any violation. That helper is
-the hard gate; the Git hook is cooperative and, like every Git hook, can be
+`git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)` (wrapped
+by `scripts/ship_push.py`) and never a bare `git push`: it runs the same gate
+and returns before the push on any violation. That helper is the hard gate; the Git hook is cooperative and, like every Git hook, can be
 skipped with `git push --no-verify`, so release/publish tooling must call
 `push_with_gate` rather than a bare `git push`.
 `scripts/hooks/pre-push` runs the same gate for each pushed ref, using the

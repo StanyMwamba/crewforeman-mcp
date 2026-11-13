@@ -48,11 +48,13 @@ that stops crosscheck false alarms from being counted.
   example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
   on `owner/repo` or the full URL (a bare remote name is ignored), so a
   lookalike remote or a re-pointed label cannot borrow the exception, and no
-  personal address is hardcoded. The connector
+  personal address is hardcoded. Exception entries are remotes only; an
+  email-shaped entry never widens the global identity allowlist. The connector
   installs the `pre-push` hook on the first commit/rebase it creates (an
   operator's own hook is preserved as `pre-push.local` and runs first) and
   exposes
-  `git_identity.push_with_gate` for connector-controlled pushes. CLI:
+  `git_identity.push_with_gate` and `scripts/ship_push.py` for
+  connector-controlled pushes. CLI:
   `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
   builders get the OS boundary when the platform can provide it; a per-job
@@ -65,8 +67,8 @@ that stops crosscheck false alarms from being counted.
   reproduction command and output (or, for non-executable spec findings, a
   `file:line` + exact quote the connector verifies). The connector re-runs
   each repro once before the finding counts, in a disposable workspace copy
-  with a fresh HOME/desktop profile, and requires at least four characters of
-  claimed output; findings that do not reproduce are dropped and counted as
+  with a fresh HOME/desktop profile (common secret files are not copied), and
+  requires at least four characters of claimed output; findings that do not reproduce are dropped and counted as
   `false_alarm_filtered`. Records report
   `raw_findings`, `unique`, `real`, `false_alarm`, `false_alarm_filtered`,
   `unverified` and breaker/spec counts.

@@ -181,10 +181,15 @@ an argv and is never run through a shell, with a scrubbed environment
 (`PATH`, `TMPDIR`/`TEMP`, locale and the platform's process variables
 survive; API keys do not), a hard 10 s cap, and a process-group kill on
 timeout. `HOME`, `USERPROFILE`, `APPDATA` and the XDG directories point at a
-fresh temporary directory, so a repro cannot read the operator's credential
-store by absolute path, and the copy is removed afterwards so a repro cannot
-mutate the operator's tree. The observed output must contain the claimed
-output (at least four characters, so `1` or `x` cannot match by accident);
+fresh temporary directory, and common secret files (`.env`, keys,
+`credentials*`, `.ssh`, `.dsh`) are left out of the copy, so the default
+profile stores are not exposed. This is **not** a security sandbox: a repro
+that names an absolute path outside the copy can still read it, and the
+command runs with the operator's network access. Treat crosscheck findings as
+input from your own crews and run the job in a workspace that does not hold
+secrets. The copy is removed afterwards so a repro cannot mutate the
+operator's tree. The observed output must contain the claimed output (at
+least four characters, so `1` or `x` cannot match by accident);
 an explicit `exit_code` pins the status when the finder cares about it. A
 spec quote is checked against the file at the recorded line. Findings that do
 not reproduce are dropped, marked `filtered_by: "connector_repro"` with

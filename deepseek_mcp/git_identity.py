@@ -170,17 +170,13 @@ def allowed_names(cfg=None):
 def allowed_emails(cfg=None):
     """Emails accepted by the metadata gate.
 
-    The configured identity email, ``noreply@example.com`` and any exception
-    entry that is plainly an email address (not a remote URL) are allowed.
+    Only the configured identity email and the documented default.  Exception
+    entries are *remotes*; an email-shaped entry must not widen the global
+    allowlist for every push (it would silently permit a personal address).
     """
 
     allowed = {_normalise_email(DEFAULT_IDENTITY["email"])}
     allowed.add(_normalise_email(identity_from_config(cfg)["email"]))
-    for entry in exceptions_from_config(cfg):
-        lowered = entry.lower()
-        if "@" in entry and not any(marker in lowered for marker in _REMOTE_MARKERS):
-            if "/" not in entry and ":" not in entry:
-                allowed.add(_normalise_email(entry))
     return allowed
 
 

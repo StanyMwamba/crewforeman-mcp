@@ -64,7 +64,7 @@ _DSH_DEFAULT = ("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/c
 # Generic, portable defaults. Every path is overridable.
 DEFAULTS = {
     # Commit identity for every connector-created commit/rebase. The
-    # pre-push privacy gate allowlists this email (plus noreply@example.com
+    # pre-push privacy gate allows this email (plus noreply@example.com);
     # and any email-shaped git_identity_exceptions entry).
     "git_identity": {"name": "crewforeman-mcp", "email": "noreply@example.com"},
     # Remote names/URL substrings that keep their own repo-local identity,

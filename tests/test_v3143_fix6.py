@@ -427,6 +427,21 @@ class CrosscheckReproGateTest(unittest.TestCase):
         self.assertIn("HOME=", output)
         self.assertNotEqual(output, "HOME=" + os.path.expanduser("~"))
 
+    def test_secret_files_are_not_copied_into_the_repro(self):
+        Path(self.ws, ".env").write_text("# placeholder\n", encoding="utf-8")
+        Path(self.ws, "server.pem").write_text("# placeholder\n", encoding="utf-8")
+        command = python_command(
+            "import pathlib; "
+            "print('env=' + str(pathlib.Path('.env').exists()) + "
+            "' key=' + str(pathlib.Path('server.pem').exists()))")
+        item = self.finding(executable=True,
+                            repro={"command": command,
+                                   "output": "env=False key=False"})
+        kept, filtered, _stats = crosscheck.verify_findings([item], self.ws)
+        self.assertEqual(len(kept), 1, filtered)
+        self.assertIn("env=False key=False",
+                      kept[0]["repro_result"]["output"])
+
     def test_too_short_expected_output_is_dropped(self):
         item = self.finding(executable=True,
                             repro={"command": "python repro.py",

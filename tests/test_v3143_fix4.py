@@ -348,6 +348,63 @@ class GitIdentityTest(unittest.TestCase):
             else:
                 os.environ["CF_PYTHON"] = old_cf_python
 
+    def test_email_shaped_exception_does_not_widen_the_allowlist(self):
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign", email="personal@example.org")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["personal@example.org"]}
+        report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
+                                         head="HEAD")
+        self.assertFalse(report["ok"], report)
+        self.assertNotIn("personal@example.org",
+                         git_identity.allowed_emails(cfg))
+
+    def test_installed_hook_blocks_a_plain_git_push(self):
+        bare = self.root / "hook-remote.git"
+        _run(["init", "--bare", str(bare)], self.root)
+        base = self.commit("base", "base.txt")
+        self.git("remote", "add", "origin", str(bare))
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        self.foreign_commit("foreign")
+        old_pythonpath = os.environ.get("PYTHONPATH")
+        old_cf_python = os.environ.get("CF_PYTHON")
+        os.environ["PYTHONPATH"] = str(REPO_ROOT)
+        os.environ["CF_PYTHON"] = sys.executable
+        try:
+            proc = _run(["push", "origin", "main:refs/heads/main"], self.repo)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertIn("pre-push", proc.stderr + proc.stdout)
+            self.assertNotEqual(
+                _run(["rev-parse", "--verify", "main"], bare).returncode, 0)
+            self.git("reset", "--hard", base)
+            self.commit("mine", "mine.txt")
+            proc = _run(["push", "origin", "main:refs/heads/main"], self.repo)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        finally:
+            if old_pythonpath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = old_pythonpath
+            if old_cf_python is None:
+                os.environ.pop("CF_PYTHON", None)
+            else:
+                os.environ["CF_PYTHON"] = old_cf_python
+
+    def test_ship_push_wrapper_calls_the_gate(self):
+        import importlib.util
+        script = (REPO_ROOT / "scripts" / "ship_push.py")
+        spec = importlib.util.spec_from_file_location("cf_ship_push", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        base = self.commit("base", "base.txt")
+        self.git("remote", "add", "origin", str(self.root / "unused.git"))
+        with mock.patch.object(git_identity, "push_with_gate",
+                               return_value=(0, "", "")) as push:
+            rc = module.main(["--repo", str(self.repo), "--remote", "origin",
+                              "--refspec", "main:main", "--base", base])
+        self.assertEqual(rc, 0)
+        self.assertTrue(push.called)
+
     def test_content_scan_still_catches_secret(self):
         base = self.commit("base", "base.txt")
         self.commit("secret", "notes.txt",

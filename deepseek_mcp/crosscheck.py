@@ -710,6 +710,14 @@ def _repro_timeout(timeout):
     return min(max(value, 0.1), REPRO_TIMEOUT)
 
 
+_REPRO_COPY_IGNORE = (
+    ".git", "__pycache__", "*.pyc", ".dsh-tmp-tests", ".pytest_cache",
+    "node_modules", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
+    "*.kdbx", "credentials", "credentials.*", ".ssh", ".aws", ".dsh",
+    "id_rsa*", "id_ed25519*",
+)
+
+
 def _repro_workspace_copy(workspace):
     """Return ``(path, cleanup)`` for a disposable copy of *workspace*.
 
@@ -728,9 +736,7 @@ def _repro_workspace_copy(workspace):
         target = os.path.join(parent, "workspace")
         shutil.copytree(
             root, target, symlinks=True,
-            ignore=shutil.ignore_patterns(
-                ".git", "__pycache__", "*.pyc", ".dsh-tmp-tests",
-                ".pytest_cache", "node_modules"))
+            ignore=shutil.ignore_patterns(*_REPRO_COPY_IGNORE))
         return target, (lambda: shutil.rmtree(parent, ignore_errors=True))
     except Exception:  # noqa: BLE001 - fall back to the original path
         if parent:
