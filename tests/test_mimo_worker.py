@@ -177,7 +177,15 @@ if positional and positional[0] == "serve":
             else:
                 self._send(404, b"")
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    class _Server(ThreadingHTTPServer):
+        # No reverse-DNS getfqdn() in server_bind: it can hang on macOS CI.
+        def server_bind(self):
+            import socketserver
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = host
+            self.server_port = self.server_address[1]
+
+    httpd = _Server((host, port), Handler)
     bound = httpd.server_address[1]
     url = "http://%s:%s" % (host, bound)
     print("mimocode server listening on %s" % url, flush=True)
