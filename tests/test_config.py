@@ -246,7 +246,7 @@ class ConfigTests(unittest.TestCase):
             "gate_lint_command": "",
             "gate_secret_scan": True,
             "gate_secret_patterns": [],
-            "gate_timeout_seconds": 300.0,
+            "gate_timeout_seconds": 900.0,
             "gate_max_revisions": 2,
             "gate_max_output_chars": 4000,
             "plan_contract": "warn",

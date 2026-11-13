@@ -318,7 +318,7 @@ shown before generated patches/logs/docs, and each file body is capped
 evidence-aware: a clean signed suite says do not rerun the whole suite; a
 skipped suite says run only the relevant tests and never claim a pass.
 
-`review_test_timeout_seconds` (default 300) is the connector test hard timeout.
+`review_test_timeout_seconds` (default 900) is the connector test hard timeout.
 `model_prices` (default `{}`) is the generic per-model table of USD per
 million tokens used for builders and as the fallback for reviewers:
 `{"kimi-k3.1-pro": {"input": 0.0, "cache_read": 0.0, "output": 0.0}}`.
@@ -468,7 +468,7 @@ is safe. Evidence is signed and bounded; `output_tail` is capped and redacted.
 | `gate_secret_scan` | `True` | Built-in scan; no external command replaces it. |
 | `gate_secret_patterns` | `[]` | Additional regexes. They add findings, never suppress them. |
 | `gate_secret_scan_budget_seconds` | `120.0` | Per-scan wall clock; expiry is reported as `timed_out`, not raised. `0` means an immediate `timed_out`, not unbounded. |
-| `gate_timeout_seconds` | `300.0` | Total gate wall clock. |
+| `gate_timeout_seconds` | `900.0` | Total gate wall clock. The connector suite takes 230-300 s, so 300 s was too tight; explicit values still win. |
 | `gate_max_revisions` | `2` | Gate-funded revisions before `gate_failed`. |
 | `gate_max_output_chars` | `4000` | Per-check output tail cap. |
 

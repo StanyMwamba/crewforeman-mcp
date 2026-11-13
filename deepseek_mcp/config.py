@@ -191,7 +191,10 @@ DEFAULTS = {
     # directory; "" disables; a string/list overrides the command.
     "review_test_suite": "auto",
     "review_test_command": "",
-    "review_test_timeout_seconds": 300.0,
+    # The connector's own suite takes 230-300 s; a 300 s default killed it
+    # under load (gate exit -15, tests=0). Keep >=2x headroom while still
+    # bounding a hung run; explicit config/env values always win.
+    "review_test_timeout_seconds": 900.0,
     # P3-2: a tiny reviewer pre-flight (same reviewer path, short timeout)
     # must answer READY before the connector starts the paid review.
     "review_preflight": True,
@@ -331,7 +334,9 @@ DEFAULTS = {
     "gate_secret_scan": True,
     "gate_secret_patterns": [],
     "gate_secret_scan_budget_seconds": 120.0,
-    "gate_timeout_seconds": 300.0,
+    # Same headroom as review_test_timeout_seconds: the gate runs the full
+    # connector suite plus secret scan and lint inside this total budget.
+    "gate_timeout_seconds": 900.0,
     "gate_max_revisions": 2,
     "gate_max_output_chars": 4000,
     # v3.11.0 F2: PLAN.json contract check.

@@ -48,11 +48,36 @@ os.environ.setdefault("DSH_OS_SANDBOX", "0")
 # background child session can finish writing before the in-flight scan.  The
 # fake DSH used here writes every session/marker file synchronously before it
 # exits, so the wait only adds wall clock time; the connector's deterministic
-# gate gives the whole suite a 300 s budget.  Compress the wait for tests
+# gate gives the whole suite a 900 s budget.  Compress the wait for tests
 # only: the product default stays 1.0 s and the in-flight logic is untouched.
 from deepseek_mcp import harness as _harness  # noqa: E402
 
 _harness.REVIEWER_ACTIVITY_SETTLE_SECONDS = 0.01
+
+# Retry backoff is a product policy (1 s, 2 s, 4 s ...).  The suite asserts
+# the retry *decisions* and call counts, never the wall-clock delay, so cap
+# the actual sleep for tests only.  Without this, a handful of retry tests
+# alone spent 20-30 s asleep and pushed the 2205-test suite into the
+# deterministic gate's timeout.  ``RetryPolicy.delay`` (the policy value) is
+# untouched and still asserted by tests/test_p2_health.py.
+from deepseek_mcp import health as _health  # noqa: E402
+
+_RETRY_SLEEP_ORIGINAL = _health.RetryPolicy.sleep
+
+
+def _fast_retry_sleep(self, seconds):
+    # An explicitly injected sleeper is part of that test's contract; only
+    # the production default (real time.sleep) is compressed.
+    if getattr(self, "sleeper", None) is not _health.time.sleep:
+        return _RETRY_SLEEP_ORIGINAL(self, seconds)
+    try:
+        seconds = min(float(seconds or 0.0), 0.05)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return _RETRY_SLEEP_ORIGINAL(self, seconds)
+
+
+_health.RetryPolicy.sleep = _fast_retry_sleep
 
 _PROBE_PREFIX = ".dsh-tmp-probe-"
 _TEST_OVERRIDE_VARS = ("DSH_TEST_TMPDIR", "DSH_TMPDIR")

@@ -108,9 +108,22 @@ that stops crosscheck false alarms from being counted.
   EOF only when the waiting reader's poll expired, adding up to one
   `STALL_POLL_SECONDS` interval to every child phase. The pump now posts a
   sticky queue sentinel at real EOF, so the phase ends as soon as the writer
-  closes the pipe. Functionally identical output, but the 2205-test suite no
-  longer overruns the connector's 300 s deterministic gate; regression tests
-  in `tests/test_v3134_windows.py` fail on the old poll-bounded behaviour.
+  closes the pipe. Functionally identical output, and it cut the 2205-test
+  suite from ~349 s to ~256 s; regression tests in
+  `tests/test_v3134_windows.py` fail on the old poll-bounded behaviour.
+- **Gate and reviewer suite budgets have real headroom.** The deterministic
+  gate's total budget and the reviewer's connector-suite timeout both
+  defaulted to 300 s while this project's own 2205-test suite already took
+  230-300 s. Under load the gate killed the suite at 300.4 s
+  (`exit -15, tests=0`) and the independent review received no test evidence.
+  Both defaults are now 900 s (still bounded, still overridable with
+  `gate_timeout_seconds` / `review_test_timeout_seconds` and their env vars);
+  `tests/test_v3143_gate_budget.py` pins the headroom and proves `run_gate`
+  hands the full default budget to the test check. The suite itself also got
+  faster instead of only relaxing the limit: the test harness caps real retry
+  backoff sleep (the `RetryPolicy.delay` policy and injected sleepers are
+  unchanged) so retry tests no longer spend 20-30 s asleep; the full suite
+  went from 257-314 s to 210 s, leaving real margin under the old limit too.
 
 ## 3.14.2
 
