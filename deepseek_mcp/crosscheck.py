@@ -1036,7 +1036,9 @@ def apply_rescue(record, rescue, rescued=False):
         })
     elif failed_crew:
         rows.append({
-            "part_id": "",
+            # Do not use "" here: evaluate() treats an empty rescue part_id
+            # as the whole-run "all" scope.  A sentinel keeps it inert.
+            "part_id": "unknown-crew",
             "scope": "unknown_crew",
             "reason": default_reason,
             "failed_crew": failed_crew,

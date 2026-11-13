@@ -518,6 +518,7 @@ class RescueTests(unittest.TestCase):
         self.assertEqual([part["status"] for part in record["parts"]],
                          ["failed", "failed"])
         self.assertEqual(record["rescues"][0]["scope"], "unknown_crew")
+        self.assertEqual(record["rescues"][0]["part_id"], "unknown-crew")
         evaluation = crosscheck.evaluate(
             record["parts"], [], [], {"status": "passed"},
             record["rescues"], threshold=10.0)

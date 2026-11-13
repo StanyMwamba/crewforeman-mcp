@@ -681,13 +681,19 @@ def _enforce_spots(result, plan, focused=False):
             by_id.setdefault(ident, []).append(check)
     record = (plan or {}).get("record") or plan or {}
     if focused:
-        required = [str(item.get("id")) for item in record.get("blocking") or []
+        # Match reaudit_block(), which lists at most 20 prior items.
+        required = [str(item.get("id")) for item in
+                    (record.get("blocking") or [])[:20]
                     if isinstance(item, dict) and item.get("id")]
     else:
         required = [ident for ident, _kind in _planned_spot_ids(plan)]
     for ident in required:
-        if not by_id.get(ident) or not any(
-                _valid_spot(check) for check in by_id[ident]):
+        # A failed seeded spot becomes blocking as SPOT-R1; accept the
+        # reviewer keying that re-check as either SPOT-R1 or R1.
+        aliases = [ident, ident[5:]] if ident.startswith("SPOT-") else [ident]
+        if not any(by_id.get(alias) and any(
+                _valid_spot(check) for check in by_id[alias])
+                for alias in aliases):
             result["error"] = "spot_checks_incomplete"
             result["ran"] = False
             return

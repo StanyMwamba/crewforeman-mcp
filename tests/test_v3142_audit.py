@@ -372,6 +372,19 @@ class PromptParseTests(unittest.TestCase):
         self.assertTrue(result["ran"], result.get("error"))
         self.assertEqual(result["score"], 9.5)
 
+    def test_focused_reaudit_accepts_the_underlying_spot_id(self):
+        plan = {"record": {
+            "review_round": 2,
+            "blocking": [{"id": "SPOT-R1", "text": "spot failed"}],
+            "spot": {"requirements": [{"id": "R1"}], "fixes": []},
+        }}
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": [{"id": "R1", "result": "pass", '
+                  '"evidence": "command: test; ok"}]} -->')
+        result = audit.parse_audit(report, plan)
+        self.assertTrue(result["ran"], result.get("error"))
+
     def test_integer_blocking_keeps_reaudit_rows(self):
         report = ('<!-- AUDIT_JSON {"score": 6.0, "blocking": 2, '
                   '"spot_checks": []} -->')
