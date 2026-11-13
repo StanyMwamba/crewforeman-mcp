@@ -280,7 +280,7 @@ class GitIdentityTest(unittest.TestCase):
                 remote="upstream")
             self.assertTrue(report["ok"], (entry, report["messages"]))
 
-    def test_exception_matches_a_direct_url_push(self):
+    def test_direct_url_push_cannot_borrow_a_configured_exception(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")
         cfg = {"git_identity": dict(CFG["git_identity"]),
@@ -288,8 +288,8 @@ class GitIdentityTest(unittest.TestCase):
         report = git_identity.check_push(
             cfg, repo=str(self.repo), base=base, head="HEAD",
             remote="https://github.com/example-org/Cypraea.git")
-        self.assertTrue(report["ok"], report["messages"])
-        self.assertEqual(report["exception"], "example-org/Cypraea")
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exception"], "")
 
     def test_bare_remote_name_is_not_an_exception(self):
         base = self.commit("base", "base.txt")

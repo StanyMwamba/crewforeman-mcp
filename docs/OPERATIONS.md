@@ -1406,8 +1406,9 @@ Matching is **exact**, not a substring: an entry must be `owner/repo` or a
 full URL (with or without `.git`). A substring match would let an entry such
 as `owner/repo` exempt an unrelated `evil.example/fork-of-owner/repo` push
 target, and a bare remote name is a local label that can be re-pointed at
-another URL, so bare names such as `origin` are ignored. No personal address
-is built in anywhere.
+another URL, so bare names such as `origin` are ignored. An exception is
+resolved from a configured remote name; a direct-URL `git push` does not
+borrow it. No personal address is built in anywhere.
 
 ```bash
 python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \

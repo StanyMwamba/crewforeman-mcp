@@ -4030,7 +4030,8 @@ _SHUTDOWN_NOISE_RE = re.compile(
     r"(?im)^(?:dsh:\s*)?session\s+\"[^\"]*\":\s*flush on a closed handle"
     r"[^\n]*\n?")
 _SHUTDOWN_STOP_REASONS = frozenset(
-    ("timeout", "time_limit", "stalled", "cancel", "cancelled", "canceling"))
+    ("timeout", "time_limit", "stalled", "cancel", "cancelled", "canceling",
+     "loop", "loop_nudge", "loop_stop", "budget", "no_balance"))
 
 
 def _strip_shutdown_noise(text, stop_reason=None):

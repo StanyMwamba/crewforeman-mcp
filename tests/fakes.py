@@ -234,6 +234,9 @@ if mode == "drain":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     emit({"type": "session", "version": 4, "id": "drain-session",
           "cwd": str(workspace.resolve())})
+    if os.environ.get("FAKE_DSH_CLOSED_HANDLE_STDERR"):
+        sys.stderr.write('dsh: session "drain": flush on a closed handle\n')
+        sys.stderr.flush()
     deadline = time.time() + float(os.environ.get("FAKE_DSH_DRAIN_SECONDS", "1.2"))
     seq = 0
     while time.time() < deadline:

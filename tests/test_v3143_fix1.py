@@ -157,6 +157,7 @@ class StopDrainIntegrationTest(unittest.TestCase):
         child_env.update({
             "FAKE_DSH_MODE": "drain",
             "FAKE_DSH_DRAIN_SECONDS": "1.2",
+            "FAKE_DSH_CLOSED_HANDLE_STDERR": "1",
         })
         with mock.patch.dict(os.environ, child_env, clear=False):
             result = harness._execute_once_impl(
@@ -167,6 +168,8 @@ class StopDrainIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(result["events"], 3,
                                 "events written after the stop were lost")
         self.assertNotIn("flush on a closed handle", result["error"] or "")
+        self.assertNotIn("flush on a closed handle",
+                         result.get("stderr_tail") or "")
 
     def test_a_child_that_outlives_the_drain_window_is_killed(self):
         tmp = tempfile.TemporaryDirectory()

@@ -174,6 +174,12 @@ class ShutdownNoiseTests(unittest.TestCase):
         self.assertIn("progress line", cleaned)
         self.assertIn("tail", cleaned)
 
+    def test_closed_handle_line_is_stripped_after_a_loop_stop(self):
+        raw = ('progress\n'
+               'dsh: session "loop": flush on a closed handle\n')
+        cleaned = harness._strip_shutdown_noise(raw, "loop")
+        self.assertNotIn("flush on a closed handle", cleaned)
+
     def test_closed_handle_line_is_kept_without_a_stop_reason(self):
         raw = 'dsh: session "session-1": flush on a closed handle\n'
         self.assertEqual(harness._strip_shutdown_noise(raw, None), raw)
