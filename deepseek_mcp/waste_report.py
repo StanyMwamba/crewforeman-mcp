@@ -9,6 +9,8 @@ derived ratios) and never raises.
 import os
 import re
 
+from . import model_usage as model_usage_mod
+
 NAME = "WASTE_REPORT.md"
 MAX_TEXT = 20000
 
@@ -66,12 +68,19 @@ def _empty(present=False):
         "agents_discarded": None,
         "waste_ratio": None,
         "source": None,
+        "by_vendor": {},
     }
 
 
-def parse_waste(text):
-    """Parse WASTE_REPORT text into counts and a bounded waste ratio."""
+def parse_waste(text, model_usage=None):
+    """Parse WASTE_REPORT text into counts and a bounded waste ratio.
+
+    ``model_usage`` (a finished model-usage aggregate) adds its ``by_vendor``
+    rollup to the payload; the parsed fields are unchanged without it.
+    """
     result = _empty(present=False)
+    if isinstance(model_usage, dict):
+        result["by_vendor"] = model_usage_mod.by_vendor_of(model_usage)
     if not isinstance(text, str):
         return result
     text = text[:MAX_TEXT]
@@ -120,14 +129,18 @@ def parse_waste(text):
     return result
 
 
-def inspect(workspace):
-    """Read ``<workspace>/WASTE_REPORT.md`` (bounded) and parse it."""
+def inspect(workspace, model_usage=None):
+    """Read ``<workspace>/WASTE_REPORT.md`` (bounded) and parse it.
+
+    ``model_usage`` (a finished model-usage aggregate) adds its ``by_vendor``
+    rollup to the payload; all pre-existing keys are unchanged without it.
+    """
     path = os.path.join(workspace, NAME)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             text = handle.read(MAX_TEXT)
     except (OSError, IOError):
         return _empty(present=False)
-    parsed = parse_waste(text)
+    parsed = parse_waste(text, model_usage=model_usage)
     parsed["present"] = True
     return parsed

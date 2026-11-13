@@ -9,6 +9,8 @@ below the gate (or still has blocking defects) is no longer reported as plain
 Python 3.9 compatible; standard library only.
 """
 
+from . import model_usage as model_usage_mod
+
 STATUSES = (
     "ok",
     "ok_below_gate",
@@ -121,3 +123,23 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
     if rescued:
         return "ok_rescued", STATUS_MEANING["ok_rescued"], passed
     return "ok", STATUS_MEANING["ok"], passed
+
+
+def usage_status(model_usage=None):
+    """Job-status usage payload: per-model split plus the per-vendor rollup.
+
+    ``model_usage`` is the finished aggregate from
+    :mod:`deepseek_mcp.model_usage` (the dict run records serialise).  The
+    payload is additive: every key that job status already showed is
+    unchanged and ``by_vendor`` carries the vendor → tokens/cost/models
+    rollup (3.15.0).
+    """
+    usage = model_usage if isinstance(model_usage, dict) else {}
+    models = usage.get("models")
+    totals = usage.get("totals")
+    return {
+        "models": models if isinstance(models, dict) else {},
+        "totals": totals if isinstance(totals, dict) else {},
+        "unpriced_models": list(usage.get("unpriced_models") or []),
+        "by_vendor": model_usage_mod.by_vendor_of(usage),
+    }

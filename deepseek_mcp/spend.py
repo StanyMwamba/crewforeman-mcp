@@ -9,6 +9,7 @@ billing.
 import datetime as dt
 
 from . import ledger
+from . import model_usage as model_usage_mod
 
 
 def today_key(now=None):
@@ -55,7 +56,13 @@ def _reserved_today(cfg, now=None):
         return 0.0, True
 
 
-def budget_state(cfg, now=None):
+def budget_state(cfg, now=None, model_usage=None):
+    """Daily spend state; ``model_usage`` adds the per-vendor ``by_vendor``.
+
+    The optional ``model_usage`` aggregate (the dict ``model_usage.build_model_usage``
+    / ``ModelUsage.finish`` returns) contributes a ``by_vendor`` rollup to the
+    payload.  All pre-existing keys are unchanged.
+    """
     spent = spend_today(cfg, now)
     reserved, reserved_unknown = _reserved_today(cfg, now)
     effective = round(spent + reserved, 6)
@@ -90,6 +97,7 @@ def budget_state(cfg, now=None):
         "alert_crossed": alert_crossed,
         "limit_reached": limit_reached,
         "warning": warning,
+        "by_vendor": model_usage_mod.by_vendor_of(model_usage),
     }
 
 
