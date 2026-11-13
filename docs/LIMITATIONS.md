@@ -54,6 +54,28 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
   builder. `os_sandbox=auto` starts it only with `degraded=true`, and the run
   header prints `UNSANDBOXED`. A run record never reports `enforcement=enforced`
   unless the probe and the canary both passed.
+### Child shutdown and the Windows stop path
+
+- **The stdout read end is never closed under a live writer.**  The connector
+  gives the child's stdout to one pump thread, which closes the stream only
+  after a real EOF.  A deliberate stop keeps draining while the captured
+  process group is alive, then escalates SIGTERM to SIGKILL; the retry/degrade
+  path (`flush on a closed handle` -> one fresh retry, then `ok_unreviewed`)
+  remains as a backstop.  On POSIX a regression test proves that a grandchild
+  writing 2.5 s after the direct child exits is still captured.
+- **Windows has no SIGTERM grace on a deliberate stop.**  `platforms.terminate_tree`
+  uses `taskkill /T /F`, so the force-stopped child cannot run a post-stop
+  session-log flush; the connector still keeps the pipe open to EOF and never
+  closes it from the waiter, but a final flush *after* a forced Windows kill is
+  not guaranteed.  A normal Windows exit still drains inherited stdout to EOF
+  up to `EXIT_GROUP_DRAIN_SECONDS`; the closed-handle retry/degrade is the
+  backstop for the forced-stop case.
+- **No-pgid path.**  When Windows (or an unusual POSIX leader) has no pgid, the
+  group is considered gone only when the stdout pump reaches a real EOF.  A
+  grandchild that redirects stdout away from the inherited pipe is therefore
+  invisible; cleanup is deferred and `stream_abandoned`/`cleanup_deferred`
+  are recorded only when EOF never arrives.  No claim is made that such a
+  redirected child has exited.
 - **Scope:** this is a file-write boundary, not a container, VM, network
   firewall or malware sandbox. It does not protect against kernel or sandbox
   exploits, a compromised `dsh` install, a different same-user process, or
@@ -70,7 +92,7 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
 | Packaging | `pip install .` uses a small in-tree PEP 517 backend so it works offline; that backend does not implement editable installs (PEP 660). | Install into a venv with `pip install .`, or run `python -m deepseek_mcp` from the repository root for a source-linked development loop. |
 | Path matching | Plan, write-set and record matching folds case on Windows only. macOS is matched case-sensitively: APFS can be formatted case-sensitive, so the host-wide "every Mac ignores case" assumption would merge `A.py` and `a.py` into one plan entry on such a volume. | Declare each file with its on-disk spelling; on a case-insensitive Mac volume a differently-cased declaration is not treated as the same file. |
 | Sandbox | The OS boundary is a file-write boundary only, and it differs per platform: macOS Seatbelt, Linux Landlock at ABI 3 or newer, Windows write-restricted token. ABI 1-2 Linux and hosts without a usable wrapper run degraded or `UNSANDBOXED`, never as an enforced boundary. | Read the run's `os_sandbox` object and header, and the per-OS limits below. Review the workspace before accepting output. |
-| Windows | The first real `windows-2025` run (42629362611) failed in the sandbox probe before the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`). 3.13.3 fixed the probe; run 42648360100 proved it (`usable=true`, `write_restricted=true` on both Pythons) but the suite was red (82 failures + 141 errors on 3.9; 83 + 139 on 3.15) and `admin_member` errored (`WinError 1309`). 3.13.9 was green in run 42697229851; 3.14.3 needs its own green Windows run as the required evidence. The runner account is an Administrators member, but the failed probe's elevation value is not evidence; `admin` (token elevation) and `admin_member` (account group) are recorded separately. When the next run reaches the boundary, create/modify/append/truncate denials outside the workspace are required; delete/rename outside is recorded and stays `delete_outside=unverified` unless the run proves it. The token blocks file writes only; network and UNC writes are not blocked. The standard-user path is still established only by the user's Windows 11 VM run. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
+| Windows | The first real `windows-2025` run (42629362611) failed in the sandbox probe before the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`, `usable=false`). 3.13.3 fixed the probe; run 42648360100 proved it (`usable=true`, `write_restricted=true` on both Pythons) but the suite was red (82 failures + 141 errors on 3.9; 83 + 139 on 3.15) and `admin_member` errored (`WinError 1309`). 3.13.9 was green in run 42697229851; 3.14.3 is green on both Windows Pythons in run 43453684037 (head a2c0ada, 6/6 jobs). The runner account is an Administrators member, but the failed probe's elevation value is not evidence; `admin` (token elevation) and `admin_member` (account group) are recorded separately. In the green 3.14.3 run the boundary required create/modify/append/truncate denials outside the workspace; delete/rename outside is recorded and stays `delete_outside=unverified` unless the run proves it. The token blocks file writes only; network and UNC writes are not blocked. The standard-user path is still established only by the user's Windows 11 VM run. | Process-tree termination uses `taskkill /T /F`; paths use `%APPDATA%`/`%LOCALAPPDATA%`. Run as a standard user; no no-admin claim is made. Report a failing case with the run id. |
 | Resume | Resume can only continue from a checkpoint boundary. Work done by a DSH process killed mid-tool-call is repeated. | Skeleton and checkpoints are written before each phase; finished revisions are reused. |
 | Live scaling | The candidate score is a deterministic heuristic, not a model review. It can misjudge unusually formatted output. | Threshold, max extra waves and the whole-job budget are configurable; set `live_scaling=false` to disable. |
 | Reviewer | The reviewer is a fresh Harness process; `reviewer_model`/`reviewers` can put it on another vendor, but a legacy `dsh_bin` wrapper that does not set a vendor label is fail-closed and pauses once. | Configure `reviewers` (see `docs/REVIEWER.md`); the same-vendor question is explicit and labelled. |

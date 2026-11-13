@@ -78,6 +78,13 @@ that stops crosscheck false alarms from being counted.
   first); hooks are defense in depth, and the GitHub Actions workflow runs the
   same gate over the pushed range before the test matrix. CLI:
   `python -m deepseek_mcp.git_identity --repo DIR --base A --head B`.
+- **Windows forced-stop limitation is documented.**  A deliberate stop on
+  Windows uses `taskkill /T /F`, so a force-stopped child's own post-stop
+  session-log flush is not guaranteed; the connector still keeps the stdout
+  pipe open to EOF and never closes it from the waiter, and the
+  closed-handle retry/degrade remains the backstop.  Normal exits drain to EOF,
+  and the no-pgid caveat for redirected grandchildren is recorded in
+  `docs/LIMITATIONS.md`.
 - **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
   builders get the OS boundary when the platform can provide it; a per-job
   `danger-full-access` is labelled
