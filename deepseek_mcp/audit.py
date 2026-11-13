@@ -656,6 +656,64 @@ def _valid_spot(check):
     return result in ("pass", "passed", "fail", "failed") and bool(evidence)
 
 
+def _audit_focused(plan):
+    """True for the focused re-audit round that follows audit blocking."""
+    record = (plan or {}).get("record") or plan or {}
+    try:
+        round_no = int(record.get("review_round") or 0)
+    except (TypeError, ValueError):
+        round_no = 0
+    return bool(record.get("blocking")) and round_no > 1
+
+
+def _enforce_spots(result, plan, focused=False):
+    """Require the seeded spots on a full audit and flag failed spots.
+
+    A focused re-audit is asked to check only the prior blocking items, so it
+    must not be failed for omitting the originally seeded spot ids.  Every
+    prior blocking id must still come back with pass/fail plus evidence.
+    """
+    checks = result.get("spot_checks") or []
+    by_id = {}
+    for check in checks:
+        ident = str(check.get("id") or "").strip()
+        if ident:
+            by_id.setdefault(ident, []).append(check)
+    record = (plan or {}).get("record") or plan or {}
+    if focused:
+        required = [str(item.get("id")) for item in record.get("blocking") or []
+                    if isinstance(item, dict) and item.get("id")]
+    else:
+        required = [ident for ident, _kind in _planned_spot_ids(plan)]
+    for ident in required:
+        if not by_id.get(ident) or not any(
+                _valid_spot(check) for check in by_id[ident]):
+            result["error"] = "spot_checks_incomplete"
+            result["ran"] = False
+            return
+    known = {str(item.get("id")) for item in result.get("blocking") or []
+             if isinstance(item, dict)}
+    for check in checks:
+        if str(check.get("result") or check.get("status") or "").strip().lower() \
+                not in ("fail", "failed"):
+            continue
+        ident = str(check.get("id") or "spot")
+        if "SPOT-%s" % ident in known:
+            continue
+        evidence = _truncate(check.get("evidence"), 800)
+        result.setdefault("blocking", []).append({
+            "id": "SPOT-%s" % ident,
+            "text": "audit spot check failed: %s" % ident,
+            "evidence": evidence,
+        })
+        result["blocking_count"] = int(result.get("blocking_count") or 0) + 1
+        result.setdefault("claims", []).append({
+            "claim": "spot check %s reported as passing" % ident,
+            "why": "the re-run evidence failed",
+            "evidence": evidence,
+        })
+
+
 def _coerce_blocking(value):
     rows = []
     if isinstance(value, int):
@@ -731,41 +789,11 @@ def parse_audit(report_text, plan=None):
         if not isinstance(checks, list):
             result["error"] = "spot_checks_missing"
             return result
-        normalized = [item for item in checks if isinstance(item, dict)][:40]
-        by_id = {}
-        for check in normalized:
-            ident = str(check.get("id") or "").strip()
-            if ident:
-                by_id.setdefault(ident, []).append(check)
-        # Every seeded spot must come back with a pass/fail and the command
-        # output it re-ran.  A bare score cannot satisfy the audit.
-        for ident, _kind in _planned_spot_ids(plan):
-            if not by_id.get(ident):
-                result["error"] = "spot_checks_incomplete"
-                return result
-            if not any(_valid_spot(check) for check in by_id[ident]):
-                result["error"] = "spot_checks_incomplete"
-                return result
-        result["spot_checks"] = normalized
-        failed = [
-            check for check in normalized
-            if str(check.get("result") or check.get("status") or "").strip()
-            .lower() in ("fail", "failed")
-        ]
-        for check in failed:
-            ident = str(check.get("id") or "spot")
-            evidence = _truncate(check.get("evidence"), 800)
-            result["blocking"].append({
-                "id": "SPOT-%s" % ident,
-                "text": "audit spot check failed: %s" % ident,
-                "evidence": evidence,
-            })
-            result["blocking_count"] = int(result["blocking_count"]) + 1
-            result["claims"].append({
-                "claim": "spot check %s reported as passing" % ident,
-                "why": "the re-run evidence failed",
-                "evidence": evidence,
-            })
+        result["spot_checks"] = [
+            item for item in checks if isinstance(item, dict)][:40]
+        _enforce_spots(result, plan, _audit_focused(plan))
+        if result.get("error"):
+            return result
         result["ran"] = True
         return result
 
@@ -801,6 +829,11 @@ def parse_audit(report_text, plan=None):
             "result": spot.group(2).lower(),
             "evidence": _truncate(spot.group(3), 500),
         })
+    # The heading fallback must satisfy the same seeded-spot contract as the
+    # JSON block; otherwise removing AUDIT_JSON would bypass the audit.
+    _enforce_spots(result, plan, _audit_focused(plan))
+    if result.get("error"):
+        return result
     return result
 
 
@@ -856,15 +889,20 @@ def confirmed_fixes(crosscheck_record):
             if isinstance(part, dict)
         }
         builder = str((parts.get(part_id) or {}).get("builder_crew") or "")
-        if part_id and builder and fix_crew != builder:
-            rescuers = {
-                str(row.get("rescue_crew") or "")
-                for row in (crosscheck_record or {}).get("rescues") or []
-                if isinstance(row, dict)
-                and str(row.get("part_id") or "") in (part_id, "", "all")
-            }
-            if fix_crew not in rescuers:
+        if part_id:
+            # Match evaluate(): an unknown part or a fixer other than its
+            # builder/rescuer is not a confirmed fix worth spot-checking.
+            if not builder:
                 continue
+            if fix_crew != builder:
+                rescuers = {
+                    str(row.get("rescue_crew") or "")
+                    for row in (crosscheck_record or {}).get("rescues") or []
+                    if isinstance(row, dict)
+                    and str(row.get("part_id") or "") in (part_id, "", "all")
+                }
+                if fix_crew not in rescuers:
+                    continue
         rows.append({
             "id": item.get("id"),
             "text": item.get("text"),

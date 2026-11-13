@@ -332,6 +332,46 @@ class PromptParseTests(unittest.TestCase):
         done = audit.finish({"job_id": "j"}, report, None)
         self.assertEqual(done["verdict"], "blocked")
 
+    def test_focused_reaudit_does_not_require_original_spots(self):
+        plan = {"record": {
+            "review_round": 2,
+            "blocking": [{"id": "AUD-1", "text": "still broken"}],
+            "spot": {"requirements": [{"id": "R1"}], "fixes": []},
+        }}
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": [{"id": "AUD-1", "result": "pass", '
+                  '"evidence": "command: regression; ok"}]} -->')
+        result = audit.parse_audit(report, plan)
+        self.assertTrue(result["ran"], result.get("error"))
+        self.assertEqual(result["blocking_count"], 0)
+
+    def test_focused_reaudit_must_verify_each_prior_blocking_item(self):
+        plan = {"record": {
+            "review_round": 2,
+            "blocking": [{"id": "AUD-1", "text": "still broken"}],
+            "spot": {"requirements": [{"id": "R1"}], "fixes": []},
+        }}
+        report = ('<!-- AUDIT_JSON {"score": 9.0, "blocking": [], '
+                  '"crew_claims_that_did_not_hold": [], '
+                  '"spot_checks": []} -->')
+        result = audit.parse_audit(report, plan)
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["error"], "spot_checks_incomplete")
+
+    def test_heading_fallback_still_requires_seeded_spots(self):
+        plan = {"record": {"spot": {
+            "requirements": [{"id": "R1"}], "fixes": []}}}
+        bare = ("## Connector audit\n- Audit score: 9.5\n"
+                "- Audit blocking: 0\n")
+        result = audit.parse_audit(bare, plan)
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["error"], "spot_checks_incomplete")
+        with_spot = bare + "- R1: pass — command: test -q; ok\n"
+        result = audit.parse_audit(with_spot, plan)
+        self.assertTrue(result["ran"], result.get("error"))
+        self.assertEqual(result["score"], 9.5)
+
     def test_integer_blocking_keeps_reaudit_rows(self):
         report = ('<!-- AUDIT_JSON {"score": 6.0, "blocking": 2, '
                   '"spot_checks": []} -->')

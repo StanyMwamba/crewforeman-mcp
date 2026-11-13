@@ -131,6 +131,16 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result["status"], "invalid")
         self.assertTrue(any("overlap" in item for item in result["errors"]))
 
+    def test_plan_globs_are_kept_and_checked_for_overlap(self):
+        self._write({"parts": [
+            {"id": "p1", "write_set": ["docs/*.md"]},
+            {"id": "p2", "write_set": ["docs/b.md"]},
+        ]})
+        result = crosscheck.plan_parts(self.tmp.name)
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("overlap" in item for item in result["errors"]))
+        self.assertEqual(result["parts"][0]["write_set"], ["docs/*.md"])
+
     def test_artifact_roundtrip(self):
         self._write({"parts": [
             {"id": "p1", "write_set": ["a.py"]},
@@ -496,15 +506,31 @@ class RescueTests(unittest.TestCase):
         self.assertLessEqual(evaluation["score"], 8.0)
         self.assertIn("rescue_failed", evaluation["reasons"])
 
+    def test_unknown_failed_crew_does_not_rescue_every_part(self):
+        record = crosscheck.new_record({"threshold": 10.0})
+        record["parts"] = [
+            _part("p1", ["a.py"], status="failed"),
+            _part("p2", ["b.py"], status="failed"),
+        ]
+        record = crosscheck.apply_rescue(
+            record, {"failed_crew": "crew-typo", "status": "ok",
+                     "rescue_crew": "finisher"}, rescued=True)
+        self.assertEqual([part["status"] for part in record["parts"]],
+                         ["failed", "failed"])
+        self.assertEqual(record["rescues"][0]["scope"], "unknown_crew")
+        evaluation = crosscheck.evaluate(
+            record["parts"], [], [], {"status": "passed"},
+            record["rescues"], threshold=10.0)
+        self.assertLessEqual(evaluation["score"], 8.0)
+
     def test_rescue_does_not_cap_a_green_result(self):
         record = crosscheck.new_record({"threshold": 10.0})
         record["parts"] = [_part("p1", ["a.py"])]
         record = crosscheck.apply_rescue(
-            record, {"reason": "stall", "failed_crew": "crew-9"},
-            rescued=True)
+            record, {"reason": "whole-run stall"}, rescued=True)
         self.assertTrue(record["rescues"])
-        # The 'all' rescue is informational when no part matched; a part that
-        # was actually rescued is marked above in test_rescued_part...
+        # The 'all' rescue is informational when no part needed a status
+        # change; a part that was actually rescued is marked in the test above.
         self.assertEqual(record["rescues"][0]["part_id"], "all")
 
 

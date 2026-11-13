@@ -73,8 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tests condition and cannot reach 10.0. A fix counts only when the part's
   builder or a successful rescuer made it; the finding crew cannot fix and
   confirm the same item. An unmatched explicit rescue target is recorded as
-  `unknown_part` and cannot mark other parts rescued. Every seeded audit spot
-  id must return pass/fail plus command output, and a failed spot is blocking.
+  `unknown_part` and cannot mark other parts rescued. On a full audit every
+  seeded spot id must return pass/fail plus command output (the heading
+  fallback included), a failed spot is blocking, and a focused re-audit is not
+  failed for omitting the original sample.
   Per-job `risk_paths` reaches risk detection, and resume replays the frozen
   crosscheck/audit/parallel settings or fails closed instead of downgrading.
 - **Parallel/integration hardening.** A `PLAN.json` write set is

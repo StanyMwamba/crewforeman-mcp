@@ -175,6 +175,15 @@ def _safe_glob(raw):
     return text
 
 
+def _fs_key(path):
+    """Case-normalise for the current filesystem and keep '/' separators.
+
+    ``os.path.normcase`` turns '/' into '\\\\' on Windows; converting back
+    keeps the directory-prefix comparison and glob patterns consistent.
+    """
+    return os.path.normcase(str(path)).replace("\\", "/")
+
+
 def path_covered(path, write_set):
     """True when ``path`` is the same as or under a write-set entry."""
     target = normalise_rel(path)
@@ -185,15 +194,20 @@ def path_covered(path, write_set):
         if any(char in raw for char in "*?["):
             import fnmatch
             pattern = _safe_glob(raw)
-            if pattern and fnmatch.fnmatchcase(target.casefold(),
-                                               pattern.casefold()):
+            # Containment follows the actual filesystem's case rules: a
+            # case-only difference must not let a stray file install on a
+            # case-sensitive Linux tree.
+            if pattern and fnmatch.fnmatchcase(
+                    _fs_key(target), _fs_key(pattern)):
                 return True
             continue
         entry = normalise_rel(raw)
         if not entry:
             continue
-        if (target.casefold() == entry.casefold()
-                or target.casefold().startswith(entry.rstrip("/").casefold() + "/")):
+        target_key = _fs_key(target)
+        entry_key = _fs_key(entry)
+        if (target_key == entry_key
+                or target_key.startswith(entry_key.rstrip("/") + "/")):
             return True
     return False
 

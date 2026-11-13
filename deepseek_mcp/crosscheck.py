@@ -50,7 +50,9 @@ STATUS_BELOW = "crosscheck_below_threshold"
 
 _REQUIREMENT_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+(.+?)\s*$")
 _PATH_SPLIT_RE = re.compile(r"[,;\s]+")
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
+# PLAN write sets may use globs; keep metacharacters so disjointness is still
+# computed against the real pattern rather than silently dropping the entry.
+_SAFE_PLAN_PATH_RE = re.compile(r"^[A-Za-z0-9._\-/*?\[\]]+$")
 
 
 class CrosscheckError(ValueError):
@@ -186,7 +188,7 @@ def _split_paths(blob):
         token = token.strip().strip("`'\"()[]{}<>")
         token = token.rstrip(".,;:")
         path = _norm_path(token)
-        if not path or not _SAFE_PATH_RE.match(path):
+        if not path or not _SAFE_PLAN_PATH_RE.match(path):
             continue
         key = _path_key(path)
         if key not in seen:
@@ -984,7 +986,7 @@ def apply_rescue(record, rescue, rescued=False):
                    if str(part.get("builder_crew") or "") == failed_crew]
     else:
         targets = []
-    if not targets and not explicit:
+    if not targets and not explicit and not failed_crew:
         targets = [
             part for part in parts
             if str(part.get("status") or "").strip().lower()
@@ -1031,6 +1033,16 @@ def apply_rescue(record, rescue, rescued=False):
             "rescue_crew": rescue_crew,
             "checker_crew": None,
             "status": "unknown_part",
+        })
+    elif failed_crew:
+        rows.append({
+            "part_id": "",
+            "scope": "unknown_crew",
+            "reason": default_reason,
+            "failed_crew": failed_crew,
+            "rescue_crew": rescue_crew,
+            "checker_crew": None,
+            "status": "unknown_crew",
         })
     else:
         # No part could be identified.  A successful rescue completed the

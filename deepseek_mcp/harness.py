@@ -4333,6 +4333,8 @@ def _job_spec_for_checkpoint(run, args, workspace):
         "work_id": run.get("work_id"),
         "attempt_no": run.get("attempt_no"),
         "request_fingerprint": run.get("request_fingerprint"),
+        "mode": run.get("mode"),
+        "crosscheck_config": run.get("crosscheck_config"),
     })
     return spec
 
@@ -4451,6 +4453,8 @@ def _synthetic_saved_run(manifest):
         "builder_sandbox": spec.get("builder_sandbox"),
         "reviewer_sandbox": spec.get("reviewer_sandbox"),
         "transport": spec.get("transport"),
+        "mode": spec.get("mode"),
+        "crosscheck_config": spec.get("crosscheck_config"),
         "add_dirs": spec.get("add_dirs") or [],
         "output_files": builder.get("output_files") or [],
         "answer": None,
@@ -10143,25 +10147,37 @@ def _resume_job_args(saved, spec=None):
     saved = saved if isinstance(saved, dict) else {}
     spec = spec if isinstance(spec, dict) else {}
     out = {}
+    mapping = (
+        ("crosscheck_crews", "crews"),
+        ("crosscheck_crew_size", "crew_size"),
+        ("crosscheck_threshold", "threshold"),
+        ("crosscheck_max_rounds", "max_rounds"),
+        ("audit_review", "audit_review"),
+        ("audit_sample_rate", "audit_sample_rate"),
+        ("audit_spot_requirements", "audit_spot_requirements"),
+        ("audit_spot_fixes", "audit_spot_fixes"),
+        ("risk_paths", "risk_paths"),
+    )
+    mode = str(saved.get("mode") or spec.get("mode") or "")
     cc = saved.get("crosscheck_config")
     if not isinstance(cc, dict):
+        cc = spec.get("crosscheck_config")
+    if not isinstance(cc, dict):
         cc = {}
-    if str(saved.get("mode") or "") == "crosscheck" or cc:
-        if not cc:
+    if not cc and mode == "crosscheck":
+        # A run record lost from disk is rebuilt from the checkpoint spec;
+        # reconstruct the frozen config from the individual spec keys.
+        cc = {key: spec.get(arg) for arg, key in mapping
+              if spec.get(arg) is not None}
+        if spec.get("subagents") is not None:
+            cc["subagents"] = spec.get("subagents")
+    if mode == "crosscheck" or cc:
+        if not cc and str(saved.get("mode") or "") == "crosscheck":
             raise RuntimeError(
                 "cannot resume crosscheck run: the saved job has no "
                 "crosscheck_config (refusing to downgrade to standard mode)")
         out["mode"] = "crosscheck"
-        for arg, key in (
-                ("crosscheck_crews", "crews"),
-                ("crosscheck_crew_size", "crew_size"),
-                ("crosscheck_threshold", "threshold"),
-                ("crosscheck_max_rounds", "max_rounds"),
-                ("audit_review", "audit_review"),
-                ("audit_sample_rate", "audit_sample_rate"),
-                ("audit_spot_requirements", "audit_spot_requirements"),
-                ("audit_spot_fixes", "audit_spot_fixes"),
-                ("risk_paths", "risk_paths")):
+        for arg, key in mapping:
             if cc.get(key) is not None:
                 out[arg] = cc[key]
         if cc.get("subagents") is not None:

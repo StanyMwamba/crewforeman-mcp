@@ -148,6 +148,21 @@ class ResumeSurfaceTests(unittest.TestCase):
         self.assertEqual(out["audit_spot_requirements"], 4)
         self.assertEqual(out["risk_paths"], ["billing/**"])
 
+    def test_checkpoint_spec_replays_when_run_record_is_missing(self):
+        from deepseek_mcp.harness import _resume_job_args
+        spec = {
+            "mode": "crosscheck",
+            "crosscheck_config": {
+                "threshold": 9.0, "max_rounds": 2, "crews": 2,
+                "crew_size": 4, "subagents": 8, "audit_review": True,
+            },
+        }
+        out = _resume_job_args({}, spec)
+        self.assertEqual(out["mode"], "crosscheck")
+        self.assertEqual(out["crosscheck_threshold"], 9.0)
+        self.assertEqual(out["crosscheck_max_rounds"], 2)
+        self.assertEqual(out["subagents"], 8)
+
     def test_crosscheck_without_frozen_config_fails_closed(self):
         from deepseek_mcp.harness import _resume_job_args
         with self.assertRaises(RuntimeError):

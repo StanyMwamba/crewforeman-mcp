@@ -289,6 +289,15 @@ class StrayTests(unittest.TestCase):
             self.assertEqual(
                 writesets.normalise_rel(absolute, root), "src/a.py")
 
+    def test_case_containment_follows_the_filesystem(self):
+        # A case-only difference is a stray on case-sensitive POSIX, but the
+        # same file on Windows.
+        self.assertEqual(
+            writesets.path_covered("src/A.py", ["src/a.py"]),
+            os.name == "nt")
+        self.assertEqual(writesets.stray_files(["src/a.py"], ["src/A.py"]),
+                         [] if os.name == "nt" else ["src/A.py"])
+
     def test_empty_write_set_is_never_installed(self):
         decision = writesets.integration_decision(
             {"write_set": []}, ["src/a.py"], True)

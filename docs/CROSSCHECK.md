@@ -143,11 +143,13 @@ Risk detection is used only to (1) never sample the audit out and (2) record
 risky. Risk globs come from `risk_paths` (the name used in the 3.14.2 brief)
 and `audit_risk_globs`; both lists are merged with the built-in defaults.
 `audit_sample_rate` defaults to 1.0; `0.2` audits one in five low-risk jobs. A
-failed crew claim forces full audits for the next five crosscheck jobs. Every
-seeded spot id must come back with `pass`/`fail` and the command output that
-was re-run; a missing id, malformed list or failed spot is blocking, and an
-empty audit section is `not_reported`, never a pass. An audit blocking list
-gets one crew fix round and a focused re-audit of only those items.
+failed crew claim forces full audits for the next five crosscheck jobs. On the
+full audit, every seeded spot id must come back with `pass`/`fail` and the
+command output that was re-run; a missing id, malformed list or failed spot is
+blocking, and an empty audit section is `not_reported`, never a pass. The
+heading-only fallback must satisfy the same spot contract. An audit blocking
+list gets one crew fix round and a focused re-audit of only those items (the
+focused round is not required to repeat the original spot sample).
 
 A resumed crosscheck job replays the frozen `mode`/`crosscheck_*`/`audit_*`
 settings and `risk_paths`; a saved crosscheck run without that config fails
