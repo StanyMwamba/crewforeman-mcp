@@ -5,12 +5,16 @@ never the network beyond 127.0.0.1.  Python 3.9-compatible, stdlib unittest,
 Windows-safe paths via pathlib.
 """
 
+import base64
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from deepseek_mcp import mimo_worker
@@ -22,6 +26,7 @@ except ImportError:  # tests run as top-level modules
 
 
 FAKE_MIMO_BODY = r'''#!/usr/bin/env python3
+import base64
 import json
 import os
 import sys
@@ -36,6 +41,25 @@ if capture:
     except Exception:
         pass
 
+# Record password-env PRESENCE only -- never the value: the password must
+# not land in any capture that gets serialised.
+state_path = os.environ.get("FAKE_MIMO_STATE")
+if state_path:
+    try:
+        state = {}
+        if os.environ.get("MIMOCODE_SERVER_PASSWORD"):
+            state["password_env"] = True
+        Path(state_path).write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+
+# The real CLI has no --host flag: print usage and exit non-zero.
+for item in argv[1:]:
+    if item == "--host" or item.startswith("--host="):
+        sys.stderr.write("usage: mimo serve [--hostname HOSTNAME] [--port PORT]\n")
+        sys.stderr.write("mimo serve: error: unrecognized arguments: %s\n" % item)
+        sys.exit(2)
+
 
 def emit(obj):
     print(json.dumps(obj), flush=True)
@@ -48,7 +72,7 @@ def parse_flags(args):
     while index < len(args):
         item = args[index]
         if item in ("--format", "--dir", "-m", "--variant", "-s", "--attach",
-                    "--host", "--port"):
+                    "--hostname", "--port"):
             if index + 1 < len(args):
                 flags[item] = args[index + 1]
                 index += 2
@@ -69,24 +93,86 @@ task = positional[1] if len(positional) > 1 else (
 
 if positional and positional[0] == "serve":
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    host = flags.get("--host") or "127.0.0.1"
+    host = flags.get("--hostname") or "127.0.0.1"
     port = int(flags.get("--port") or 0)
+    password = os.environ.get("MIMOCODE_SERVER_PASSWORD") or ""
+
+    def health_mode():
+        path = os.environ.get("FAKE_MIMO_HEALTH_FILE")
+        if path:
+            try:
+                return Path(path).read_text(encoding="utf-8").strip()
+            except Exception:
+                return "ok"
+        return os.environ.get("FAKE_MIMO_HEALTH_MODE", "ok")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
 
-        def do_GET(self):
-            healthy = self.path.split("?")[0].rstrip("/") == "/healthz"
-            body = b"ok" if healthy else b"missing"
-            self.send_response(200 if healthy else 404)
+        def _authorized(self):
+            if not password:
+                return True
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                return False
+            try:
+                decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+            except Exception:
+                return False
+            user, sep, supplied = decoded.partition(":")
+            return sep == ":" and user == "" and supplied == password
+
+        def _send(self, status, body):
+            self.send_response(status)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
+            if status == 401:
+                self.send_header("WWW-Authenticate", 'Basic realm="mimocode"')
             self.end_headers()
             self.wfile.write(body)
 
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+        def do_GET(self):
+            if not self._authorized():
+                self._send(401, b"unauthorized")
+                return
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            sick = health_mode() == "sick"
+            if path == "/global/health":
+                self._send(503 if sick else 200,
+                           b"unhealthy" if sick else b"ok")
+            elif path == "/healthz":
+                self._send(200 if sick else 503,
+                           b"ok" if sick else b"unhealthy")
+            elif path == "/doc":
+                self._send(200, b"doc")
+            else:
+                self._send(404, b"")
+
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    bound = httpd.server_address[1]
+    url = "http://%s:%s" % (host, bound)
+    print("mimocode server listening on %s" % url, flush=True)
+    serve_capture = os.environ.get("FAKE_MIMO_SERVE_URL")
+    if serve_capture:
+        try:
+            Path(serve_capture).write_text(
+                json.dumps({"url": url, "host": host, "port": bound}),
+                encoding="utf-8")
+        except Exception:
+            pass
+    httpd.serve_forever()
     sys.exit(0)
+
+if mode == "leak":
+    # Deliberately hostile child: echo the password so the worker has to
+    # scrub it out of stderr_tail / error text before returning.
+    secret = os.environ.get("MIMOCODE_SERVER_PASSWORD", "")
+    print("leaked password: " + secret, file=sys.stderr, flush=True)
+    emit({"type": "error", "error": {"data": {
+        "message": "handshake failed for password " + secret,
+        "statusCode": 401}}})
+    sys.exit(1)
 
 forced_text = os.environ.get("FAKE_MIMO_TEXT")
 if task.startswith("Reply with exactly READY") and forced_text is None:
@@ -160,7 +246,12 @@ class MimoWorkerCase(unittest.TestCase):
         self.workspace = self.root / "ws"
         self.workspace.mkdir()
         self.argv_capture = self.root / "argv.json"
-        self.setenv(FAKE_MIMO_ARGV=str(self.argv_capture), FAKE_MIMO_MODE="ok")
+        self.state_capture = self.root / "state.json"
+        self.serve_url_capture = self.root / "serve-url.json"
+        self.setenv(FAKE_MIMO_ARGV=str(self.argv_capture),
+                    FAKE_MIMO_STATE=str(self.state_capture),
+                    FAKE_MIMO_SERVE_URL=str(self.serve_url_capture),
+                    FAKE_MIMO_MODE="ok")
 
     # -- helpers ---------------------------------------------------------
 
@@ -182,6 +273,26 @@ class MimoWorkerCase(unittest.TestCase):
 
     def captured_argv(self):
         return json.loads(self.argv_capture.read_text(encoding="utf-8"))
+
+    def captured_state(self):
+        return json.loads(self.state_capture.read_text(encoding="utf-8"))
+
+    def captured_serve_url(self):
+        return json.loads(self.serve_url_capture.read_text(encoding="utf-8"))
+
+    def http_status(self, url, password=None):
+        request = urllib.request.Request(url)
+        if password:
+            request.add_header("Authorization", "Basic " + base64.b64encode(
+                (":" + password).encode("utf-8")).decode("ascii"))
+        try:
+            response = urllib.request.urlopen(request, timeout=5)
+            try:
+                return response.getcode()
+            finally:
+                response.close()
+        except urllib.error.HTTPError as exc:
+            return exc.code
 
     def assert_cost_invariant(self, result):
         """cost_known False must never pair with a 0.0 (or any) cost."""
@@ -449,7 +560,7 @@ class MimoWorkerCase(unittest.TestCase):
             self.assertTrue(server.ready())
             result = mimo_worker.execute(
                 cfg, self.workspace, "attach task", attach_url=url,
-                timeout=15)
+                server_password=server.password, timeout=15)
             self.assertEqual(result["status"], "ok")
             captured = self.captured_argv()
             self.assertIn("--attach", captured)
@@ -459,6 +570,167 @@ class MimoWorkerCase(unittest.TestCase):
         finally:
             server.cleanup()
             server.cleanup()  # idempotent
+
+    def test_serve_argv_hostname_never_host(self):
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            server.start()
+            captured = self.captured_argv()
+            self.assertEqual(captured[1], "serve")
+            self.assertIn("--hostname", captured)
+            self.assertEqual(captured[captured.index("--hostname") + 1],
+                             "127.0.0.1")
+            self.assertIn("--port", captured)
+            self.assertEqual(captured[captured.index("--port") + 1], "0")
+            self.assertNotIn("--host", captured)
+        finally:
+            server.cleanup()
+
+    def test_worker_never_sends_host_flag(self):
+        # The fake rejects --host exactly like the real CLI: usage-ish text
+        # plus a non-zero exit.  If the worker ever sent --host, start()
+        # below could not succeed.
+        proc = subprocess.run(
+            [str(self.fake), "serve", "--host", "127.0.0.1", "--port", "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+        self.assertNotEqual(proc.returncode, 0)
+        combined = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        self.assertIn("usage", combined.lower())
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            self.assertTrue(server.start())
+            self.assertNotIn("--host", self.captured_argv())
+        finally:
+            server.cleanup()
+
+    def test_ready_uses_global_health_not_healthz(self):
+        # (c) /global/health 200 -> ready even though /healthz is 503.
+        # (d) /global/health 503 -> not ready even though /healthz is 200.
+        health_file = self.root / "health-mode.txt"
+        health_file.write_text("ok", encoding="utf-8")
+        self.setenv(FAKE_MIMO_HEALTH_FILE=str(health_file))
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            url = server.start()
+            password = server.password
+            self.assertEqual(self.http_status(url + "/healthz", password), 503)
+            self.assertTrue(server.ready())
+            health_file.write_text("sick", encoding="utf-8")
+            self.assertEqual(
+                self.http_status(url + "/healthz", password), 200)
+            self.assertFalse(server.ready())
+        finally:
+            server.cleanup()
+
+    def test_port_zero_ready_line_drives_attach_url(self):
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            url = server.start()
+            serve_argv = self.captured_argv()
+            self.assertEqual(serve_argv[serve_argv.index("--port") + 1], "0")
+            capture = self.captured_serve_url()
+            # --port 0 was passed: only the ready line can carry the
+            # OS-assigned port back to the worker.
+            self.assertEqual(url, capture["url"])
+            self.assertEqual(url, "http://127.0.0.1:%s" % capture["port"])
+            self.assertGreater(int(capture["port"]), 0)
+            self.assertNotEqual(url, "http://127.0.0.1:0")
+            self.assertTrue(mimo_worker._health_request(url, server.password))
+            result = mimo_worker.execute(
+                self.cfg(), self.workspace, "attach task", attach_url=url,
+                server_password=server.password, timeout=15)
+            self.assertEqual(result["status"], "ok")
+            captured = self.captured_argv()
+            self.assertIn("--attach", captured)
+            self.assertEqual(captured[captured.index("--attach") + 1], url)
+        finally:
+            server.cleanup()
+
+    def test_execute_dir_is_absolute_workspace(self):
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "dir task", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        captured = self.captured_argv()
+        dir_value = captured[captured.index("--dir") + 1]
+        self.assertEqual(dir_value, str(self.workspace))
+        self.assertTrue(Path(dir_value).is_absolute())
+
+    # -- server password hygiene ----------------------------------------
+
+    def test_serve_child_password_env_never_argv(self):
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            server.start()
+            self.assertTrue(server.password)
+            # env only: the fake records presence (never the value)
+            self.assertTrue(self.captured_state().get("password_env"))
+            captured = self.captured_argv()
+            self.assertNotIn("-p", captured)
+            self.assertNotIn("--password", captured)
+            self.assertNotIn(server.password, json.dumps(captured))
+        finally:
+            server.cleanup()
+
+    def test_execute_server_password_env_only(self):
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "no secret", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("password_env", self.captured_state())
+        server_pw = "exec-env-secret-77"
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "with secret",
+            server_password=server_pw, timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(self.captured_state().get("password_env"))
+        captured = self.captured_argv()
+        self.assertNotIn("-p", captured)
+        self.assertNotIn("--password", captured)
+        self.assertNotIn(server_pw, json.dumps(captured))
+
+    def test_health_probe_basic_auth_contract(self):
+        server = mimo_worker.MimoServer(
+            self.cfg(), host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            url = server.start()
+            password = server.password
+            # Value match: ready() only succeeds when the probe password
+            # equals the serve child's MIMOCODE_SERVER_PASSWORD.
+            self.assertTrue(server.ready())
+            self.assertIs(mimo_worker._health_request(url, password), True)
+            # Fails closed: password-protected fake, no/invalid password.
+            self.assertIs(mimo_worker._health_request(url, None), False)
+            self.assertIs(mimo_worker._health_request(url, "wrong"), False)
+            self.assertEqual(self.http_status(url + "/global/health"), 401)
+            self.assertEqual(
+                self.http_status(url + "/global/health", password), 200)
+        finally:
+            server.cleanup()
+
+    def test_password_never_recorded_in_outputs(self):
+        server_pw = "Never-Leak-Me-42"
+        for mode in ("ok", "leak"):
+            with self.subTest(mode=mode):
+                self.setenv(FAKE_MIMO_MODE=mode)
+                result = mimo_worker.execute(
+                    self.cfg(), self.workspace, "secret task",
+                    server_password=server_pw, timeout=15)
+                dump = json.dumps(result, default=str)
+                self.assertNotIn(server_pw, dump)
+                self.assertNotIn(server_pw, result.get("stderr_tail") or "")
+                self.assertNotIn(server_pw, result.get("error") or "")
+                self.assertNotIn(server_pw, json.dumps(self.captured_argv()))
+                self.assertNotIn(
+                    server_pw, self.state_capture.read_text(encoding="utf-8"))
+                if mode == "leak":
+                    # The hostile child echoed the password; the worker
+                    # scrubbed it out of both surfaces.
+                    self.assertIn("***", result.get("stderr_tail") or "")
+                    self.assertIn("***", result.get("error") or "")
 
     # -- ping ------------------------------------------------------------
 
