@@ -5,22 +5,50 @@ CrewForeman worker.  The public API mirrors the contract pinned in
 MIMO_PLAN.md: ``is_mimo_target``, ``build_argv``, ``parse_event``,
 ``classify_error``, ``execute``, ``MimoServer`` and ``ping``.
 
-The JSONL event stream consumed by :func:`parse_event`:
+Event schema -- CANONICAL shape, verified on mimo 0.1.17 (recorded lines in
+``tests/fixtures/mimo/``).  Every event carries a top-level ``type``,
+``timestamp`` (ms) and ``sessionID``, plus a ``part`` object (everything
+except ``error``, which has none):
 
-- ``{"type": "text", "data": {"text": "..."}}`` -- streamed text; the last
-  text event is the final answer.
-- ``{"type": "step_start", "data": {"name": "..."}}`` -- step begins.
-- ``{"type": "step_finish", "data": {"tokens": {"total", "input", "output",
-  "reasoning", "cache"}}}`` -- per-step usage; totals accumulate.
-- ``{"type": "tool_use", "data": {"name": "bash", "input": {...}}}`` -- tool
-  call.
-- ``{"type": "error", "error": {"data": {"message": "...", "statusCode":
-  401}}}`` -- vendor error, classified by :func:`classify_error`.
+- ``text``: ``part.text`` and ``part.time.{start,end}``.
+- ``step_start``: ``part.type == "step-start"``, ``part.snapshot``.
+- ``step_finish``: ``part.reason`` (``tool-calls`` | ``stop``),
+  ``part.tokens`` = ``{total, input, output, reasoning, cache: {read,
+  write}}`` (``cache`` is a DICT, not an int) and ``part.cost`` = the CLI's
+  own USD cost for that step.
+- ``tool_use``: ``part.tool``, ``part.callID``,
+  ``part.state.{status, input, output, metadata, title}``; subagents are
+  ``tool == "actor"`` with ``state.input.operation.action == "spawn"``.
+- ``error``: top-level ``error.name`` and
+  ``error.data.{message, statusCode, isRetryable, metadata}``.
 
-Token mapping: the stream's ``cache`` counter becomes ``cache_read_tokens``
-and ``output`` is taken to already include ``reasoning`` (tracked separately
-for reporting and never double-billed).  Cost is unknown -- never 0 -- when
-usage is missing or the model has no price entry.
+:func:`parse_event` never raises and also accepts the older
+``{"type": ..., "data": {...}}`` payload (legacy inline fakes) as a
+tolerant fallback; the canonical ``part`` fields win when both are present.
+
+Normalised event contract (keys of the dict :func:`parse_event` returns):
+
+- every event: ``kind`` (``text`` | ``step_start`` | ``step_finish`` |
+  ``tool_use`` | ``error`` | ``session`` | ``other``) and ``session_id``
+  when known (top-level ``sessionID``, ``part.sessionID``, legacy
+  spellings).
+- text: ``text``, ``time`` (``{start, end}`` ms, or ``None``).
+- step_start: ``name``, ``snapshot``.
+- step_finish: ``name``, ``reason``, ``cost`` (float or ``None``),
+  ``tokens`` = ``{total, input, output, reasoning, cache_read,
+  cache_write}`` -- ``cache.read`` (or a legacy int ``cache``) maps to
+  ``cache_read``, ``cache.write`` to ``cache_write``.
+- tool_use: ``name``, ``status``, ``input``, ``call_id``.
+- error: ``message``, ``status_code``, ``error_name``, ``is_retryable``.
+
+:func:`execute` returns the concatenation of all text parts as the final
+answer (joined with a blank line: the stream carries one ``text`` part per
+assistant message part, so narrate-then-answer runs keep both -- a single
+text part is returned unchanged).  Usage sums every ``step_finish`` and
+``total_tokens`` is the sum of the five token counters.  Cost prefers the
+CLI-reported ``part.cost`` sum (``cost_source: "vendor"``), else the price
+table (``cost_source: "price_table"``), else unknown (``cost_known``
+False, ``estimated_cost_usd`` None -- never 0.0 with known True).
 """
 
 import base64
@@ -169,8 +197,9 @@ def build_argv(task, workspace, model, *, variant=None, session_id=None,
     return argv
 
 
-def _extract_session_id(event, data):
-    for value in (event.get("session_id"), event.get("sessionId"),
+def _extract_session_id(event, part, data):
+    for value in (event.get("sessionID"), part.get("sessionID"),
+                  event.get("session_id"), event.get("sessionId"),
                   data.get("session_id"), data.get("sessionId")):
         if isinstance(value, str) and value:
             return value
@@ -180,11 +209,46 @@ def _extract_session_id(event, data):
     return ""
 
 
+def _coerce_cost(*values):
+    """First usable USD amount among *values*; ``None`` when absent/invalid."""
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _coerce_tokens(raw):
+    """Normalise a step token dict (real cache dict or legacy int ``cache``)."""
+    raw = raw if isinstance(raw, dict) else {}
+    cache = raw.get("cache")
+    if isinstance(cache, dict):
+        cache_read = _as_int(cache.get("read"))
+        cache_write = _as_int(cache.get("write"))
+    else:
+        cache_read = _as_int(cache)
+        cache_write = 0
+    return {"total": _as_int(raw.get("total")),
+            "input": _as_int(raw.get("input")),
+            "output": _as_int(raw.get("output")),
+            "reasoning": _as_int(raw.get("reasoning")),
+            "cache_read": cache_read,
+            "cache_write": cache_write}
+
+
 def parse_event(line):
     """Normalise one ``mimo run --format json`` JSONL event line.
 
-    Never raises: garbage or partially-shaped input degrades to a dict with
-    ``kind`` set to ``"other"``.
+    The canonical mimo 0.1.17 ``part`` shape is the source of truth (see
+    the module docstring); a legacy ``data`` payload is accepted as a
+    fallback.  Never raises: garbage or partially-shaped input degrades to
+    a dict with ``kind`` set to ``"other"``.
     """
     event = line
     if isinstance(line, (bytes, bytearray)):
@@ -202,34 +266,62 @@ def parse_event(line):
             return {"kind": "other"}
     if not isinstance(event, dict):
         return {"kind": "other"}
-    typ = str(event.get("type") or "").lower()
+    typ = str(event.get("type") or "").lower().replace("-", "_")
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
     data = event.get("data") if isinstance(event.get("data"), dict) else {}
-    session_id = _extract_session_id(event, data)
+    session_id = _extract_session_id(event, part, data)
     if typ == "text":
+        time_raw = part.get("time")
+        time_norm = None
+        if isinstance(time_raw, dict):
+            time_norm = {"start": _as_int(time_raw.get("start")),
+                         "end": _as_int(time_raw.get("end"))}
         parsed = {"kind": "text",
-                  "text": _first_str(data.get("text"), event.get("text"),
-                                    data.get("content"), event.get("content"),
-                                    data.get("answer"), event.get("answer"))}
+                  "text": _first_str(part.get("text"), data.get("text"),
+                                    event.get("text"), data.get("content"),
+                                    event.get("content"), data.get("answer"),
+                                    event.get("answer")),
+                  "time": time_norm}
     elif typ == "step_start":
         parsed = {"kind": "step_start",
-                  "name": _first_str(data.get("name"), event.get("name")) or "step"}
+                  "name": _first_str(data.get("name"), event.get("name"))
+                  or "step",
+                  "snapshot": _first_str(part.get("snapshot"),
+                                        data.get("snapshot"),
+                                        event.get("snapshot")) or None}
     elif typ == "step_finish":
-        raw = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        raw = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+        if not raw and isinstance(data.get("tokens"), dict):
+            raw = data["tokens"]
         if not raw and isinstance(event.get("tokens"), dict):
             raw = event["tokens"]
         parsed = {"kind": "step_finish",
                   "name": _first_str(data.get("name"), event.get("name")),
-                  "tokens": {"total": _as_int(raw.get("total")),
-                             "input": _as_int(raw.get("input")),
-                             "output": _as_int(raw.get("output")),
-                             "reasoning": _as_int(raw.get("reasoning")),
-                             "cache": _as_int(raw.get("cache"))}}
+                  "reason": _first_str(part.get("reason"), data.get("reason"),
+                                      event.get("reason")) or None,
+                  "tokens": _coerce_tokens(raw),
+                  "cost": _coerce_cost(part.get("cost"), data.get("cost"),
+                                      event.get("cost"))}
     elif typ == "tool_use":
-        tool_input = data.get("input")
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        tool_input = None
+        for candidate in (state.get("input"), part.get("input"),
+                         data.get("input")):
+            if isinstance(candidate, dict):
+                tool_input = candidate
+                break
         parsed = {"kind": "tool_use",
-                  "name": _first_str(data.get("name"), event.get("name"),
-                                     data.get("tool")) or "tool",
-                  "input": tool_input if isinstance(tool_input, dict) else {}}
+                  "name": _first_str(part.get("tool"), data.get("name"),
+                                     event.get("name"), data.get("tool"),
+                                     part.get("name")) or "tool",
+                  "status": _first_str(state.get("status"), data.get("status"),
+                                       event.get("status")) or None,
+                  "input": tool_input if tool_input is not None else {},
+                  "call_id": _first_str(part.get("callID"),
+                                        part.get("call_id"),
+                                        data.get("callID"),
+                                        data.get("call_id"),
+                                        event.get("callID")) or None}
     elif typ == "error":
         err = event.get("error") if isinstance(event.get("error"), dict) else {}
         err_data = err.get("data") if isinstance(err.get("data"), dict) else {}
@@ -248,9 +340,19 @@ def parse_event(line):
             if isinstance(value, str) and value.strip().lstrip("-").isdigit():
                 status_code = int(value.strip())
                 break
+        is_retryable = None
+        for value in (err_data.get("isRetryable"), err_data.get("is_retryable"),
+                      err.get("isRetryable"), err.get("is_retryable")):
+            if isinstance(value, bool):
+                is_retryable = value
+                break
         parsed = {"kind": "error",
                   "message": message or "unknown mimo error",
-                  "status_code": status_code}
+                  "status_code": status_code,
+                  "error_name": _first_str(err.get("name"),
+                                           err_data.get("name"),
+                                           event.get("error_name")) or None,
+                  "is_retryable": is_retryable}
     elif typ in ("session", "session/start", "session_start"):
         parsed = {"kind": "session",
                   "id": session_id or _first_str(data.get("id"),
@@ -574,9 +676,13 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
     tools = {}
     events_count = 0
     errors = []          # (message, status_code)
-    final_text = None
+    text_parts = []
     session_from_events = None
-    tokens = {"input": 0, "cache": 0, "output": 0, "reasoning": 0, "total": 0}
+    tokens = {"input": 0, "cache_read": 0, "cache_write": 0,
+              "output": 0, "reasoning": 0}
+    vendor_cost = 0.0
+    vendor_cost_steps = 0
+    subagent_spawns = 0
     saw_usage = False
     timed_out = False
     cancelled = False
@@ -607,6 +713,7 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
                 tools=tools,
                 events_count=events_count, outputs=[], started=started,
                 stderr_tail="", tokens=tokens, saw_usage=False,
+                vendor_cost=0.0, vendor_cost_steps=0, subagent_spawns=0,
                 model=model, cfg=cfg, preset=preset, stalled=False,
                 timed_out=False, stop_reason="error",
                 transport_session_id=session_id)
@@ -661,23 +768,27 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
                 if kind == "tool_use":
                     name = parsed.get("name") or "tool"
                     tools[name] = tools.get(name, 0) + 1
+                    if _is_subagent_spawn(name, parsed.get("input")):
+                        subagent_spawns += 1
                     if progress_cb:
                         progress_cb("%s: %d tool call(s), last: %s, %d s" % (
                             label, sum(tools.values()), name,
                             round(time.time() - started)))
                 elif kind == "text":
-                    final_text = parsed.get("text") or ""
+                    text_parts.append(parsed.get("text") or "")
                 elif kind == "step_start":
                     if progress_cb:
                         progress_cb("%s: step %s" % (
                             label, parsed.get("name") or "step"))
                 elif kind == "step_finish":
                     step_tokens = parsed.get("tokens") or {}
-                    tokens["input"] += _as_int(step_tokens.get("input"))
-                    tokens["cache"] += _as_int(step_tokens.get("cache"))
-                    tokens["output"] += _as_int(step_tokens.get("output"))
-                    tokens["reasoning"] += _as_int(step_tokens.get("reasoning"))
-                    tokens["total"] += _as_int(step_tokens.get("total"))
+                    for key in ("input", "cache_read", "cache_write",
+                                "output", "reasoning"):
+                        tokens[key] += _as_int(step_tokens.get(key))
+                    step_cost = parsed.get("cost")
+                    if step_cost is not None:
+                        vendor_cost += step_cost
+                        vendor_cost_steps += 1
                     saw_usage = True
                     if progress_cb:
                         progress_cb("%s: step finished (%d tokens)" % (
@@ -729,6 +840,7 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
             pass
 
     outputs = _scan_outputs(workspace, started)
+    final_text = "\n\n".join(text_parts) if text_parts else None
     if errors:
         message, status_code = errors[0]
         combined = "; ".join(item[0] for item in errors)
@@ -762,30 +874,59 @@ def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
         status=status, answer=final_text, exit_code=exit_code,
         error=error_text, tools=tools, events_count=events_count,
         outputs=outputs, started=started, stderr_tail=stderr_tail,
-        tokens=tokens, saw_usage=saw_usage, model=model, cfg=cfg,
+        tokens=tokens, saw_usage=saw_usage,
+        vendor_cost=vendor_cost, vendor_cost_steps=vendor_cost_steps,
+        subagent_spawns=subagent_spawns, model=model, cfg=cfg,
         preset=preset, stalled=stalled, timed_out=timed_out,
         stop_reason=stop_reason,
         transport_session_id=session_from_events or session_id)
 
 
+def _is_subagent_spawn(name, tool_input):
+    """True for an ``actor`` tool call with ``operation.action == "spawn"``."""
+    if str(name or "").lower() != "actor":
+        return False
+    operation = tool_input.get("operation") if isinstance(
+        tool_input, dict) else None
+    return (isinstance(operation, dict)
+            and str(operation.get("action") or "").lower() == "spawn")
+
+
 def _result(status, answer, exit_code, error, tools, events_count, outputs,
-            started, stderr_tail, tokens, saw_usage, model, cfg, preset,
+            started, stderr_tail, tokens, saw_usage, vendor_cost,
+            vendor_cost_steps, subagent_spawns, model, cfg, preset,
             stalled, timed_out, stop_reason, transport_session_id):
-    """Assemble the harness-compatible execution dict."""
-    prices = _price_table(cfg)
-    cost, cost_known = _estimate_cost(
-        _model_prices(prices, model),
-        tokens["input"], tokens["cache"], tokens["output"])
+    """Assemble the harness-compatible execution dict.
+
+    Cost resolution order: the CLI-reported ``part.cost`` sum
+    (``cost_source: "vendor"``), then price-table pricing
+    (``cost_source: "price_table"``), else unknown -- ``cost_known``
+    False and ``estimated_cost_usd`` None, never 0.0 with known True.
+    """
     if not saw_usage:
         cost, cost_known = None, False
-        tokens_out = {"input": None, "cache": None, "output": None,
-                      "reasoning": None, "total": None}
+        cost_source = "unknown"
+        tokens_out = {"input": None, "cache_read": None, "cache_write": None,
+                      "output": None, "reasoning": None, "total": None}
         usage = None
     else:
+        if vendor_cost_steps > 0:
+            cost = round(float(vendor_cost), 6)
+            cost_known = True
+            cost_source = "vendor"
+        else:
+            cost, cost_known = _estimate_cost(
+                _model_prices(_price_table(cfg), model),
+                tokens["input"], tokens["cache_read"], tokens["output"])
+            cost_source = "price_table" if cost_known else "unknown"
         tokens_out = dict(tokens)
+        tokens_out["total"] = (tokens["input"] + tokens["cache_read"]
+                               + tokens["cache_write"] + tokens["output"]
+                               + tokens["reasoning"])
         usage = {
             "input_tokens": tokens_out["input"],
-            "cache_read_tokens": tokens_out["cache"],
+            "cache_read_tokens": tokens_out["cache_read"],
+            "cache_write_tokens": tokens_out["cache_write"],
             "output_tokens": tokens_out["output"],
             "reasoning_tokens": tokens_out["reasoning"],
             "total_tokens": tokens_out["total"],
@@ -799,18 +940,20 @@ def _result(status, answer, exit_code, error, tools, events_count, outputs,
         "exit_code": exit_code,
         "error": error,
         "tools_used": dict(tools),
+        "subagent_spawns": int(subagent_spawns),
         "events": events_count,
         "output_files": list(outputs),
         "seconds": round(time.time() - started, 1),
         "stderr_tail": stderr_tail,
         "session_logs": [],
         "tokens_in": tokens_out["input"],
-        "cache_read_tokens": tokens_out["cache"],
+        "cache_read_tokens": tokens_out["cache_read"],
+        "cache_write_tokens": tokens_out["cache_write"],
         "tokens_out": tokens_out["output"],
         "reasoning_tokens": tokens_out["reasoning"],
         "total_tokens": tokens_out["total"],
         "estimated_cost_usd": cost,
-        "cost_source": "mimo_events",
+        "cost_source": cost_source,
         "cost_known": bool(cost_known),
         "models": [str(model)],
         "usage": usage,
