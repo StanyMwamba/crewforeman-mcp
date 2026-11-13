@@ -3,6 +3,14 @@
 Fake ``mimo`` binaries only (recorded JSONL streams) -- never the real mimo,
 never the network beyond 127.0.0.1.  Python 3.9-compatible, stdlib unittest,
 Windows-safe paths via pathlib.
+
+Two event dialects meet here:
+
+- the CANONICAL mimo 0.1.17 ``part`` shape -- ``tests/fixtures/mimo/*.jsonl``
+  (recorded, sanitized) are replayed verbatim through ``parse_event`` and
+  ``execute``; the inline fake emits the same shape;
+- the legacy ``data`` payload, kept as per-event-type fallback coverage.
+
 """
 
 import base64
@@ -23,6 +31,14 @@ try:
     from tests import fakes as _fakes
 except ImportError:  # tests run as top-level modules
     import fakes as _fakes
+
+
+# Recorded, sanitized real mimo 0.1.17 streams -- the source of truth for
+# the canonical `part` event shape.
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mimo"
+RUN_FIXTURE = FIXTURES / "mimo-0.1.17-run-events.jsonl"
+READY_FIXTURE = FIXTURES / "mimo-0.1.17-attach-ready.jsonl"
+ERROR_FIXTURE = FIXTURES / "mimo-0.1.17-error-401.jsonl"
 
 
 FAKE_MIMO_BODY = r'''#!/usr/bin/env python3
@@ -164,19 +180,77 @@ if positional and positional[0] == "serve":
     httpd.serve_forever()
     sys.exit(0)
 
+fixture = os.environ.get("FAKE_MIMO_FIXTURE")
+if fixture:
+    # Replay a recorded real 0.1.17 stream (tests/fixtures/mimo/*.jsonl)
+    # verbatim -- canonical `part` shape, line for line.
+    for line in Path(fixture).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            print(line, flush=True)
+    sys.exit(0)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+# Canonical 0.1.17 events carry a top-level sessionID; the CLI echoes the
+# `-s <id>` resume value there, else a fixed default.
+session = (flags.get("-s") or os.environ.get("FAKE_MIMO_SESSION_ID")
+           or "ses_fake0000000000000000000000")
+
+
+def emit_event(kind, part_type, payload):
+    part = {"type": part_type, "sessionID": session}
+    part.update(payload)
+    emit({"type": kind, "timestamp": now_ms(), "sessionID": session,
+          "part": part})
+
+
+def emit_text(text):
+    stamp = now_ms()
+    emit_event("text", "text",
+               {"text": text, "time": {"start": stamp, "end": stamp}})
+
+
+def emit_step_start():
+    emit_event("step_start", "step-start",
+               {"snapshot": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"})
+
+
+def emit_tool(tool, tool_input, title=""):
+    emit_event("tool_use", "tool", {
+        "tool": tool, "callID": "call_" + tool + "01",
+        "state": {"status": "completed", "input": tool_input,
+                  "output": "ok", "metadata": {}, "title": title}})
+
+
+def emit_step_finish(tokens, cost=None, reason="stop"):
+    payload = {"reason": reason, "tokens": tokens}
+    if cost is not None and mode != "no_cost":
+        payload["cost"] = cost
+    emit_event("step_finish", "step-finish", payload)
+
+
+def emit_error(message, status_code):
+    data = {"message": message, "isRetryable": False,
+            "metadata": {"providerID": "xiaomi"}}
+    if status_code is not None:
+        data["statusCode"] = status_code
+    emit({"type": "error", "timestamp": now_ms(), "sessionID": session,
+          "error": {"name": "APIError", "data": data}})
+
 if mode == "leak":
     # Deliberately hostile child: echo the password so the worker has to
     # scrub it out of stderr_tail / error text before returning.
     secret = os.environ.get("MIMOCODE_SERVER_PASSWORD", "")
     print("leaked password: " + secret, file=sys.stderr, flush=True)
-    emit({"type": "error", "error": {"data": {
-        "message": "handshake failed for password " + secret,
-        "statusCode": 401}}})
+    emit_error("handshake failed for password " + secret, 401)
     sys.exit(1)
 
 forced_text = os.environ.get("FAKE_MIMO_TEXT")
 if task.startswith("Reply with exactly READY") and forced_text is None:
-    emit({"type": "text", "data": {"text": "READY"}})
+    emit_text("READY")
     sys.exit(0)
 
 if mode == "silent":
@@ -184,47 +258,63 @@ if mode == "silent":
     sys.exit(0)
 
 if mode == "error_auth":
-    emit({"type": "error", "error": {"data": {
-        "message": "Unauthorized: invalid API key", "statusCode": 401}}})
+    emit_error("Unauthorized: invalid API key", 401)
     sys.exit(1)
 if mode == "error_limit":
-    emit({"type": "error", "error": {"data": {
-        "message": "Too many requests", "statusCode": 429}}})
+    emit_error("Too many requests", 429)
     sys.exit(1)
 if mode == "error_network":
-    emit({"type": "error", "error": {"data": {
-        "message": "network failure: ECONNRESET talking to MiMo API"}}})
+    emit_error("network failure: ECONNRESET talking to MiMo API", None)
     sys.exit(1)
+
+if mode == "legacy":
+    # Legacy `data` payload: end-to-end fallback coverage.  No sessionID on
+    # the events on purpose (the transport_session_id fallback to `-s`).
+    legacy_session = os.environ.get("FAKE_MIMO_SESSION_ID")
+    if legacy_session:
+        emit({"type": "session", "data": {"id": legacy_session}})
+    emit({"type": "step_start", "data": {"name": "plan"}})
+    emit({"type": "tool_use", "data": {"name": "bash",
+                                      "input": {"command": "ls"}}})
+    emit({"type": "step_finish", "data": {"tokens": {
+        "total": 100, "input": 40, "output": 30, "reasoning": 10,
+        "cache": 20}}})
+    emit({"type": "text", "data": {"text": "legacy answer"}})
+    sys.exit(0)
+
+if mode == "two_texts":
+    emit_step_start()
+    emit_text("first part")
+    emit_text("second part")
+    sys.exit(0)
 
 if mode == "slow":
     for index in range(3):
-        emit({"type": "step_start", "data": {"name": "slow-%d" % index}})
-        emit({"type": "tool_use", "data": {"name": "bash",
-                                          "input": {"command": "ls"}}})
+        emit_step_start()
+        emit_tool("bash", {"command": "ls"})
         time.sleep(float(os.environ.get("FAKE_MIMO_STEP_SLEEP", "0.15")))
-    emit({"type": "step_finish", "data": {"tokens": {
-        "total": 30, "input": 10, "output": 15, "reasoning": 5, "cache": 5}}})
-    emit({"type": "text", "data": {"text": "slow done"}})
+    emit_step_finish({"total": 35, "input": 10, "output": 15, "reasoning": 5,
+                      "cache": {"read": 5, "write": 0}},
+                     cost=0.00003, reason="stop")
+    emit_text("slow done")
     sys.exit(0)
 
-session = os.environ.get("FAKE_MIMO_SESSION_ID")
-if session:
-    emit({"type": "session", "data": {"id": session}})
-emit({"type": "step_start", "data": {"name": "plan"}})
-emit({"type": "tool_use", "data": {"name": "bash", "input": {"command": "ls"}}})
-emit({"type": "tool_use", "data": {"name": "read", "input": {"path": "x"}}})
-emit({"type": "step_finish", "data": {"tokens": {
-    "total": 100, "input": 40, "output": 30, "reasoning": 10, "cache": 20}}})
-emit({"type": "step_start", "data": {"name": "act"}})
-emit({"type": "step_finish", "data": {"tokens": {
-    "total": 50, "input": 20, "output": 15, "reasoning": 5, "cache": 10}}})
+emit_step_start()
+emit_tool("bash", {"command": "ls"})
+emit_tool("read", {"path": "x"})
+emit_step_finish({"total": 100, "input": 40, "output": 30, "reasoning": 10,
+                  "cache": {"read": 20, "write": 0}},
+                 cost=0.008813859, reason="tool-calls")
+emit_step_start()
+emit_step_finish({"total": 50, "input": 20, "output": 15, "reasoning": 5,
+                  "cache": {"read": 10, "write": 0}},
+                 cost=0.0027891192, reason="stop")
 try:
     (workspace / "out.txt").write_text("done\n", encoding="utf-8")
     (workspace / ".fake-mimo-state.json").write_text("{}", encoding="utf-8")
 except Exception:
     pass
-emit({"type": "text", "data": {
-    "text": forced_text if forced_text is not None else "final answer"}})
+emit_text(forced_text if forced_text is not None else "final answer")
 sys.exit(0)
 '''
 
@@ -251,7 +341,8 @@ class MimoWorkerCase(unittest.TestCase):
         self.setenv(FAKE_MIMO_ARGV=str(self.argv_capture),
                     FAKE_MIMO_STATE=str(self.state_capture),
                     FAKE_MIMO_SERVE_URL=str(self.serve_url_capture),
-                    FAKE_MIMO_MODE="ok")
+                    FAKE_MIMO_MODE="ok", FAKE_MIMO_FIXTURE=None,
+                    FAKE_MIMO_TEXT=None)
 
     # -- helpers ---------------------------------------------------------
 
@@ -295,9 +386,12 @@ class MimoWorkerCase(unittest.TestCase):
             return exc.code
 
     def assert_cost_invariant(self, result):
-        """cost_known False must never pair with a 0.0 (or any) cost."""
+        """cost_known False must never pair with a cost; a known cost is a
+        real number (vendor or price-table) -- never the 0.0/unknown lie."""
         if not result["cost_known"]:
             self.assertIsNone(result["estimated_cost_usd"])
+        else:
+            self.assertIsNotNone(result["estimated_cost_usd"])
 
     def cfg(self, **extra):
         config = {"mimo_bin": str(self.fake)}
@@ -338,32 +432,42 @@ class MimoWorkerCase(unittest.TestCase):
             "t", "/tmp/w", "mimo/x", mimo_bin="mimo", skip_permissions=True))
 
     def test_parse_event_all_types_and_garbage(self):
+        # Legacy `data` payload: per-event-type fallback coverage.
         text = mimo_worker.parse_event(
             '{"type": "text", "data": {"text": "hello"}}')
         self.assertEqual(text["kind"], "text")
         self.assertEqual(text["text"], "hello")
+        self.assertIsNone(text["time"])
         step = mimo_worker.parse_event(
             '{"type": "step_start", "data": {"name": "plan"}}')
         self.assertEqual(step["kind"], "step_start")
         self.assertEqual(step["name"], "plan")
+        self.assertIsNone(step["snapshot"])
         finish = mimo_worker.parse_event(
             '{"type": "step_finish", "data": {"tokens": {"total": 9, '
             '"input": 4, "output": 3, "reasoning": 1, "cache": 2}}}')
         self.assertEqual(finish["kind"], "step_finish")
         self.assertEqual(finish["tokens"], {"total": 9, "input": 4, "output": 3,
-                                            "reasoning": 1, "cache": 2})
+                                            "reasoning": 1, "cache_read": 2,
+                                            "cache_write": 0})
+        self.assertIsNone(finish["cost"])
+        self.assertIsNone(finish["reason"])
         tool = mimo_worker.parse_event(
             '{"type": "tool_use", "data": {"name": "bash", '
             '"input": {"command": "ls"}}}')
         self.assertEqual(tool["kind"], "tool_use")
         self.assertEqual(tool["name"], "bash")
         self.assertEqual(tool["input"], {"command": "ls"})
+        self.assertIsNone(tool["status"])
+        self.assertIsNone(tool["call_id"])
         err = mimo_worker.parse_event(
             '{"type": "error", "error": {"data": {"message": "Unauthorized", '
             '"statusCode": 401}}}')
         self.assertEqual(err["kind"], "error")
         self.assertEqual(err["message"], "Unauthorized")
         self.assertEqual(err["status_code"], 401)
+        self.assertIsNone(err["error_name"])
+        self.assertIsNone(err["is_retryable"])
         sess = mimo_worker.parse_event('{"type": "session", "data": {"id": "s-1"}}')
         self.assertEqual(sess["kind"], "session")
         self.assertEqual(sess["id"], "s-1")
@@ -373,7 +477,8 @@ class MimoWorkerCase(unittest.TestCase):
         self.assertEqual(mimo_worker.parse_event('{"type": "text"}')["text"], "")
         zeros = mimo_worker.parse_event('{"type": "step_finish", "data": {}}')
         self.assertEqual(zeros["tokens"], {"total": 0, "input": 0, "output": 0,
-                                           "reasoning": 0, "cache": 0})
+                                           "reasoning": 0, "cache_read": 0,
+                                           "cache_write": 0})
         missing = mimo_worker.parse_event('{"type": "error"}')
         self.assertEqual(missing["kind"], "error")
         self.assertIsNone(missing["status_code"])
@@ -385,6 +490,55 @@ class MimoWorkerCase(unittest.TestCase):
                         '{"type": "mystery"}', '{"no": "type"}'):
             self.assertEqual(mimo_worker.parse_event(garbage)["kind"], "other",
                              garbage)
+
+    def test_parse_event_real_part_shape(self):
+        # Canonical mimo 0.1.17 `part` shape, one synthetic event per type.
+        text = mimo_worker.parse_event(
+            '{"type": "text", "timestamp": 1794585329067, "sessionID": "ses_1",'
+            ' "part": {"type": "text", "text": "hi", '
+            '"time": {"start": 5, "end": 9}}}')
+        self.assertEqual(text["kind"], "text")
+        self.assertEqual(text["text"], "hi")
+        self.assertEqual(text["time"], {"start": 5, "end": 9})
+        self.assertEqual(text["session_id"], "ses_1")
+        step = mimo_worker.parse_event(
+            '{"type": "step_start", "timestamp": 1, "sessionID": "ses_1",'
+            ' "part": {"type": "step-start", "snapshot": "abc123"}}')
+        self.assertEqual(step["kind"], "step_start")
+        self.assertEqual(step["snapshot"], "abc123")
+        finish = mimo_worker.parse_event(
+            '{"type": "step_finish", "timestamp": 2, "sessionID": "ses_1",'
+            ' "part": {"type": "step-finish", "reason": "tool-calls", '
+            '"tokens": {"total": 30, "input": 10, "output": 5, '
+            '"reasoning": 2, "cache": {"read": 12, "write": 1}}, '
+            '"cost": 0.0042}}')
+        self.assertEqual(finish["kind"], "step_finish")
+        self.assertEqual(finish["reason"], "tool-calls")
+        self.assertEqual(finish["tokens"], {"total": 30, "input": 10,
+                                            "output": 5, "reasoning": 2,
+                                            "cache_read": 12, "cache_write": 1})
+        self.assertEqual(finish["cost"], 0.0042)
+        tool = mimo_worker.parse_event(
+            '{"type": "tool_use", "timestamp": 3, "sessionID": "ses_1",'
+            ' "part": {"type": "tool", "tool": "actor", "callID": "call_7",'
+            ' "state": {"status": "completed", '
+            '"input": {"operation": {"action": "spawn"}}, '
+            '"output": "ok", "title": "explore"}}}')
+        self.assertEqual(tool["kind"], "tool_use")
+        self.assertEqual(tool["name"], "actor")
+        self.assertEqual(tool["status"], "completed")
+        self.assertEqual(tool["call_id"], "call_7")
+        self.assertEqual(tool["input"], {"operation": {"action": "spawn"}})
+        err = mimo_worker.parse_event(
+            '{"type": "error", "timestamp": 4, "sessionID": "ses_1",'
+            ' "error": {"name": "APIError", "data": {"message": "bad key", '
+            '"statusCode": 401, "isRetryable": false}}}')
+        self.assertEqual(err["kind"], "error")
+        self.assertEqual(err["message"], "bad key")
+        self.assertEqual(err["status_code"], 401)
+        self.assertEqual(err["error_name"], "APIError")
+        self.assertIs(err["is_retryable"], False)
+        self.assertEqual(err["session_id"], "ses_1")
 
     def test_classify_error_buckets(self):
         auth = mimo_worker.classify_error("Unauthorized", 401)
@@ -419,24 +573,30 @@ class MimoWorkerCase(unittest.TestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(result["tokens_in"], 60)
         self.assertEqual(result["cache_read_tokens"], 30)
+        self.assertEqual(result["cache_write_tokens"], 0)
         self.assertEqual(result["tokens_out"], 45)
         self.assertEqual(result["reasoning_tokens"], 15)
         self.assertEqual(result["total_tokens"], 150)
         self.assertTrue(result["cost_known"])
-        expected = round((60 * 0.435 + 30 * 0.0036 + 45 * 0.87) / 1e6, 6)
+        # The fake reports part.cost on both step_finish events: the CLI's
+        # own USD sum wins over any price table.
+        expected = round(0.008813859 + 0.0027891192, 6)
         self.assertEqual(result["estimated_cost_usd"], expected)
+        self.assertEqual(result["cost_source"], "vendor")
         self.assertEqual(result["usage"]["input_tokens"], 60)
         self.assertEqual(result["usage"]["cache_read_tokens"], 30)
+        self.assertEqual(result["usage"]["cache_write_tokens"], 0)
         self.assertEqual(result["usage"]["output_tokens"], 45)
         self.assertEqual(result["usage"]["reasoning_tokens"], 15)
+        self.assertEqual(result["usage"]["total_tokens"], 150)
         self.assertEqual(result["tools_used"], {"bash": 1, "read": 1})
+        self.assertEqual(result["subagent_spawns"], 0)
         self.assertIn("out.txt", result["output_files"])
         self.assertNotIn("mimocode.jsonc", result["output_files"])
         self.assertFalse([name for name in result["output_files"]
                           if name.startswith(".fake")])
         self.assertEqual(result["session_logs"], [])
         self.assertEqual(result["transport"], "mimo")
-        self.assertEqual(result["cost_source"], "mimo_events")
         self.assertEqual(result["sandbox"], "workspace-write")
         self.assertEqual(result["models"], ["xiaomi/mimo-v2.6-pro"])
         self.assertEqual(result["stop_reason"], "ok")
@@ -444,6 +604,44 @@ class MimoWorkerCase(unittest.TestCase):
         self.assertFalse(result["stalled"])
         self.assertGreater(result["events"], 0)
         self.assertGreaterEqual(result["seconds"], 0.0)
+        self.assert_cost_invariant(result)
+
+    def test_execute_price_table_when_no_vendor_cost(self):
+        # Real-shaped stream with no part.cost on step_finish: fall back to
+        # the builtin price table for the default model.
+        self.setenv(FAKE_MIMO_MODE="no_cost")
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "price me", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["cost_known"])
+        expected = round((60 * 0.435 + 30 * 0.0036 + 45 * 0.87) / 1e6, 6)
+        self.assertEqual(result["estimated_cost_usd"], expected)
+        self.assertEqual(result["cost_source"], "price_table")
+        self.assertEqual(result["usage"]["cost_known"], True)
+        self.assert_cost_invariant(result)
+
+    def test_execute_concatenates_text_parts(self):
+        self.setenv(FAKE_MIMO_MODE="two_texts")
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "two texts", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["answer"], "first part\n\nsecond part")
+
+    def test_execute_legacy_data_fallback(self):
+        # End-to-end coverage of the legacy `data` dialect (fallback path).
+        self.setenv(FAKE_MIMO_MODE="legacy")
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "legacy", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["answer"], "legacy answer")
+        self.assertEqual(result["tokens_in"], 40)
+        self.assertEqual(result["cache_read_tokens"], 20)
+        self.assertEqual(result["cache_write_tokens"], 0)
+        self.assertEqual(result["tokens_out"], 30)
+        self.assertEqual(result["reasoning_tokens"], 10)
+        self.assertEqual(result["total_tokens"], 100)
+        self.assertEqual(result["tools_used"], {"bash": 1})
+        self.assertEqual(result["cost_source"], "price_table")
         self.assert_cost_invariant(result)
 
     def test_execute_error_auth_limit_network(self):
@@ -504,6 +702,15 @@ class MimoWorkerCase(unittest.TestCase):
             self.cfg(), self.workspace, "fresh run", timeout=15)
         self.assertEqual(result["transport_session_id"], "parsed-9")
 
+    def test_execute_session_fallback_to_dash_s(self):
+        # Legacy stream with no session id anywhere: transport_session_id
+        # falls back to the `-s` value so resume keeps working.
+        self.setenv(FAKE_MIMO_MODE="legacy")
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "resume legacy",
+            session_id="sess-legacy-1", timeout=15)
+        self.assertEqual(result["transport_session_id"], "sess-legacy-1")
+
     def test_execute_never_skips_permissions_unless_asked(self):
         result = mimo_worker.execute(
             self.cfg(), self.workspace, "plain", timeout=15)
@@ -518,15 +725,19 @@ class MimoWorkerCase(unittest.TestCase):
         self.assertNotIn("--yolo", captured)
 
     def test_execute_unknown_model_cost_is_unknown_not_zero(self):
+        self.setenv(FAKE_MIMO_MODE="no_cost")
         result = mimo_worker.execute(
             self.cfg(), self.workspace, "priceless",
             model="other/vendor-9000", timeout=15)
         self.assertEqual(result["status"], "ok")
         self.assertFalse(result["cost_known"])
         self.assertIsNone(result["estimated_cost_usd"])
+        self.assertNotEqual(result["estimated_cost_usd"], 0.0)
+        self.assertEqual(result["cost_source"], "unknown")
         self.assert_cost_invariant(result)
 
     def test_execute_cfg_price_override(self):
+        self.setenv(FAKE_MIMO_MODE="no_cost")
         result = mimo_worker.execute(
             self.cfg(mimo_prices={"other/vendor-9000": {
                 "input": 1.0, "cache_hit": 0.5, "output": 2.0}}),
@@ -534,6 +745,7 @@ class MimoWorkerCase(unittest.TestCase):
         self.assertTrue(result["cost_known"])
         expected = round((60 * 1.0 + 30 * 0.5 + 45 * 2.0) / 1e6, 6)
         self.assertEqual(result["estimated_cost_usd"], expected)
+        self.assertEqual(result["cost_source"], "price_table")
         self.assert_cost_invariant(result)
 
     def test_permissions_fallback_standalone(self):
@@ -747,6 +959,135 @@ class MimoWorkerCase(unittest.TestCase):
         result = mimo_worker.ping(cfg, timeout=15.0)
         self.assertIs(result["ok"], False)
         self.assertEqual(result["answer"], "NOPE")
+
+    # -- real fixtures (mimo 0.1.17) ------------------------------------
+    #
+    # Every assertion below exercises canonical ``part``-shaped fields the
+    # pre-3.15 parser cannot read (it only looks under ``data``):
+    # ``part.text`` / ``part.time`` (answer), ``part.tokens.cache.read``
+    # / ``.write`` and ``part.cost`` (usage + cost), ``part.tool`` /
+    # ``part.state.*`` (tool names/statuses), top-level ``sessionID``
+    # (transport_session_id), ``error.name`` / ``error.data.isRetryable``.
+    # On the old parse_event each of those degrades to "" / 0 / "tool" /
+    # None, so this whole section fails against the old parser.
+
+    def fixture_lines(self, path):
+        return [line for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_real_run_fixture_parse(self):
+        events = [mimo_worker.parse_event(line)
+                  for line in self.fixture_lines(RUN_FIXTURE)]
+        self.assertEqual([e["kind"] for e in events], [
+            "step_start", "text", "tool_use", "tool_use", "step_finish",
+            "tool_use", "tool_use", "tool_use", "step_finish",
+            "tool_use", "tool_use", "tool_use"])
+        text = events[1]
+        self.assertEqual(
+            text["text"],
+            "I'll start by reading the brief and understanding the workspace.")
+        self.assertEqual(text["time"], {"start": 1794585328241,
+                                        "end": 1794585329063})
+        step1 = events[4]
+        self.assertEqual(step1["reason"], "tool-calls")
+        self.assertEqual(step1["tokens"], {
+            "total": 30291, "input": 19925, "output": 104, "reasoning": 22,
+            "cache_read": 10240, "cache_write": 0})
+        self.assertEqual(step1["cost"], 0.008813859)
+        step2 = events[8]
+        self.assertEqual(step2["reason"], "stop")
+        self.assertEqual(step2["tokens"], {
+            "total": 35623, "input": 1354, "output": 2299, "reasoning": 98,
+            "cache_read": 31872, "cache_write": 0})
+        self.assertEqual(step2["cost"], 0.0027891192)
+        tools = [e for e in events if e["kind"] == "tool_use"]
+        self.assertEqual([t["name"] for t in tools], [
+            "read", "bash", "actor", "grep", "glob", "task", "write", "edit"])
+        self.assertEqual({t["status"] for t in tools}, {"completed"})
+        for event in events:
+            self.assertEqual(event["session_id"],
+                             "ses_ffe5e2a611a85ffeatM04xDPrk")
+
+    def test_real_run_fixture_execute(self):
+        self.setenv(FAKE_MIMO_FIXTURE=str(RUN_FIXTURE))
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "run the worker build", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["answer"],
+            "I'll start by reading the brief and understanding the workspace.")
+        self.assertEqual(result["tokens_in"], 21279)
+        self.assertEqual(result["cache_read_tokens"], 42112)
+        self.assertEqual(result["cache_write_tokens"], 0)
+        self.assertEqual(result["tokens_out"], 2403)
+        self.assertEqual(result["reasoning_tokens"], 120)
+        self.assertEqual(result["total_tokens"], 65914)
+        self.assertEqual(result["usage"]["total_tokens"], 65914)
+        self.assertEqual(result["usage"]["cache_write_tokens"], 0)
+        self.assertTrue(result["cost_known"])
+        self.assertEqual(result["cost_source"], "vendor")
+        self.assertEqual(result["estimated_cost_usd"],
+                         round(0.008813859 + 0.0027891192, 6))
+        self.assertEqual(result["tools_used"], {
+            "read": 1, "bash": 1, "actor": 1, "grep": 1, "glob": 1,
+            "task": 1, "write": 1, "edit": 1})
+        self.assertEqual(result["subagent_spawns"], 1)
+        self.assertEqual(result["transport_session_id"],
+                         "ses_ffe5e2a611a85ffeatM04xDPrk")
+        self.assertEqual(result["events"], 12)
+        self.assert_cost_invariant(result)
+
+    def test_real_error_fixture_401(self):
+        parsed = mimo_worker.parse_event(
+            self.fixture_lines(ERROR_FIXTURE)[0])
+        self.assertEqual(parsed["kind"], "error")
+        self.assertEqual(parsed["error_name"], "APIError")
+        self.assertEqual(parsed["message"],
+                         "Invalid API Key: Please provide valid API Key")
+        self.assertEqual(parsed["status_code"], 401)
+        self.assertIs(parsed["is_retryable"], False)
+        self.assertEqual(parsed["session_id"],
+                         "ses_ffe5e2a8bc4a4ffeGp8oqW1ypo")
+        self.setenv(FAKE_MIMO_FIXTURE=str(ERROR_FIXTURE))
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "fail auth", timeout=15)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["stop_reason"], "auth")
+        self.assertIn("mimo providers login", result["error"])
+        self.assertIn("Invalid API Key", result["error"])
+        # No step_finish carries usage: cost is UNKNOWN -- never 0.0 with
+        # cost_known True (the round-2 regression this suite pins).
+        self.assertFalse(result["cost_known"])
+        self.assertIsNone(result["estimated_cost_usd"])
+        self.assertNotEqual(result["estimated_cost_usd"], 0.0)
+        self.assertEqual(result["cost_source"], "unknown")
+        self.assertEqual(result["subagent_spawns"], 0)
+        self.assert_cost_invariant(result)
+
+    def test_real_attach_fixture_execute_and_ping(self):
+        self.setenv(FAKE_MIMO_FIXTURE=str(READY_FIXTURE))
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "Reply with exactly READY and "
+            "nothing else.", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["answer"], "READY")
+        self.assertEqual(result["tokens_in"], 6397)
+        self.assertEqual(result["cache_read_tokens"], 24576)
+        self.assertEqual(result["cache_write_tokens"], 0)
+        self.assertEqual(result["tokens_out"], 3)
+        self.assertEqual(result["reasoning_tokens"], 17)
+        self.assertEqual(result["total_tokens"], 30993)
+        self.assertEqual(result["cost_source"], "vendor")
+        self.assertEqual(result["estimated_cost_usd"],
+                         round(0.0009699928, 6))
+        self.assertEqual(result["transport_session_id"],
+                         "ses_ffe5e2985f535ffeCwuDRPJR84")
+        self.assertEqual(result["subagent_spawns"], 0)
+        self.assert_cost_invariant(result)
+        ping = mimo_worker.ping(self.cfg(), timeout=15.0)
+        self.assertIs(ping["ok"], True)
+        self.assertEqual(ping["answer"], "READY")
+        self.assertIsNone(ping["error"])
 
 
 if __name__ == "__main__":
