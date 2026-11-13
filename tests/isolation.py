@@ -27,6 +27,13 @@ restored afterwards: an operator environment can never direct a test write
 outside its case directory, while a test that deliberately sets one in a child
 environment is unaffected.  ``DSH_SESSIONS_DIR`` is instead redirected to the
 case (B1: sessions are no longer derived from ``state_root``).
+
+While a case is active the store write guard additionally monkeypatches the
+``deepseek_mcp.store`` write entry points so a run record aimed at the real
+home state root or the ``<repo>/runs`` fallback raises
+:class:`IsolationViolation` instead of polluting the operator's data (see the
+guard section below).  The store module is imported lazily at guard install
+time, so this file stays standard-library-only at import.
 """
 
 import contextlib
@@ -160,6 +167,249 @@ def _rmtree_robust(path):
             return
 
 
+# ---------------------------------------------------------------------------
+# Store write guard: while a case is active, any deepseek_mcp.store write
+# whose resolved target is the real home state root (``~/DeepSeek-MCP`` /
+# ``%LOCALAPPDATA%\\DeepSeek-MCP``) or the store's ``<repo>/runs`` fallback
+# raises IsolationViolation *before* anything touches the filesystem.  The
+# wrappers are installed by :func:`isolated_case` and removed on exit; when a
+# test never resolves or performs a store write, none of them ever runs.
+# ---------------------------------------------------------------------------
+
+
+class IsolationViolation(AssertionError):
+    """A test attempted to write run state outside its isolated case."""
+
+
+def real_home_state_root():
+    """The real home state root that ``config._base_dir`` derives from.
+
+    Read from the import-time identity snapshot so a test that rewrites
+    ``HOME`` cannot hide the real home state root from the guard.
+    """
+    if os.name == "nt":
+        base = (os.environ.get("LOCALAPPDATA")
+                or HOME_AT_IMPORT.get("USERPROFILE")
+                or os.path.expanduser("~"))
+    else:
+        base = HOME_AT_IMPORT.get("HOME") or os.path.expanduser("~")
+    return Path(os.path.expanduser(str(base))) / "DeepSeek-MCP"
+
+
+def repo_runs_dir():
+    """The store's ``FALLBACK_LOG_DIR`` for this checkout (``<repo>/runs``)."""
+    return Path(__file__).resolve().parent.parent / "runs"
+
+
+def _norm_target(path):
+    if path is None:
+        return None
+    try:
+        text = str(path).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        return os.path.normcase(os.path.realpath(
+            os.path.abspath(os.path.expanduser(text))))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _under_target(norm_path, norm_root):
+    return (norm_path is not None and norm_root is not None
+            and (norm_path == norm_root
+                 or norm_path.startswith(norm_root + os.sep)))
+
+
+# Extra forbidden roots captured from ``store.FALLBACK_LOG_DIR`` when the
+# guard installs.  The capture happens before any test body runs, so a test
+# that patches the constant to a case-local temp dir is not affected.
+_EXTRA_FORBIDDEN_ROOTS = []
+
+
+def forbidden_target_reason(target):
+    """Return why *target* is a forbidden test write root, or ``None``.
+
+    Forbidden: the real home state root (except the ``harness-workspace``
+    development area, which on this workspace layout contains the repository
+    and every case directory) and the repository ``runs`` fallback.  The
+    repository itself is exempt from the home-state-root rule so case
+    directories keep working even when the checkout sits under the home root.
+    """
+    norm = _norm_target(target)
+    if norm is None:
+        return None
+    if _under_target(norm, _norm_target(repo_runs_dir())):
+        return "the repository runs fallback %s" % (repo_runs_dir(),)
+    home_root = real_home_state_root()
+    if (_under_target(norm, _norm_target(home_root))
+            and not _under_target(norm,
+                                  _norm_target(home_root / "harness-workspace"))
+            and not _under_target(
+                norm, _norm_target(Path(__file__).resolve().parent.parent))):
+        return "the real home state root %s" % (home_root,)
+    for root, label in _EXTRA_FORBIDDEN_ROOTS:
+        if _under_target(norm, root):
+            return label
+    return None
+
+
+_CFG_STACK = []
+_CFG_BY_DIR = {}
+_GUARD_REFCOUNT = 0
+_GUARD_SAVED = []
+
+
+def _describe_cfg(cfg):
+    if cfg is None:
+        return "config unknown"
+    try:
+        return "config log_dir=%r state_dir=%r _config_path=%r" % (
+            cfg.get("log_dir"), cfg.get("state_dir"), cfg.get("_config_path"))
+    except Exception:
+        return "config %r" % (cfg,)
+
+
+def _refuse(target, description):
+    reason = forbidden_target_reason(target)
+    if reason is None:
+        return
+    raise IsolationViolation(
+        "isolation guard: refusing test write to %r (inside %s); %s"
+        % (str(target), reason, description or "config unknown"))
+
+
+def _cfg_hint(directory=None):
+    if directory is not None:
+        key = _norm_target(directory)
+        if key and key in _CFG_BY_DIR:
+            return _CFG_BY_DIR[key]
+    return _CFG_STACK[-1] if _CFG_STACK else None
+
+
+def _install_store_guard():
+    """Patch deepseek_mcp.store write entry points (re-entrant)."""
+    global _GUARD_REFCOUNT
+    if _GUARD_REFCOUNT:
+        _GUARD_REFCOUNT += 1
+        return
+    from deepseek_mcp import store
+    del _EXTRA_FORBIDDEN_ROOTS[:]
+    extra = _norm_target(getattr(store, "FALLBACK_LOG_DIR", None))
+    if extra and extra != _norm_target(repo_runs_dir()):
+        _EXTRA_FORBIDDEN_ROOTS.append(
+            (extra, "the store log-dir fallback %s" % (store.FALLBACK_LOG_DIR,)))
+    _CFG_STACK[:] = []
+    _CFG_BY_DIR.clear()
+    _GUARD_SAVED[:] = []
+
+    def guard_save_run(original):
+        def wrapper(run, cfg, *args, **kwargs):
+            description = _describe_cfg(cfg)
+            _CFG_STACK.append(description)
+            try:
+                _refuse(getattr(cfg, "log_dir", None), description)
+                return original(run, cfg, *args, **kwargs)
+            finally:
+                _CFG_STACK.pop()
+        return wrapper
+
+    def guard_resolve_log_dir(original):
+        def wrapper(cfg):
+            description = _describe_cfg(cfg)
+            _CFG_STACK.append(description)
+            try:
+                _refuse(getattr(cfg, "log_dir", None), description)
+                directory, fallback_reason = original(cfg)
+                _refuse(directory, description)
+                key = _norm_target(directory)
+                if key:
+                    _CFG_BY_DIR[key] = description
+                return directory, fallback_reason
+            finally:
+                _CFG_STACK.pop()
+        return wrapper
+
+    def guard_probe_dir(original):
+        def wrapper(directory):
+            _refuse(directory, _cfg_hint())
+            return original(directory)
+        return wrapper
+
+    def guard_atomic_write(original):
+        def wrapper(path, text):
+            try:
+                hint = _cfg_hint(Path(path).parent)
+            except Exception:
+                hint = _cfg_hint()
+            _refuse(path, hint)
+            return original(path, text)
+        return wrapper
+
+    def guard_append_run_md(original):
+        def wrapper(run, text, cfg):
+            description = _describe_cfg(cfg)
+            _CFG_STACK.append(description)
+            try:
+                _refuse(getattr(cfg, "log_dir", None), description)
+                try:
+                    _run, _json_path, md_path = store.find_run(run["id"], cfg)
+                except Exception:
+                    md_path = None
+                if md_path is not None:
+                    _refuse(md_path, description)
+                return original(run, text, cfg)
+            finally:
+                _CFG_STACK.pop()
+        return wrapper
+
+    factories = {
+        "save_run": guard_save_run,
+        "resolve_log_dir": guard_resolve_log_dir,
+        "_probe_dir": guard_probe_dir,
+        "_atomic_write": guard_atomic_write,
+        "append_run_md": guard_append_run_md,
+    }
+    for name, factory in factories.items():
+        original = getattr(store, name)
+        wrapped = factory(original)
+        _GUARD_SAVED.append((store, name, original))
+        setattr(store, name, wrapped)
+        # Patch where it is used: modules that did ``from .store import
+        # save_run`` at import time hold a bound reference the store-module
+        # patch alone would not reach.
+        for module in list(sys.modules.values()):
+            if module is store:
+                continue
+            try:
+                if module.__dict__.get(name) is original:
+                    _GUARD_SAVED.append((module, name, original))
+                    setattr(module, name, wrapped)
+            except Exception:
+                continue
+    _GUARD_REFCOUNT = 1
+
+
+def _remove_store_guard():
+    global _GUARD_REFCOUNT
+    if _GUARD_REFCOUNT <= 0:
+        return
+    _GUARD_REFCOUNT -= 1
+    if _GUARD_REFCOUNT:
+        return
+    for module, name, original in reversed(_GUARD_SAVED):
+        try:
+            setattr(module, name, original)
+        except Exception:
+            pass
+    _GUARD_SAVED[:] = []
+    _CFG_STACK[:] = []
+    _CFG_BY_DIR.clear()
+    del _EXTRA_FORBIDDEN_ROOTS[:]
+
+
 @contextlib.contextmanager
 def isolated_case():
     """Create one case dir, point the env at it, then restore and delete it.
@@ -195,7 +445,11 @@ def isolated_case():
         os.environ.setdefault("DSH_OS_SANDBOX", "0")
         os.environ.setdefault("DSH_REVIEW_PREFLIGHT", "0")
         tempfile.tempdir = overlay["TMPDIR"]
-        yield case
+        _install_store_guard()
+        try:
+            yield case
+        finally:
+            _remove_store_guard()
     finally:
         for name, value in previous.items():
             if value is _MISSING:
