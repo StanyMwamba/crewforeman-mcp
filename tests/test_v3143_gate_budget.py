@@ -95,6 +95,60 @@ class GateBudgetWiringTests(unittest.TestCase):
         self.assertLessEqual(remaining, 45.0)
 
 
+class CrosscheckGateTests(unittest.TestCase):
+    """A crosscheck round must re-verify tests even with no product diff.
+
+    Crosscheck fix rounds can be evidence-only (CROSSCHECK.json and reports
+    live outside the repo), so there is no product diff for the gate to see.
+    Taking the no-product shortcut there dropped the tests condition and
+    capped the crosscheck score at 8.00 (reason ``tests_skipped``).
+    """
+
+    def _run(self, phase):
+        with tempfile.TemporaryDirectory() as root:
+            # A synthetic, platform-independent snapshot: Windows may exclude
+            # its TEMP root from the tree scanner, and the point here is the
+            # gate policy, not the scanner.
+            before = {"app.py": "same"}
+            cfg = SimpleNamespace(
+                gate_enabled=True,
+                gate_secret_scan=True,
+                gate_timeout_seconds=900.0,
+                gate_no_product_mode="skip",
+            )
+            test_calls = []
+
+            def fake_tests(*_args):
+                test_calls.append(1)
+                return _ok_check()
+
+            with mock.patch.object(
+                    gate, "_snapshot", return_value=dict(before)), \
+                    mock.patch.object(
+                        gate, "_secret_check",
+                        return_value=_ok_check("secrets")), \
+                    mock.patch.object(gate, "_lint_check",
+                                      return_value=_ok_check("lint")), \
+                    mock.patch.object(gate, "_tests_check",
+                                      side_effect=fake_tests):
+                result = gate.run_gate(cfg, root, {}, before=before,
+                                       phase=phase)
+            return result, test_calls
+
+    def test_crosscheck_phase_runs_tests_without_product_diff(self):
+        result, test_calls = self._run("crosscheck")
+        self.assertEqual(test_calls, [1])
+        self.assertEqual(result["verdict"], "passed", result)
+        by_name = {check["name"]: check for check in result["checks"]}
+        self.assertEqual(by_name["tests"]["status"], "ok")
+
+    def test_pre_review_phase_keeps_the_no_product_shortcut(self):
+        result, test_calls = self._run("pre_review")
+        self.assertEqual(test_calls, [])
+        self.assertEqual(result["verdict"], "skipped")
+        self.assertEqual(result["skip_reason"], "no_product_code_change")
+
+
 class RetrySleepBudgetTests(unittest.TestCase):
     """The suite caps real retry backoff so it fits the gate on slow hosts."""
 

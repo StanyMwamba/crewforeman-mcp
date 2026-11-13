@@ -1393,7 +1393,13 @@ def run_gate(cfg, workspace, run, *, phase="pre_review", before=None):
             output_paths.append(rel)
     no_product_mode = str(
         _cfg(cfg, "gate_no_product_mode", "skip") or "skip").strip().lower()
+    # A crosscheck round can be evidence-only: its files live outside the repo
+    # (CROSSCHECK.json, reports) while the product tree is already final.  The
+    # crosscheck score still depends on the connector-run test condition, so a
+    # crosscheck gate must re-verify instead of taking the no-product shortcut.
+    crosscheck_phase = str(phase or "").strip().lower() == "crosscheck"
     if (not scope.product and no_product_mode == "skip"
+            and not crosscheck_phase
             and (scope.baseline_known or not scope.product_outputs)):
         checks = []
         try:
