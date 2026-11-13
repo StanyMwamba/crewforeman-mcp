@@ -109,7 +109,13 @@ class StallWatchTests(unittest.TestCase):
 class StallSecondsTests(unittest.TestCase):
     def test_default_is_480_and_invalid_values_disable(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(config_path=Path(tmp) / "missing.json", env={})
+            root = Path(tmp)
+            cfg = load_config(config_path=root / "missing.json", env={
+                "CREWFOREMAN_STATE_DIR": str(root),
+                "DSH_STATE_DIR": str(root / "state"),
+                "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+            })
         self.assertEqual(harness._stall_seconds(cfg), 480.0)
 
         for raw in (None, 0, -5, "abc", "", "not-a-number"):

@@ -25,7 +25,10 @@ class OverlayExecutionTests(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         self.cfg = load_config(config_path=self.ws / "config.json", env={
             "DEEPSEEK_MCP_CONFIG": str(self.ws / "config.json"),
+            "CREWFOREMAN_STATE_DIR": str(self.ws),
             "DSH_STATE_DIR": str(self.ws / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(self.ws / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(self.ws / "jobs"),
             "DEEPSEEK_API_KEY": "test-key-not-real",
         })
 
@@ -127,13 +130,20 @@ class HeaderAndStatusTests(unittest.TestCase):
             self.assertIn(name, props)
 
     def test_checkpoint_spec_keeps_model_args(self):
-        cfg = load_config(config_path="/nonexistent/config.json", env={
-            "DEEPSEEK_MCP_CONFIG": "/nonexistent/config.json"})
-        spec = harness._job_spec_for_checkpoint(
-            {"id": "r", "prompt": "p", "subagents": 0}, {
-                "builder_model": "m", "builder_provider": "p",
-                "slice_models": {"a": "p/m"}, "reviewer_model": "rm",
-            }, Path("/tmp/ws"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = load_config(config_path="/nonexistent/config.json", env={
+                "DEEPSEEK_MCP_CONFIG": "/nonexistent/config.json",
+                "CREWFOREMAN_STATE_DIR": str(root),
+                "DSH_STATE_DIR": str(root / "state"),
+                "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+            })
+            spec = harness._job_spec_for_checkpoint(
+                {"id": "r", "prompt": "p", "subagents": 0}, {
+                    "builder_model": "m", "builder_provider": "p",
+                    "slice_models": {"a": "p/m"}, "reviewer_model": "rm",
+                }, Path("/tmp/ws"))
         self.assertEqual(spec["builder_model"], "m")
         self.assertEqual(spec["slice_models"], {"a": "p/m"})
         self.assertEqual(spec["reviewer_model"], "rm")
@@ -243,7 +253,12 @@ class CompetitionTests(unittest.TestCase):
                 '"file": "candidates/api--missing.py", "status": "ok"}]}]}',
                 encoding="utf-8")
             cfg = load_config(config_path=str(ws / "config.json"), env={
-                "DEEPSEEK_MCP_CONFIG": str(ws / "config.json")})
+                "DEEPSEEK_MCP_CONFIG": str(ws / "config.json"),
+                "CREWFOREMAN_STATE_DIR": str(ws),
+                "DSH_STATE_DIR": str(ws / "state"),
+                "DEEPSEEK_MCP_LOG_DIR": str(ws / "runs"),
+                "DEEPSEEK_MCP_JOBS_DIR": str(ws / "jobs"),
+            })
             run = {}
             harness._apply_model_competition(
                 run, ws, cfg, "build the api",

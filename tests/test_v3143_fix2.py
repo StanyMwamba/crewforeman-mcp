@@ -222,19 +222,35 @@ class DependsOnPolicyTests(unittest.TestCase):
     # -- config plumbing ---------------------------------------------------
 
     def test_config_rejects_unknown_policy(self):
-        with self.assertRaises(ValueError) as ctx:
-            load_config(env={"DSH_DEPENDS_ON_POLICY": "sometimes"},
-                        include_file=False)
-        self.assertIn("depends_on_policy", str(ctx.exception))
-        self.assertIn("success", str(ctx.exception))
-        self.assertIn("finished", str(ctx.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {
+                "DSH_DEPENDS_ON_POLICY": "sometimes",
+                "CREWFOREMAN_STATE_DIR": str(root),
+                "DSH_STATE_DIR": str(root / "state"),
+                "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+            }
+            with self.assertRaises(ValueError) as ctx:
+                load_config(env=env, include_file=False)
+            self.assertIn("depends_on_policy", str(ctx.exception))
+            self.assertIn("success", str(ctx.exception))
+            self.assertIn("finished", str(ctx.exception))
 
     def test_config_default_and_env_mapping(self):
-        default = load_config(env={}, include_file=False)
-        self.assertEqual(default.get("depends_on_policy"), "success")
-        env = {"DSH_DEPENDS_ON_POLICY": "finished"}
-        configured = load_config(env=env, include_file=False)
-        self.assertEqual(configured.get("depends_on_policy"), "finished")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            roots = {
+                "CREWFOREMAN_STATE_DIR": str(root),
+                "DSH_STATE_DIR": str(root / "state"),
+                "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+            }
+            default = load_config(env=dict(roots), include_file=False)
+            self.assertEqual(default.get("depends_on_policy"), "success")
+            env = dict(roots, DSH_DEPENDS_ON_POLICY="finished")
+            configured = load_config(env=env, include_file=False)
+            self.assertEqual(configured.get("depends_on_policy"), "finished")
 
 
 if __name__ == "__main__":

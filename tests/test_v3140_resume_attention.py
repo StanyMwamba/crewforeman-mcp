@@ -48,17 +48,21 @@ class ResumeAttentionTests(unittest.TestCase):
             self.root / "fake-dsh", "import sys\nsys.exit(0)\n"))
         env = {
             "DEEPSEEK_MCP_CONFIG": str(self.root / "config.json"),
+            "CREWFOREMAN_STATE_DIR": str(self.root),
             "DSH_STATE_DIR": str(self.state),
+            "DEEPSEEK_MCP_LOG_DIR": str(self.root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(self.root / "jobs"),
             "DSH_BIN": str(self.dsh),
             "DSH_SKILLS_DIR": str(self.root / "skills"),
             "DSH_AUTO_SKILLS": "off",
             "DEEPSEEK_API_KEY": "test-key-not-real",
         }
         self.cfg = load_config(config_path=self.root / "config.json", env=env)
-        # load_config prefers the ambient environment; pin every write root so
-        # the test never reads the operator's real run history and never falls
-        # back to ``<repo>/runs`` (a non-ignored tree mutation that the
-        # connector's deterministic gate would flag as tree_changed).
+        # The env dict above pins every write root at load_config time; keep
+        # the explicit _values pins as a second lock so the test never reads
+        # the operator's real run history and never falls back to
+        # ``<repo>/runs`` (a non-ignored tree mutation that the connector's
+        # deterministic gate would flag as tree_changed).
         self.cfg._values["state_dir"] = str(self.state)
         self.cfg._values["log_dir"] = str(self.root / "runs")
         self.cfg._values["jobs_dir"] = str(self.root / "jobs")
