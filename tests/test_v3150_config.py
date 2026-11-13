@@ -113,6 +113,9 @@ class ConfigSurfaceTests(unittest.TestCase):
         for env_name, raw, key, expected in cases:
             with self.subTest(env=env_name):
                 cfg = self.load({env_name: raw})
+                if key == "mimo_bin":
+                    # Binary paths are OS-normalised (``\\opt\\mimo-a`` on Windows).
+                    expected = os.path.normpath(expected)
                 self.assertEqual(cfg[key], expected)
                 self.assertTrue(cfg.is_explicit(key), env_name)
 
@@ -121,9 +124,9 @@ class ConfigSurfaceTests(unittest.TestCase):
         # first ("New names are listed first") so it is applied last and wins.
         cfg = self.load({"MIMO_BIN": "/newest", "DSH_MIMO_BIN": "/mid",
                          "DEEPSEEK_MIMO_BIN": "/oldest"})
-        self.assertEqual(cfg.mimo_bin, "/newest")
+        self.assertEqual(cfg.mimo_bin, os.path.normpath("/newest"))
         cfg = self.load({"DSH_MIMO_BIN": "/mid", "DEEPSEEK_MIMO_BIN": "/oldest"})
-        self.assertEqual(cfg.mimo_bin, "/mid")
+        self.assertEqual(cfg.mimo_bin, os.path.normpath("/mid"))
         cfg = self.load({"MIMO_MODEL": "xiaomi/new",
                          "DSH_MIMO_MODEL": "xiaomi/old"})
         self.assertEqual(cfg.mimo_default_model, "xiaomi/new")

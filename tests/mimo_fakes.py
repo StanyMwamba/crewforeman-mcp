@@ -726,7 +726,18 @@ def run_serve(opts):
 
         do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_GET
 
-    httpd = HTTPServer((host, port), Handler)
+    class _Server(HTTPServer):
+        # HTTPServer.server_bind() calls socket.getfqdn(host), a reverse-DNS
+        # lookup that can hang for many seconds on macOS and Windows CI
+        # runners, so the fake never printed its ready line there.  Bind
+        # like socketserver.TCPServer and set the names without DNS.
+        def server_bind(self):
+            import socketserver
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = host
+            self.server_port = self.server_address[1]
+
+    httpd = _Server((host, port), Handler)
     bound = httpd.server_address[1]
     url = "http://%s:%s" % (host, bound)
     # Real CLI ready line, printed after the bind with the real bound port.

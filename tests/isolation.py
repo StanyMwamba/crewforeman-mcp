@@ -291,7 +291,7 @@ def _refuse(target, description):
     if reason is None:
         return
     raise IsolationViolation(
-        "isolation guard: refusing test write to %r (inside %s); %s"
+        "isolation guard: refusing test write to '%s' (inside %s); %s"
         % (str(target), reason, description or "config unknown"))
 
 

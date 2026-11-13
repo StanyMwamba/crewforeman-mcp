@@ -1062,6 +1062,13 @@ class MimoFakesSmokeTest(unittest.TestCase):
                                  "serve URL capture file never appeared")
             yield served
         finally:
+            if os.name == "nt":
+                # The Windows fake is a compiled launcher with a Python child
+                # that keeps the pipes open; stop the whole tree, otherwise
+                # communicate() waits on the orphaned child.
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
             proc.terminate()
             try:
                 out, err = proc.communicate(timeout=10)
