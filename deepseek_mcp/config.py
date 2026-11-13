@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.14.3"
+SERVER_VERSION = "3.15.0"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -444,6 +444,26 @@ DEFAULTS = {
         "tests/test_v340_render.py",
     ],
     "plan_optional_max_files": 1,
+    # v3.15.0 MiMo Code worker keys.
+    "mimo_bin": "mimo",
+    "mimo_default_model": "xiaomi/mimo-v2.6-pro",
+    "mimo_probe_model": "xiaomi/mimo-v2.6-flash",
+    "mimo_variant": "",
+    # NEVER skip permissions by default; explicit opt-in only.
+    "mimo_skip_permissions": False,
+    # Empty means the per-role sandbox preset.
+    "mimo_sandbox": "",
+    # 0 auto-detects MiMo's workflow.maxConcurrentAgents.
+    "mimo_max_concurrent_agents": 0,
+    "mimo_use_serve": False,
+    "mimo_serve_host": "127.0.0.1",
+    "mimo_serve_port": 0,
+    # Per-model price overrides (USD per 1M tokens):
+    # {"model": {"input": F, "cache_hit": F, "output": F}}.
+    "mimo_prices": {},
+    # Explicit crosscheck crew vendor selection ("" = auto, different vendor).
+    "crosscheck_crew_provider": "",
+    "crosscheck_crew_model": "",
 }
 
 # Environment variable -> config key. New names are listed first; legacy v2
@@ -736,6 +756,27 @@ ENV_MAP = {
     "DEEPSEEK_AUTO_PARALLEL": "auto_parallel",
     "DSH_AUTO_PARALLEL_MIN_CONFIDENCE": "auto_parallel_min_confidence",
     "DEEPSEEK_AUTO_PARALLEL_MIN_CONFIDENCE": "auto_parallel_min_confidence",
+    # v3.15.0 MiMo worker keys. Newest alias first so it wins in the
+    # reversed load_config iteration (see the comment there).
+    "MIMO_BIN": "mimo_bin",
+    "DSH_MIMO_BIN": "mimo_bin",
+    "DEEPSEEK_MIMO_BIN": "mimo_bin",
+    "MIMO_MODEL": "mimo_default_model",
+    "DSH_MIMO_MODEL": "mimo_default_model",
+    "MIMO_PROBE_MODEL": "mimo_probe_model",
+    "MIMO_VARIANT": "mimo_variant",
+    "DSH_MIMO_SKIP_PERMISSIONS": "mimo_skip_permissions",
+    "DEEPSEEK_MIMO_SKIP_PERMISSIONS": "mimo_skip_permissions",
+    "DSH_MIMO_SANDBOX": "mimo_sandbox",
+    "DSH_MIMO_MAX_CONCURRENT_AGENTS": "mimo_max_concurrent_agents",
+    "DSH_MIMO_USE_SERVE": "mimo_use_serve",
+    "DSH_MIMO_SERVE_HOST": "mimo_serve_host",
+    "DSH_MIMO_SERVE_PORT": "mimo_serve_port",
+    "DSH_MIMO_PRICES": "mimo_prices",
+    "DSH_CROSSCHECK_CREW_PROVIDER": "crosscheck_crew_provider",
+    "DEEPSEEK_CROSSCHECK_CREW_PROVIDER": "crosscheck_crew_provider",
+    "DSH_CROSSCHECK_CREW_MODEL": "crosscheck_crew_model",
+    "DEEPSEEK_CROSSCHECK_CREW_MODEL": "crosscheck_crew_model",
 }
 
 BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "independent_review", "child_progress",
@@ -749,7 +790,8 @@ BOOL_KEYS = {"builder_practices", "builder_allow_unlisted_models", "quality", "i
              "reserve_resume_slot", "review_preflight",
              "gate_enabled", "gate_secret_scan", "pipeline_enabled",
              "pipeline_require_disjoint", "auto_parallel",
-             "loop_guard_enabled", "loop_guard_confirm"}
+             "loop_guard_enabled", "loop_guard_confirm",
+             "mimo_skip_permissions", "mimo_use_serve"}
 INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_soft_cap",
              "restart_helper_attempts",
             "quality_max_rounds", "max_file_chars", "max_concurrent_children",
@@ -783,7 +825,8 @@ INT_KEYS = {"max_parallel", "max_harness_jobs", "default_subagents", "subagent_s
             "reviewer_max_preflights", "plan_optional_max_files",
             "linux_min_abi", "crosscheck_crews", "crosscheck_crew_size",
             "crosscheck_max_rounds", "audit_spot_requirements",
-            "audit_spot_fixes", "audit_forced_jobs", "audit_seed"}
+            "audit_spot_fixes", "audit_forced_jobs", "audit_seed",
+            "mimo_max_concurrent_agents", "mimo_serve_port"}
 ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "task_completion": ("job", "request"),
              "quality_convergence": ("observe", "auto"),
@@ -813,7 +856,7 @@ LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "sandbox_extra_writes", "audit_risk_globs", "risk_paths",
              "git_identity_exceptions"}
 # Dict-valued keys keep JSON objects intact (never comma-split the text).
-DICT_KEYS = {"slice_models", "model_prices", "git_identity"}
+DICT_KEYS = {"slice_models", "model_prices", "git_identity", "mimo_prices"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "admission_heartbeat_seconds", "admission_lease_seconds",
               "review_test_timeout_seconds", "failure_notes_half_life_days",
@@ -844,7 +887,7 @@ PATH_KEYS = {"state_root", "log_dir", "jobs_dir", "pid_file", "skills_dir",
              "harness_workspace", "backup_dsh_bin",
              "dsh_sessions_dir", "state_dir", "chrome_bin", "restart_status_path",
              "failure_notes_store", "pipeline_worktree_root",
-             "pipeline_patch_dir", "credentials_file"}
+             "pipeline_patch_dir", "credentials_file", "mimo_bin"}
 
 # P3.4a: the four connector-owned keys derived from a non-empty state_root
 # (env CREWFOREMAN_STATE_DIR or config file state_root). This sits below
@@ -951,7 +994,10 @@ def _coerce(key, value):
             text = value.strip()
             if not text:
                 return {}
-            parsed = json.loads(text)
+            try:
+                parsed = json.loads(text)
+            except ValueError as exc:
+                raise ValueError("%s must be valid JSON: %s" % (key, exc))
             if not isinstance(parsed, dict):
                 raise ValueError("%s must be a JSON object" % key)
             return parsed
