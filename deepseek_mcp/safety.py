@@ -304,11 +304,19 @@ def _status_for(system, cfg=None):
             "min_abi": None}
 
 
+_DANGER_OPT_IN_REASON = "explicit_danger_full_access_opt_in"
+_DANGER_OPT_IN_HEADER = (
+    "boundary=none(explicit danger-full-access opt-in); writes=unbounded; "
+    "delete=unbounded; network=unrestricted")
+
+
 def _sandbox_header(status):
     kind = status.get("kind") or "none"
     enforcement = status.get("enforcement") or "none"
     abi = status.get("abi")
     delete = status.get("delete_outside") or "unverified"
+    if status.get("reason") == _DANGER_OPT_IN_REASON:
+        return _DANGER_OPT_IN_HEADER
     if status.get("blocked"):
         return ("UNSANDBOXED blocked; boundary=%s(%s) unavailable; "
                 "writes=unverified; delete=unverified; network=unrestricted"
@@ -401,6 +409,22 @@ def _sandbox_mode(cfg):
     return "auto"
 
 
+def sandbox_config_warning(cfg):
+    """One-line warning when the operator explicitly disabled the boundary."""
+    if _sandbox_mode(cfg) == "off":
+        return ("WARNING: OS sandbox disabled by config os_sandbox=off; "
+                "file writes are unbounded")
+    system = platforms.normalize_system()
+    key = {"Linux": "linux_sandbox", "Windows": "windows_sandbox"}.get(system)
+    if key:
+        raw = _cfg_get(cfg, key, "")
+        if str(raw or "").strip().lower() in ("off", "false", "no", "0",
+                                               "disabled"):
+            return ("WARNING: OS sandbox disabled by config %s=off; "
+                    "file writes are unbounded" % key)
+    return None
+
+
 def _os_sandbox_enabled(cfg):
     """Legacy boolean used by :func:`resolve`; delegates to the policy."""
     policy = sandbox_policy(cfg)
@@ -415,7 +439,30 @@ def sandbox_policy(cfg, args=None, reviewer=False):
     enforced tier the policy carries ``os_sandbox_blocked=True``.
     """
     mode = _sandbox_mode(cfg)
-    if mode == "off":
+    danger_opt_in = False
+    if isinstance(args, dict) and args.get("sandbox") is not None:
+        try:
+            danger_opt_in = (normalize_sandbox(args.get("sandbox"))
+                             == "danger-full-access")
+        except Exception:
+            danger_opt_in = False
+    if danger_opt_in:
+        # A per-job danger-full-access request is an explicit opt-in and
+        # must be labelled as such, never reported as a silent degradation.
+        now = time.time()
+        status = {
+            "schema": 1, "kind": "none", "enforcement": "none", "abi": None,
+            "probe": {"ok": False, "at": now, "ttl": _probe_ttl(cfg),
+                      "reason": _DANGER_OPT_IN_REASON},
+            "canary": {"ok": None, "at": None, "reason": "not_run"},
+            "tested": False, "degraded": False, "blocked": False,
+            "reason": _DANGER_OPT_IN_REASON, "temp_roots": [],
+            "profile_sha256": None, "requested": "danger-full-access",
+            "platform": platforms.normalize_system(),
+            "writes_outside": "unbounded", "delete_outside": "unbounded",
+            "network": "unrestricted",
+        }
+    elif mode == "off":
         # An explicit opt-out needs no probe and must not touch the host.
         now = time.time()
         status = {
@@ -438,9 +485,16 @@ def sandbox_policy(cfg, args=None, reviewer=False):
                           else "none")
     if status.get("kind") != "none" and not status.get("enforcement"):
         status["enforcement"] = "enforced"
-    status["requested"] = mode
+    status["requested"] = ("danger-full-access"
+                             if danger_opt_in else mode)
     blocked = False
-    if mode == "off":
+    if danger_opt_in:
+        status["blocked"] = False
+        status["degraded"] = False
+        status["reason"] = _DANGER_OPT_IN_REASON
+        status["writes_outside"] = "unbounded"
+        status["delete_outside"] = "unbounded"
+    elif mode == "off":
         status["blocked"] = True
         status["kind"] = "none"
         status["enforcement"] = "none"
@@ -460,7 +514,9 @@ def sandbox_policy(cfg, args=None, reviewer=False):
         else:
             status["reason"] = status.get("reason") or "sandbox_unavailable"
     status["sandbox_header"] = _sandbox_header(status)
-    if mode == "off":
+    if danger_opt_in:
+        enabled = False
+    elif mode == "off":
         enabled = False
     else:
         enabled = mode == "require" or status.get("enforcement") == "enforced"
@@ -941,7 +997,9 @@ def wrap_command(cmd, policy, workspace, tmpdir=None, extra_writes=(), dsh_home=
         "kind": kind,
         "enforcement": status.get("enforcement") or "none",
         "abi": status.get("abi"),
-        "requested": mode,
+        # The status object carries the accurate request (danger-full-access
+        # for an explicit opt-in, otherwise auto/require/off).
+        "requested": status.get("requested") or mode,
         "blocked": False,
         "canary": {"ok": None, "at": None, "reason": "not_run"},
         "tested": bool(status.get("tested")),
@@ -952,6 +1010,16 @@ def wrap_command(cmd, policy, workspace, tmpdir=None, extra_writes=(), dsh_home=
         "delete_outside": status.get("delete_outside") or "unverified",
         "probe": status.get("probe") or {"ok": False, "reason": None},
     }
+    if str(policy.get("sandbox") or "") == "danger-full-access":
+        # Explicit per-job opt-in: never wrap, and say so in the record.
+        meta.update({
+            "wrapped": False, "kind": "none", "enforcement": "none",
+            "blocked": False, "degraded": False,
+            "reason": _DANGER_OPT_IN_REASON,
+            "sandbox_header": _DANGER_OPT_IN_HEADER,
+            "writes_outside": "unbounded", "delete_outside": "unbounded",
+        })
+        return (([cmd] if isinstance(cmd, str) else list(cmd or ())), meta)
     try:
         argv = [cmd] if isinstance(cmd, str) else list(cmd or ())
         if not policy.get("os_sandbox"):

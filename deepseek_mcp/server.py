@@ -296,6 +296,14 @@ TOOLS = [
                 "holds no running slot; the dependency is ordered ahead of normal "
                 "queued builds. Unknown, failed, cancelled or cyclic dependencies are "
                 "rejected. This is explicit only: the prompt text is never scanned.")},
+            "depends_on_policy": {"type": "string",
+                                  "enum": ["success", "finished"],
+                                  "description": (
+                "How depends_on must end before this job starts. 'success' "
+                "(default) requires a successful dependency; 'finished' starts "
+                "after any terminal state, including error or cancellation. A "
+                "dependent parked by a dependency error is revived when the "
+                "dependency is resumed.")},
             "write_set": {"type": "array", "items": {"type": "string"},
                           "description": (
                               "Repo-relative file prefixes or globs this job expects to "

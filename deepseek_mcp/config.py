@@ -18,7 +18,7 @@ import warnings
 from pathlib import Path
 
 SERVER_NAME = "crewforeman-mcp"
-SERVER_VERSION = "3.14.2"
+SERVER_VERSION = "3.14.3"
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
                                "2025-03-26", "2024-11-05")
@@ -63,7 +63,17 @@ _DSH_DEFAULT = ("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/c
 
 # Generic, portable defaults. Every path is overridable.
 DEFAULTS = {
+    # Commit identity for every connector-created commit/rebase. The
+    # pre-push privacy gate allowlists this email (plus noreply@example.com
+    # and any email-shaped git_identity_exceptions entry).
+    "git_identity": {"name": "crewforeman-mcp", "email": "noreply@example.com"},
+    # Remote names/URL substrings that keep their own repo-local identity,
+    # e.g. "owner/repo" (example only; empty means no exceptions).
+    "git_identity_exceptions": [],
     "builder_practices": True,
+    # depends_on policy: "success" (default) waits for a successful
+    # dependency; "finished" starts after any terminal state (error included).
+    "depends_on_policy": "success",
     # P3.4a: optional root for connector-owned mutable state. Empty keeps
     # the historical per-key defaults; when set it derives state_dir,
     # log_dir, jobs_dir and pid_file (four roots, see
@@ -442,6 +452,8 @@ ENV_MAP = {
     "DEEPSEEK_MAX_HARNESS_JOBS": "max_harness_jobs",
     "DSH_RESERVE_RESUME_SLOT": "reserve_resume_slot",
     "DEEPSEEK_RESERVE_RESUME_SLOT": "reserve_resume_slot",
+    "DSH_DEPENDS_ON_POLICY": "depends_on_policy",
+    "DEEPSEEK_DEPENDS_ON_POLICY": "depends_on_policy",
     "DEEPSEEK_MCP_LOG_DIR": "log_dir",
     "DEEPSEEK_MCP_JOBS_DIR": "jobs_dir",
     "DEEPSEEK_MCP_PID_FILE": "pid_file",
@@ -770,7 +782,8 @@ ENUM_KEYS = {"auto_skills": ("auto", "propose", "off"),
              "gate_no_product_mode": ("skip", "off"),
              "linux_sandbox": ("auto", "landlock", "bwrap", "off"),
              "windows_sandbox": ("auto", "restricted", "appcontainer", "off"),
-             "sandbox_canary": ("auto", "off")}
+             "sandbox_canary": ("auto", "off"),
+             "depends_on_policy": ("success", "finished")}
 # New v3.12.0 enums never raise on an invalid value: they fall back to the
 # documented default so a bad env/config value cannot break startup.
 ENUM_FALLBACKS = {
@@ -782,9 +795,10 @@ ENUM_FALLBACKS = {
 LIST_KEYS = {"providers", "consult_models", "add_dirs",
              "allowed_workspace_roots", "gate_secret_patterns",
              "reviewers", "gate_noproduct_globs", "gate_split_fixture_paths",
-             "sandbox_extra_writes", "audit_risk_globs", "risk_paths"}
+             "sandbox_extra_writes", "audit_risk_globs", "risk_paths",
+             "git_identity_exceptions"}
 # Dict-valued keys keep JSON objects intact (never comma-split the text).
-DICT_KEYS = {"slice_models", "model_prices"}
+DICT_KEYS = {"slice_models", "model_prices", "git_identity"}
 FLOAT_KEYS = {"timeout", "wait_seconds", "stall_seconds", "stall_max_seconds",
               "admission_heartbeat_seconds", "admission_lease_seconds",
               "review_test_timeout_seconds", "failure_notes_half_life_days",
@@ -902,7 +916,11 @@ def _coerce(key, value):
             return 4000
         return number
     if key in FLOAT_KEYS:
+        if isinstance(value, bool):
+            raise ValueError("%s must be a number, not a boolean" % key)
         number = float(value)
+        if key == "job_max_seconds" and number < 0:
+            raise ValueError("job_max_seconds must be >= 0")
         if key == "auto_skills_quality_gate" and not 0.0 <= number <= 10.0:
             raise ValueError("auto_skills_quality_gate must be between 0 and 10")
         if key == "auto_skills_min_confidence" and not 0.0 <= number <= 1.0:

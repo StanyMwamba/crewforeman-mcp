@@ -500,20 +500,16 @@ def run_job(spec_path, handlers, cfg=None):
          _admission_token, _admission_last_hb, _admission_released) = saved
 
 
-def _review_gate_state(cfg, run_id):
-    """Return ``(in_flight, review_expected, recorded, run_status, run_error)``.
+_FAILED_RUN_STATUSES = (
+    "error", "gate_failed", "crosscheck_below_threshold", "stopped",
+    "deadline_exceeded", "budget_exceeded", "no_balance",
+)
 
-    Best-effort read of the durable run record.  A missing, unreadable or
-    malformed record means "no gate applies" so old runs and ad-hoc specs keep
-    their previous terminal behaviour.
-    """
-    try:
-        from .store import find_run
-        run = find_run(run_id, cfg)[0]
-    except Exception:
-        return False, False, False, None, None
+
+def _review_gate_state_from_run(run):
+    """Gate tuple from one durable run record (pure; unit-testable)."""
     if not isinstance(run, dict):
-        return False, False, False, None, None
+        return False, False, False, None, None, False, False
     phase = str(run.get("phase") or "")
     review_status = str(run.get("review_status") or "").lower()
     rounds = run.get("review_rounds")
@@ -521,15 +517,51 @@ def _review_gate_state(cfg, run_id):
         any(isinstance(item, dict) and item.get("kind") == "review"
             for item in rounds)
         if isinstance(rounds, list) else False)
+    settled_statuses = ("accepted", "stopped", "declined", "error", "paused")
+    review_settled = bool(recorded or review_status in settled_statuses)
+    active_status = review_status in ("", "pending", "running",
+                                      "in_progress")
+    phase_running = (
+        phase.startswith("review-")
+        and not phase.endswith(("_done", "_paused"))
+    )
     in_flight = bool(
-        run.get("review_in_flight")
-        or run.get("review_phase_in_flight")
-        or (phase.startswith("review-") and not phase.endswith("_done"))
-        or review_status in ("pending", "running", "in_progress"))
+        review_status in ("pending", "running", "in_progress")
+        or (active_status and (
+            run.get("review_in_flight")
+            or run.get("review_phase_in_flight")
+            or phase_running)))
+    if review_status in settled_statuses:
+        # A terminal/paused review wins over a stale in-flight marker.
+        in_flight = False
     review_expected = bool(run.get("independent_review"))
     return (in_flight, review_expected, recorded, run.get("status"),
             run.get("review_error") or run.get("status_detail")
-            or run.get("error"))
+            or run.get("error"),
+            bool(run.get("gate_error")), review_settled)
+
+
+def _review_gate_state(cfg, run_id):
+    """Return ``(in_flight, review_expected, recorded, run_status, run_error,
+    gate_infra, review_settled)``.
+
+    Best-effort read of the durable run record.  A missing, unreadable or
+    malformed record means "no gate applies" so old runs and ad-hoc specs keep
+    their previous terminal behaviour.
+
+    ``review_settled`` is true once the record carries a durable review
+    outcome (a recorded round, or an accepted/stopped/declined/error/paused
+    status).  A settled outcome is not "still in flight": the 3.14.2 gate used
+    to refuse a terminal done status for a paused review or for a stale
+    ``review_in_flight`` flag left on an accepted run, which turned shipped
+    work into ``error``.
+    """
+    try:
+        from .store import find_run
+        run = find_run(run_id, cfg)[0]
+    except Exception:
+        return False, False, False, None, None, False, False
+    return _review_gate_state_from_run(run)
 
 
 def _review_gate_error(gate, canonical=False):
@@ -538,7 +570,9 @@ def _review_gate_error(gate, canonical=False):
     ``ok_unreviewed`` is a recorded reviewer failure, so it stays a successful
     job; only a run that genuinely ended in ``error`` is propagated.
     """
-    in_flight, review_expected, recorded, run_status, run_error = gate
+    in_flight, review_expected, recorded, run_status, run_error = gate[:5]
+    gate_infra = bool(gate[5]) if len(gate) > 5 else False
+    review_settled = bool(gate[6]) if len(gate) > 6 else False
     if run_status == "gate_failed":
         detail = str(run_error or "").strip() or "see status_detail"
         return ("deterministic gate failed; reviewer was not called: %s"
@@ -547,15 +581,15 @@ def _review_gate_error(gate, canonical=False):
         return ("review phase is still in flight; refusing a "
                 "terminal done status")
     success_shaped = ("ok", "ok_rescued", "ok_unreviewed", "ok_below_gate")
-    if (review_expected and not recorded
-            and run_status in success_shaped):
+    if (review_expected and not recorded and not gate_infra
+            and not review_settled and run_status in success_shaped):
         return ("review was requested but no review round was recorded")
-    if run_status == "error":
-        # A terminal run error belongs to the job even when no independent
-        # review was requested (install conflict, gate error, builder error).
+    if run_status in _FAILED_RUN_STATUSES:
+        # A terminal run failure belongs to the job even when no independent
+        # review was requested (install conflict, deadline, crosscheck gate).
         detail = str(run_error or "").strip()
         subject = "the canonical run" if canonical else "the run"
-        message = ("%s ended with status 'error'" % subject)
+        message = ("%s ended with status %r" % (subject, run_status))
         if detail:
             message += ": " + detail
         return message
@@ -1049,6 +1083,17 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
         if not isinstance(depends_on, str) or not _valid_run_id(depends_on.strip()):
             raise RuntimeError("Invalid depends_on run id: %r" % (depends_on,))
         depends_on = depends_on.strip()
+    raw_policy = call_args.get("depends_on_policy")
+    if raw_policy is None:
+        if hasattr(cfg, "get"):
+            raw_policy = cfg.get("depends_on_policy")
+        else:
+            raw_policy = getattr(cfg, "depends_on_policy", None)
+    try:
+        depends_on_policy = admission_mod.normalize_dependency_policy(
+            raw_policy)
+    except admission_mod.DependencyError as exc:
+        raise RuntimeError(str(exc))
     wait = float(call_args.pop("wait_seconds", cfg.wait_seconds if wait is None else wait) or 0)
     admission = None
     fingerprint = None
@@ -1467,6 +1512,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 queue_work_id, priority=priority, run_id=run_id,
                 spec_path=str(spec), tool=tool, spawn=_spawn_record,
                 urgent=urgent, depends_on=depends_on,
+                depends_on_policy=depends_on_policy,
                 pipeline=queue_pipeline)
         except admission_mod.DependencyError as exc:
             # A dependency rejection is caller-visible and must not be
@@ -1485,6 +1531,36 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                 "Admission unavailable; job not started: %s" % exc)
             log(message)
             raise RuntimeError(message)
+        if resume_source:
+            # A resumed dependency gets a new run id.  Dependents parked by
+            # the old attempt's error must move to the live attempt, otherwise
+            # they stay dead forever.
+            try:
+                revived = controller.revive_dependents(
+                    run_id, source_run_id=resume_source)
+                if revived:
+                    log("resumed dependency revived dependent(s): %s"
+                        % ", ".join(str(item) for item in revived))
+                    for dependent in revived:
+                        try:
+                            record = (controller.store._load_item(dependent)
+                                      or {})
+                            dep_run = record.get("run_id")
+                            if dep_run:
+                                dep_status = (Path(cfg.jobs_dir) /
+                                              (str(dep_run) + ".status.json"))
+                                if dep_status.exists():
+                                    write_status(
+                                        dep_status, status="queued",
+                                        progress="waiting",
+                                        waiting_on=run_id,
+                                        dependency_status="waiting",
+                                        error=None)
+                        except Exception:
+                            pass
+                    controller.start(spawn=_spawn_record)
+            except Exception as exc:
+                log("dependent revive skipped: %s" % exc)
     else:
         try:
             _spawn_record({"work_id": queue_work_id, "fencing_token": None})
@@ -1522,6 +1598,7 @@ def start_job(tool, args, cfg=None, wait=None, python=None, entry=None,
                      priority_label=label,
                      urgent=bool(submitted.get("urgent", urgent)),
                      depends_on=depends_on,
+                     depends_on_policy=depends_on_policy,
                      waiting_on=waiting_on,
                      dependency_status=dependency_status,
                      holder=fields.get("holder"),
@@ -1645,6 +1722,8 @@ def _admission_status_fields(cfg, run_id, state):
         "priority_label": fields.get("priority_label") or state.get("priority_label"),
         "urgent": fields.get("urgent", state.get("urgent", False)),
         "depends_on": fields.get("depends_on", state.get("depends_on")),
+        "depends_on_policy": (fields.get("depends_on_policy")
+                              or state.get("depends_on_policy") or "success"),
         "waiting_on": fields.get("waiting_on", state.get("waiting_on")),
         "dependency_status": fields.get("dependency_status",
                                          state.get("dependency_status")),
@@ -1720,6 +1799,9 @@ def _structured_status(args, state, run_id, cfg):
     # P3-2: reviewer token usage and per-round cost are part of the structured
     # status contract, so callers need not parse the run record.
     run = run or {}
+    # Whole-job deadline: 0 is an explicit "unlimited", never "unset".
+    payload["job_max_seconds"] = run.get("job_max_seconds")
+    payload["job_max_seconds_display"] = run.get("job_max_seconds_display")
     rounds_view = []
     for item in run.get("review_rounds") or []:
         if not isinstance(item, dict):
@@ -1751,6 +1833,28 @@ def _structured_status(args, state, run_id, cfg):
 
 
 def tool_status(args, cfg=None):
+    """Job status plus an explicit warning when the boundary is opted out."""
+    cfg = cfg or load_config()
+    warning = safety.sandbox_config_warning(cfg)
+    try:
+        text = _tool_status_impl(args, cfg)
+    except RuntimeError as exc:
+        # The warning is about the configured boundary, not the run: surface
+        # it on the error path too (an unknown id must not hide the opt-out).
+        if warning and warning not in str(exc):
+            raise RuntimeError("%s\n%s" % (warning, exc))
+        raise
+    if isinstance(text, dict):
+        if warning:
+            text = dict(text)
+            text.setdefault("sandbox_warning", warning)
+        return text
+    if warning and text:
+        return "%s\n%s" % (warning, text)
+    return text
+
+
+def _tool_status_impl(args, cfg=None):
     cfg = cfg or load_config()
     jobs_dir = Path(cfg.jobs_dir)
     run_id = (args.get("run_id") or "").strip()

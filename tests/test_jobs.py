@@ -30,7 +30,10 @@ class JobTests(unittest.TestCase):
                                     "args": {"prompt": "hi"}}), encoding="utf-8")
         with mock.patch.dict(os.environ, {"DEEPSEEK_NO_CAFFEINATE": "1"}, clear=False):
             jobs.run_job(spec, {"ask_deepseek": lambda args: "inline result"}, cfg)
-        self.assertEqual(jobs.tool_status({"run_id": "test-run"}, cfg), "inline result")
+        status = jobs.tool_status({"run_id": "test-run"}, cfg)
+        # 3.14.3: an explicit os_sandbox=off prepends one warning line.
+        self.assertIn("inline result", status)
+        self.assertIn("OS sandbox disabled", status)
         listing = jobs.tool_status({}, cfg)
         self.assertIn("test-run", listing)
 

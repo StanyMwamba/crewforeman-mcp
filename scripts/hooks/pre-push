@@ -1,0 +1,39 @@
+#!/bin/sh
+# CrewForeman pre-push privacy gate.
+#
+# Install once per clone:
+#     git config core.hooksPath scripts/hooks
+#
+# It scans the commit METADATA (author and committer name+email) and the added
+# file content of every commit being pushed, and blocks the push when anything
+# is outside the allowlist (config `git_identity`, `noreply@example.com` and
+# the email-shaped entries of `git_identity_exceptions`).
+#
+# The connector never installs this hook itself: release pushes are a
+# human-approved step (docs/OPERATIONS.md, "Release safety").
+
+remote="$1"
+status=0
+zero="0000000000000000000000000000000000000000"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue          # branch deletion
+    base="$remote_sha"
+    case "$base" in
+        "$zero"|"") base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+    esac
+    if [ -z "$base" ]; then
+        echo "pre-push: cannot determine a base for $local_ref; refusing." >&2
+        status=1
+        continue
+    fi
+    if ! python3 -m deepseek_mcp.git_identity \
+            --repo . --base "$base" --head "$local_sha" --remote "$remote"; then
+        status=1
+    fi
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "pre-push: blocked by the CrewForeman privacy/identity gate." >&2
+fi
+exit "$status"

@@ -1112,7 +1112,7 @@ def _run_agent(cfg, task, workspace, label, max_seconds, cancel_check,
                 "authority root %s" % (workspace, root or "<none>"))
         sandbox = continuation.sandbox
         cap = continuation.job_max_seconds
-        if cap is not None:
+        if cap is not None and float(cap) > 0:
             try:
                 max_seconds = min(float(max_seconds), float(cap))
             except (TypeError, ValueError):

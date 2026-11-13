@@ -82,11 +82,21 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
         return "error", STATUS_MEANING["error"], None
     if gate_status == "gate_failed":
         return "gate_failed", STATUS_MEANING["gate_failed"], None
+    if gate_status == "gate_error":
+        return ("ok_unreviewed",
+                "deterministic gate could not run; the independent review "
+                "was skipped and deliverables were not verified.", False)
     if gate_status == "crosscheck_below_threshold":
         return ("crosscheck_below_threshold",
                 STATUS_MEANING["crosscheck_below_threshold"], False)
     if review_status == "declined":
         return ("ok_unreviewed", "review declined by user", False)
+    if review_status == "error":
+        # An attempted review that failed before a round could be recorded
+        # (reviewer pre-flight killed by the whole-job deadline, closed
+        # handle, stall) is a *recorded* reviewer failure: the builder's work
+        # is kept and plainly marked unverified.  It is not a run error.
+        return "ok_unreviewed", STATUS_MEANING["ok_unreviewed"], False
     if review_recorded is False and review_status != "disabled":
         return ("error",
                 "review was requested but no review round was recorded",
@@ -106,8 +116,6 @@ def final_status(builder_status="ok", review_status="disabled", score=None,
     elif reviewed:
         passed = False
 
-    if review_status == "error":
-        return "ok_unreviewed", STATUS_MEANING["ok_unreviewed"], False
     if reviewed and not passed:
         return "ok_below_gate", STATUS_MEANING["ok_below_gate"], False
     if rescued:

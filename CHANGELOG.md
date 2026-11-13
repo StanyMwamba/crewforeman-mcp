@@ -5,6 +5,71 @@ All notable changes to CrewForeman are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 3.14.3
+
+3.14.3 is a reliability release: five run-killing defects found in real jobs,
+a commit-identity gate, an honest OS-sandbox record, and a reproduction gate
+that stops crosscheck false alarms from being counted.
+
+- **Closed-handle faults can no longer kill a phase.** The connector used to
+  stop reading a child's stdout the instant a stop reason was set, close the
+  pipe, and only then wait for the child: dsh's final session-log flush then
+  hit a closed handle. A deliberately stopped child is now drained until it
+  exits (bounded by `STOP_DRAIN_SECONDS`), and teardown noise is removed from
+  the stopped phase's error. `flush on a closed handle` /
+  `I/O operation on closed file` are also classified as infrastructure
+  faults. A gate revision is retried once on a fresh session, then the run
+  degrades cleanly to `ok_unreviewed` with `stop_reason="gate_error"`,
+  `gate_error` and `gate_warning` recorded, instead of ending in `error`.
+  A run whose deliverables succeeded is no longer reported as
+  `review phase is still in flight; refusing a terminal done status`; the
+  terminal status reflects the work that actually shipped.
+- **`depends_on_policy`** (`"success"` default, `"finished"`) on the tool and
+  in config, also via `DSH_DEPENDS_ON_POLICY` / `DEEPSEEK_DEPENDS_ON_POLICY`.
+  `"success"` keeps today's behaviour with a message that names the dependency
+  and its terminal status; `"finished"` starts once the dependency reaches any
+  terminal state, error included. Resuming an errored dependency now revives
+  dependents parked on the old attempt instead of leaving them dead.
+- **`job_max_seconds: 0` truly disables the whole-job deadline**, in the
+  builder, gate revisions, reviewer and rescue phases. `None` still means
+  "unset"; negative tool values are rejected. The run record shows
+  `job_max_seconds: 0` with `job_max_seconds_display: "unlimited"`, and the
+  built-in 7200 s stall ceiling no longer re-imposes the deadline the caller
+  disabled. An operator-configured positive ceiling still caps a per-job `0`,
+  and the shipped `config.example.json` no longer pins one.
+- **Commit-identity gate.** New `deepseek_mcp/git_identity.py` sets the
+  repo-local identity from config `git_identity` (default
+  `crewforeman-mcp` with the reserved `noreply` address at `example.com`) for every commit and rebase the
+  connector creates, and its pre-push gate scans commit **metadata** (author
+  and committer name+email of every commit in `base..head`) as well as added
+  file contents. Any identity outside the allowlist blocks the push.
+  `git_identity_exceptions` lists remotes that keep their own identity (for
+  example a personal fork such as `StanyMwamba/Cypraea`); no personal address
+  is hardcoded. CLI: `python -m deepseek_mcp.git_identity --repo DIR --base A
+  --head B`.
+- **OS sandbox is recorded honestly and defaults safe.** `workspace-write`
+  builders get the OS boundary when the platform can provide it; a per-job
+  `danger-full-access` is labelled
+  `boundary=none(explicit danger-full-access opt-in)` and is never derived
+  silently; only an explicit `os_sandbox: "off"` (or the platform
+  `linux_sandbox` / `windows_sandbox` set to `"off"`) opts out, and
+  `job_status` then prints the exact opt-out warning.
+- **Crosscheck findings must reproduce.** Every finding now carries a
+  reproduction command and output (or, for non-executable spec findings, a
+  `file:line` + exact quote the connector verifies). The connector re-runs
+  each repro once before the finding counts; findings that do not reproduce
+  are dropped and counted as `false_alarm_filtered`. Records report
+  `raw_findings`, `unique`, `real`, `false_alarm`, `false_alarm_filtered`,
+  `unverified` and breaker/spec counts.
+- **Release hygiene.** Version 3.14.3 across package metadata and server
+  info; docs for every new option in `docs/OPERATIONS.md` and
+  `docs/CROSSCHECK.md`; a live crosscheck acceptance driver at
+  `scripts/live_crosscheck.py`. A regression test
+  (`tests/test_v3143_schema.py`) plus the release's live `tools/list` check
+  prove that `mode`, `crosscheck_*`, `audit_*`, `auto_parallel*` and
+  `depends_on_policy` are advertised by the installed server, not only
+  present in the source tree.
+
 ## 3.14.2
 
 3.14.2: opt-in crosscheck crews, a one-shot audit after the crew gate, and automatic parallel jobs.

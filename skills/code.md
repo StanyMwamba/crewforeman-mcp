@@ -92,5 +92,11 @@ Use this checklist for scripts, CLIs, libraries, services and small apps.
       both cases end the answer with `Final quality score: X/10`.
 
 ## Lessons learned
-<!-- Add only verified, reusable lessons as symptom -> cause -> check to add.
-     Keep them short and free of names, emails, tokens and personal paths. -->
+
+- 2026-11-13 [auto] [run=20261113-000306-b21116] run failed: unknown
+- 2026-11-13 [auto] [run=20261113-000408-a56b0d] independent review failed: unknown
+- 2026-11-13 [auto] [run=20261113-000556-55d4b9] independent review failed: Kimi (Moonshot) reviewer failed: reviewer modified files outside REVIEW.md: deliverable.md (modified)
+- 2026-11-13 [auto] [run=20261113-000918-77ea94] independent review failed: DeepSeek reviewer failed: dsh: session "s": flush on a closed handle
+- 2026-11-13 [auto] [run=20261113-001014-9100a4] independent review failed: reviewer selection pre-flight was stopped by a time limit, stall or dropped stream; no independent review ran
+- 2026-11-13 [auto] [run=20261113-001014-18f2d5] independent review failed: DeepSeek reviewer failed: time limit reached
+- 2026-11-13 [auto] [run=20261113-001854-479260] independent review failed: whole-job deadline reached before the reviewer selection pre-flight

@@ -1,4 +1,4 @@
-"""3.14.2 hardening: fail-closed gate, rescue classification, crosscheck wiring."""
+"""3.14.3 hardening: fail-closed gate, rescue classification, crosscheck wiring."""
 
 import unittest
 

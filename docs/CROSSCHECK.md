@@ -1,4 +1,4 @@
-# Crosscheck mode (3.14.2)
+# Crosscheck mode (3.14.3)
 
 `crosscheck` is opt-in. A job enters it with:
 
@@ -154,3 +154,37 @@ focused round is not required to repeat the original spot sample).
 A resumed crosscheck job replays the frozen `mode`/`crosscheck_*`/`audit_*`
 settings and `risk_paths`; a saved crosscheck run without that config fails
 closed instead of silently restarting in standard mode.
+
+## Reproduction gate (3.14.3)
+
+Findings are evidence, not opinions. In crosscheck mode every finding must
+carry a `repro` object:
+
+```json
+{"repro": {"command": "python3 -m unittest tests.test_x.TestY.test_z",
+           "output": "FAIL: assertion ..."}}
+```
+
+or, for a specification finding that cannot be executed, the exact source it
+quotes:
+
+```json
+{"repro": {"file": "deepseek_mcp/safety.py", "line": 412,
+           "quote": "if mode == \"off\":"}}
+```
+
+Before a finding is counted, the **connector** re-runs the reproduction once
+in the workspace. Identical rows (same id and same `repro`) share one run; the
+same id with different evidence is verified separately, so a decoy cannot hide
+a real finding. The command is split into an argv and is never run through
+a shell, with a scrubbed environment (`PATH`, `HOME`/desktop, `TMPDIR`/`TEMP`,
+locale and the platform's process variables survive; API keys do not), a hard
+10 s cap, and a process-group kill on timeout. The
+observed output must contain the claimed output; an explicit `exit_code`
+pins the status when the finder cares about it. A spec quote is checked
+against the file at the recorded line. Findings that do not reproduce are
+dropped, marked `filtered_by: "connector_repro"` with `repro_status` `failed`
+or `unverified`, and counted as `false_alarm_filtered`; a dropped finding can
+never be an open BLOCKING item. The per-job record reports `raw_findings`,
+`unique`, `real`, `false_alarm`, `false_alarm_filtered`, `unverified` and the
+breaker/spec split, so a noisy round is visible as numbers rather than prose.

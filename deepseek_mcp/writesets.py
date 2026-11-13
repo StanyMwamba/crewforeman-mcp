@@ -16,7 +16,7 @@ import os
 import posixpath
 import re
 
-VERSION = "3.14.2"
+VERSION = "3.14.3"
 MAX_ITEMS = 200
 MAX_PROMPT = 256 * 1024
 DEFAULT_MIN_CONFIDENCE = 0.85

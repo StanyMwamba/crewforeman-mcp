@@ -125,11 +125,18 @@ class AuthorityFailClosedTests(Base):
 
     def test_from_dict_rejects_malformed_budgets(self):
         env = self.envelope()
-        for field in ("job_max_seconds", "job_max_cost_usd"):
-            for broken in ("not-a-number", float("nan"), float("inf"), 0,
-                           -1, True, [], {}):
-                with self.subTest(field=field, value=broken):
-                    self.error(env, **{field: broken})
+        # 3.14.3: an explicit job_max_seconds=0 means "unlimited" and is valid.
+        unlimited = authority.AuthorityEnvelope.from_dict(
+            dict(env.to_dict(), job_max_seconds=0))
+        self.assertEqual(unlimited.job_max_seconds, 0)
+        for broken in ("not-a-number", float("nan"), float("inf"),
+                       -1, True, [], {}):
+            with self.subTest(field="job_max_seconds", value=broken):
+                self.error(env, job_max_seconds=broken)
+        for broken in ("not-a-number", float("nan"), float("inf"), 0,
+                       -1, True, [], {}):
+            with self.subTest(field="job_max_cost_usd", value=broken):
+                self.error(env, job_max_cost_usd=broken)
         clone = authority.AuthorityEnvelope.from_dict(env.to_dict())
         self.assertIsNone(clone.job_max_cost_usd)
         for broken in ("nan", "inf", "-inf"):

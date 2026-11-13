@@ -727,6 +727,19 @@ def _ready(execution):
 
 def _failure_class(execution):
     status = _execution_status(execution)
+    # A time limit/stall is carried in stop_reason/timed_out; the status is
+    # "error".  Check those first or a deadline looks like a generic error and
+    # the selection step asks the operator for a reviewer that just timed out.
+    if isinstance(execution, dict):
+        stop = str(execution.get("stop_reason") or "").strip().lower()
+        timed_out = bool(execution.get("timed_out"))
+        stalled = bool(execution.get("stalled"))
+    else:
+        stop = str(getattr(execution, "stop_reason", "") or "").strip().lower()
+        timed_out = bool(getattr(execution, "timed_out", False))
+        stalled = bool(getattr(execution, "stalled", False))
+    if stop in _STALL or timed_out or stalled:
+        return "stalled"
     if status in _STALL:
         return "stalled"
     if _reviewer_backup is not None:

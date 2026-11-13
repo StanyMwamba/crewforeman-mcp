@@ -1,5 +1,11 @@
 {
   "builder_practices": true,
+  "depends_on_policy": "success",
+  "git_identity": {
+    "name": "crewforeman-mcp",
+    "email": "noreply@example.com"
+  },
+  "git_identity_exceptions": [],
   "state_root": "",
   "daily_alert_usd": 2.0,
   "daily_limit_usd": null,
@@ -26,7 +32,6 @@
   "allow_writing_reviewer": false,
   "allowed_workspace_roots": [],
   "authority_ttl_seconds": 604800,
-  "job_max_seconds": 7200,
   "job_max_cost_usd": null,
   "max_harness_jobs": 4,
   "reserve_resume_slot": true,

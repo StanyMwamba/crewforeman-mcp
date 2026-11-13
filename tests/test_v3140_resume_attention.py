@@ -1,4 +1,4 @@
-"""3.14.2 slice B: resume applies a pending reviewer-vendor answer."""
+"""3.14.3 slice B: resume applies a pending reviewer-vendor answer."""
 
 import json
 import os

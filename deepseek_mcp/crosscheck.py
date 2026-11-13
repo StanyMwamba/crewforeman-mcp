@@ -19,6 +19,8 @@ import math
 import os
 import posixpath
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -554,6 +556,365 @@ def _finding_status(item):
     return str(item.get("status") or "open").strip().lower()
 
 
+# ---------------------------------------------------------------------------
+# reproduction gate
+
+
+REPRO_TIMEOUT = 10.0
+_FALSE_ALARM_FILTERED = "false_alarm_filtered"
+
+
+def _repro_lens(item):
+    return str(item.get("lens") or item.get("checker") or item.get("kind")
+               or "").strip().lower()
+
+
+def _repro_is_spec(item):
+    if item.get("executable") is False:
+        return True
+    lens = _repro_lens(item)
+    return "spec" in lens or "requirement" in lens
+
+
+def _repro_cache_key(item):
+    """Cache key for one verification attempt.
+
+    The finding id alone is not enough: two rows can carry the same id with
+    different reproduction commands, and each must run before it is counted.
+    Identical rows (same id and same repro) still run only once.
+    """
+    try:
+        payload = json.dumps(item.get("repro"), sort_keys=True,
+                             ensure_ascii=False, default=str)
+    except Exception:
+        payload = repr(item.get("repro"))
+    return (_repro_ident(item) + "\0" + hashlib.sha256(
+        payload.encode("utf-8", "replace")).hexdigest())
+
+
+def _repro_ident(item):
+    ident = str(item.get("id") or "").strip()
+    if ident:
+        return ident
+    return hashlib.sha256(
+        (str(item.get("part_id")) + "\0" + str(item.get("text")))
+        .encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def _repro_path(workspace, rel):
+    root = os.path.realpath(str(workspace or ""))
+    if not root:
+        return None
+    path = os.path.realpath(os.path.join(root, str(rel or "")))
+    if path != root and not path.startswith(root + os.sep):
+        return None
+    return path
+
+
+# Reproduction commands come from model-authored findings.  They are run as
+# an argv (never through a shell), with a scrubbed environment and a hard
+# timeout, so a prompt-injected finding cannot chain commands or read keys.
+_REPRO_ENV_KEEP = (
+    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
+    "SYSTEMROOT", "COMSPEC", "PATHEXT", "USERPROFILE", "PYTHONPATH",
+    "PYTHONIOENCODING", "VIRTUAL_ENV", "NUMBER_OF_PROCESSORS",
+)
+_REPRO_OUTPUT_LIMIT = 20000
+# Match the claimed output against a larger bounded buffer; the record keeps
+# only the 20 KB tail.  Matching the tail alone hides a marker printed before
+# a noisy 25 KB log.
+_REPRO_MATCH_LIMIT = 4000000
+
+
+def _repro_env():
+    return {name: value for name, value in os.environ.items()
+            if name in _REPRO_ENV_KEEP}
+
+
+def _windows_argv(command):
+    """Split a command with the Windows C-runtime quoting rules.
+
+    ``shlex`` cannot parse Windows command lines: with ``posix=False`` it
+    keeps the surrounding quotes in the token, and with ``posix=True`` it
+    eats the backslashes in paths such as ``C:\\tmp\\repro.py``.
+    """
+    text = str(command)
+    argv = []
+    current = []
+    quoted = False
+    started = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in " \t":
+            if quoted:
+                current.append(char)
+                started = True
+                index += 1
+                continue
+            if started:
+                argv.append("".join(current))
+                current = []
+                started = False
+            index += 1
+            continue
+        if char == "\\":
+            start = index
+            while index < len(text) and text[index] == "\\":
+                index += 1
+            count = index - start
+            if index < len(text) and text[index] == '"':
+                current.append("\\" * (count // 2))
+                if count % 2:
+                    current.append('"')
+                    index += 1
+            else:
+                current.append("\\" * count)
+            started = True
+            continue
+        if char == '"':
+            if quoted and index + 1 < len(text) and text[index + 1] == '"':
+                current.append('"')
+                index += 2
+            else:
+                quoted = not quoted
+                index += 1
+            started = True
+            continue
+        current.append(char)
+        started = True
+        index += 1
+    if started:
+        argv.append("".join(current))
+    return argv
+
+
+def _repro_argv(command):
+    if os.name == "nt":
+        argv = _windows_argv(command)
+    else:
+        argv = shlex.split(str(command), posix=True)
+    if not argv:
+        raise ValueError("empty reproduction command")
+    return argv
+
+
+def _repro_timeout(timeout):
+    """Clamp a caller-supplied timeout to the short connector hard limit."""
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        return REPRO_TIMEOUT
+    return min(max(value, 0.1), REPRO_TIMEOUT)
+
+
+def _repro_run(command, cwd, timeout):
+    """Default runner: one argv command in the workspace, short timeout."""
+    argv = _repro_argv(command)
+    kwargs = {}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        errors="replace", env=_repro_env(), **kwargs)
+    try:
+        output, _unused = proc.communicate(timeout=_repro_timeout(timeout))
+    except subprocess.TimeoutExpired:
+        _repro_kill(proc)
+        try:
+            proc.communicate(timeout=2)
+        except Exception:
+            pass
+        raise
+    return {"returncode": proc.returncode,
+            "output": (output or "")[-_REPRO_MATCH_LIMIT:]}
+
+
+def _repro_kill(proc):
+    """Kill the reproduction and any child it started, best effort."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            # CREATE_NEW_PROCESS_GROUP gives the tree its own group; taskkill
+            # /T is the only stdlib-reachable way to kill the whole tree.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5, check=False)
+            except Exception:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _repro_result(result):
+    """Normalise a runner result to ``(returncode, output)``."""
+    if isinstance(result, dict):
+        code = result.get("returncode", result.get("rc", result.get("code")))
+        output = result.get("output", result.get("stdout", result.get("text", "")))
+    elif isinstance(result, (tuple, list)) and len(result) >= 2:
+        code, output = result[0], result[1]
+    elif hasattr(result, "returncode"):
+        code, output = getattr(result, "returncode"), getattr(result, "stdout", "")
+    else:
+        code, output = result, ""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 1
+    return code, str(output or "")
+
+
+def _repro_quote(item, workspace):
+    """Verify a non-executable spec finding's file:line quote."""
+    repro = item.get("repro") if isinstance(item.get("repro"), dict) else {}
+    rel = str(repro.get("file") or item.get("file") or "").strip()
+    quote = repro.get("quote")
+    if quote is None:
+        quote = repro.get("text")
+    quote = str(quote or "")
+    try:
+        line_no = int(repro.get("line", item.get("line")))
+    except (TypeError, ValueError, OverflowError):
+        line_no = 0
+    if not rel or len(quote.strip()) < 4 or line_no <= 0:
+        return False, "spec_finding_needs_file_line_quote", ""
+    path = _repro_path(workspace, rel)
+    if not path or not os.path.isfile(path):
+        return False, "quote_file_missing:%s" % (rel,), ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+    except OSError as exc:
+        return False, "quote_read_error:%s" % (exc,), ""
+    target = quote
+    if target not in source and target.strip() and target.strip() in source:
+        target = target.strip()
+    if target not in source:
+        return False, "quote_not_found:%s" % (rel,), ""
+    lines = source.splitlines()
+    if line_no > len(lines):
+        return False, "quote_line_out_of_range:%s:%s" % (rel, line_no), ""
+    end = line_no + target.count("\n")
+    window = "\n".join(lines[line_no - 1:end])
+    if target not in window:
+        return False, "quote_not_at_line:%s:%s" % (rel, line_no), ""
+    return True, "quote_verified:%s:%s" % (rel, line_no), target
+
+
+def _verify_one(item, workspace, runner, timeout):
+    repro = item.get("repro")
+    if not isinstance(repro, dict):
+        return False, "missing_repro", ""
+    command = str(repro.get("command") or "").strip()
+    if not command:
+        if _repro_is_spec(item):
+            return _repro_quote(item, workspace)
+        return False, "missing_repro_command", ""
+    expected = str(repro.get("output") or "").strip()
+    if not expected:
+        return False, "missing_repro_output", ""
+    try:
+        result = (runner or _repro_run)(command, str(workspace or ""), timeout)
+        code, output = _repro_result(result)
+    except subprocess.TimeoutExpired:
+        return False, "repro_timeout", ""
+    except Exception as exc:  # noqa: BLE001 - runner failure is unverified
+        return False, "runner_error:%s" % (exc,), ""
+    output = str(output or "")
+    # A demonstrating command may legitimately exit non-zero (a failing test,
+    # a traceback).  The claimed output is the evidence; an explicit
+    # ``exit_code`` lets the finder pin the status when that matters.
+    if expected in output:
+        claimed = repro.get("exit_code", repro.get("expect_exit"))
+        if claimed is not None:
+            try:
+                if int(claimed) != int(code):
+                    return (False, "exit_code_mismatch:%s" % (code,), output)
+            except (TypeError, ValueError, OverflowError):
+                return False, "invalid_exit_code", output
+        return True, "repro_passed", output
+    if code != 0:
+        return False, "repro_failed:exit=%s" % (code,), output
+    return False, "output_mismatch", output
+
+
+def verify_findings(findings, workspace, runner=None, timeout=REPRO_TIMEOUT):
+    """Connector-side reproduction gate for crosscheck findings.
+
+    Every finding must carry ``repro`` with a command and its expected
+    output, or -- for a spec/requirement finding that cannot be executed --
+    ``file``/``line`` plus the exact source ``quote``.  The command is run at
+    most once per unique finding.  Missing, failing, mismatched, timed-out or
+    otherwise unverifiable findings are dropped: their status becomes
+    ``false_alarm`` so they can never block, and they are counted in
+    ``false_alarm_filtered`` with the reason recorded.
+
+    Returns ``(kept, filtered, stats)`` where ``kept + filtered`` partitions
+    the input rows (duplicates included); ``stats`` records the raw, unique,
+    real, false-alarm, false-alarm-filtered, unverified and breaker/spec
+    counts for the record.
+    """
+    rows = [item for item in (findings or []) if isinstance(item, dict)]
+    limit = _repro_timeout(timeout)
+    cache = {}
+    kept = []
+    filtered = []
+    for item in rows:
+        if _finding_status(item) == "false_alarm":
+            filtered.append(item)
+            continue
+        ident = _repro_cache_key(item)
+        if ident not in cache:
+            cache[ident] = _verify_one(item, workspace, runner, limit)
+        ok, reason, observed = cache[ident]
+        row = dict(item)
+        if ok:
+            row["repro_status"] = "verified"
+            row["repro_verified"] = True
+            row["repro_result"] = {
+                "status": "verified", "reason": reason,
+                "output": _truncate(observed, 800)}
+            kept.append(row)
+        else:
+            unverified = reason in ("repro_timeout", "runner_error") or str(
+                reason).startswith("runner_error")
+            row["status"] = "false_alarm"
+            row["repro_status"] = "unverified" if unverified else "failed"
+            row["repro_verified"] = False
+            row["filtered_by"] = "connector_repro"
+            row["false_alarm_reason"] = reason
+            row["repro_result"] = {
+                "status": row["repro_status"], "reason": reason,
+                "output": _truncate(observed, 800)}
+            filtered.append(row)
+    lens = [_repro_lens(item) for item in rows]
+    stats = {
+        "raw_findings": len(rows),
+        "unique": len({_repro_ident(item) for item in rows}),
+        "real": len(kept),
+        "false_alarm": sum(1 for item in kept + filtered
+                           if _finding_status(item) == "false_alarm"),
+        "false_alarm_filtered": sum(
+            1 for item in filtered
+            if item.get("filtered_by") == "connector_repro"),
+        "unverified": sum(1 for item in filtered
+                          if item.get("repro_status") == "unverified"),
+        "breaker": sum(1 for value in lens if "break" in value),
+        "spec": sum(1 for value in lens
+                    if "spec" in value or "requirement" in value),
+    }
+    return kept, filtered, stats
+
+
 def _requirement_checks(item):
     checks = item.get("checks")
     if isinstance(checks, list) and checks:
@@ -833,9 +1194,15 @@ def summarise_findings(findings):
             for item in unique]
     return {
         "raw": len(rows),
+        "raw_findings": len(rows),
         "unique": len(unique),
         "real": len(real),
         "false_alarm": len(false_alarms),
+        "false_alarm_filtered": sum(
+            1 for item in unique
+            if item.get("filtered_by") == "connector_repro"),
+        "unverified": sum(1 for item in unique
+                          if item.get("repro_status") == "unverified"),
         "breaker": sum(1 for value in lens if "break" in value),
         "spec": sum(1 for value in lens if "spec" in value),
         "blocking": sum(1 for item in unique
@@ -1188,9 +1555,13 @@ def build_contract(cc, parts_info, pairing_map, prompt):
         "BREAKERS: attack edge cases, wrong inputs, error paths, failing "
         "tests. Half are SPEC CHECKERS: every brief requirement point by "
         "point. Every finding must be tagged BLOCKING or minor, with "
-        "`file:line` and evidence (the exact command and its output). The "
-        "builder crew fixes; the finding crew re-runs the evidence and "
-        "confirms each fix. Repeat up to %d rounds."
+        "`file:line` and a `repro` object carrying the exact reproduction "
+        "`command` and its expected/observed `output`. The connector re-runs "
+        "that command once and drops any finding that does not reproduce. A "
+        "spec finding that cannot be executed must instead carry `repro` with "
+        "`file`, `line` and the exact source `quote`. The builder crew fixes; "
+        "the finding crew re-runs the evidence and confirms each fix. Repeat "
+        "up to %d rounds."
         % cc.get("max_rounds", DEFAULT_MAX_ROUNDS),
         "",
         "### Connector brief checklist (use these exact requirement ids)",
@@ -1211,7 +1582,8 @@ def build_contract(cc, parts_info, pairing_map, prompt):
         '"checker_crew":"crew-2","rescued":false}],'
         '"findings":[{"id":"F1","part_id":"p1","severity":"blocking",'
         '"lens":"breaker|spec","text":"...","file":"a.py","line":12,'
-        '"evidence":"command: ...\\noutput: ...","found_by_crew":"crew-2",'
+        '"repro":{"command":"...","output":"..."},"found_by_crew":"crew-2",'
+        '"evidence":"...",'
         '"status":"open|fixed|justified|false_alarm",'
         '"fix":{"crew":"crew-1","round":2,"evidence":"..."},'
         '"confirmation":{"crew":"crew-2","confirmed":true,"evidence":"..."},'
@@ -1221,6 +1593,9 @@ def build_contract(cc, parts_info, pairing_map, prompt):
         '"passed":true}],'
         '"rounds":[{"round":1,"score":10.0}],"rescues":[]}',
         "",
+        "A non-executable spec finding replaces the command with "
+        '"repro":{"file":"a.py","line":12,"quote":"exact source text"}; the '
+        "connector verifies that quote against the file.",
         "The connector runs the test suite itself. Do not claim tests passed "
         "without running them. Write the JSON even when a part fails; the "
         "connector will ask for one focused fix round if the gate is below "
@@ -1234,8 +1609,10 @@ def build_fix_task(cc, record, evaluation, round_no, prompt):
     parts = record.get("parts") or []
     open_items = []
     for item in record.get("findings") or []:
-        if (_severity(item) == SEVERITY_BLOCKING
-                and _finding_status(item) != "fixed"):
+        if _finding_status(item) in ("fixed", "false_alarm", "justified",
+                                     "duplicate"):
+            continue
+        if _severity(item) == SEVERITY_BLOCKING:
             open_items.append(
                 "- %s %s %s:%s: %s (evidence: %s)"
                 % (item.get("id"), _severity(item).upper(), item.get("file"),

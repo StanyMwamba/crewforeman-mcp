@@ -1,4 +1,4 @@
-"""3.14.2 crosscheck: config, parts, pairing, scoring, rounds, rescue.
+"""3.14.3 crosscheck: config, parts, pairing, scoring, rounds, rescue.
 
 Standard library only; no paid model call and no network.  Every test runs on
 Windows, macOS and Linux.

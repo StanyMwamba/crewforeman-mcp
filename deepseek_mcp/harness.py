@@ -73,6 +73,11 @@ ERROR_TYPES = ("error", "failed", "failure")
 # terminated Harness process gets to exit before it is killed.
 STALL_POLL_SECONDS = 0.25
 STOP_GRACE_SECONDS = 2.0
+# A deliberate stop (time limit / stall / cancel) must keep draining the
+# child's stdout while the child shuts down.  Closing the read end early made
+# dsh's session-log flush fail with "flush on a closed handle".  Bounded so a
+# child that ignores SIGTERM cannot pin the reader.
+STOP_DRAIN_SECONDS = 3.0
 # After the direct child exits, keep draining inherited stdout for at most this
 # long: a grandchild may flush one last event, but a silent or flooding
 # grandchild must never hold the reader open indefinitely.
@@ -2176,6 +2181,37 @@ def _stall_cap_hard_max(cfg):
     return _positive_float(getattr(cfg, "stall_cap_hard_max_seconds", 7200.0))
 
 
+def _stall_hard_max_for_limit(cfg, limit, phase_cap):
+    """Apply the absolute stall ceiling only when the phase has a deadline.
+
+    With an explicitly unlimited whole-job budget ``JobBudget.phase_limit``
+    returns ``None``.  Re-introducing the built-in 7200 s ceiling there would
+    recreate exactly the deadline the caller disabled, so an unbounded phase
+    keeps only the progress-gated stall threshold.
+    """
+    if phase_cap is None or limit is None:
+        return None
+    try:
+        if float(limit) <= 0:
+            return None
+    except (TypeError, ValueError):
+        return _stall_cap_hard_max(cfg)
+    return _stall_cap_hard_max(cfg)
+
+
+def _job_seconds_display(value):
+    """Human-readable rendering for the run record's job_max_seconds."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number == 0:
+        return "unlimited"
+    return "%gs" % number
+
+
 class _StallWatch(object):
     """Monotonic timestamps for the silence window and the progress-gated cap.
 
@@ -3137,6 +3173,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
     stderr_text = ""
     stall_limit = _stall_seconds(cfg)
     stall_cap = _stall_max_seconds(cfg, label)
+    stall_hard_cap = _stall_hard_max_for_limit(cfg, limit, stall_cap)
     errfile = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(cmd, cwd=str(workspace), env=env, stdin=subprocess.DEVNULL,
@@ -3162,8 +3199,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
                 "tokens_in": None, "cache_read_tokens": None, "tokens_out": None,
                 "stalled": False, "stalled_step": None, "stall_elapsed": None,
                 "stall_seconds": stall_limit, "stall_max_seconds": stall_cap,
-                "stall_cap_hard_max_seconds": (_stall_cap_hard_max(cfg)
-                                               if stall_cap is not None else None),
+                "stall_cap_hard_max_seconds": stall_hard_cap,
                 "stall_cap_hit": False, "timed_out": False,
                 "stop_reason": "launch_error", "child_progress_events": 0,
                 "child_sessions_active": 0}
@@ -3176,8 +3212,7 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         stall_limit, clock=clock, max_seconds=stall_cap,
         grace_seconds=_cap_grace(cfg),
         extension_seconds=_cap_extension(cfg),
-        hard_max_seconds=(_stall_cap_hard_max(cfg)
-                          if stall_cap is not None else None))
+        hard_max_seconds=stall_hard_cap)
     activity = (progress.ChildActivity(cfg.dsh_sessions_dir, workspace, since=started)
                 if getattr(cfg, "child_progress", False) else None)
     child_state = {"events": 0, "active": 0}
@@ -3410,11 +3445,23 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
             watch.touch("event", parsed.get("type") or "event")
 
     drain_deadline = None
+    stop_drain_deadline = None
     pump = _StdoutPump(proc.stdout) if USE_STDOUT_PUMP else None
     try:
         while True:
             if stop["reason"] is not None:
-                break
+                # A stop reason is not an excuse to close the child's stdout:
+                # the child (or a grandchild) may still be flushing its final
+                # events and session log.  Keep draining for a short, bounded
+                # window until it exits, then stop.  Closing the pipe early is
+                # what produced `dsh: session "...": flush on a closed
+                # handle` at every time limit.
+                if stop_drain_deadline is None:
+                    stop_drain_deadline = time.monotonic() + STOP_DRAIN_SECONDS
+                if proc.poll() is not None:
+                    break
+                if time.monotonic() >= stop_drain_deadline:
+                    break
             now = time.monotonic()
             exited = proc.poll() is not None
             if exited and drain_deadline is None:
@@ -3527,6 +3574,13 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
             reason = None
             stop["reason"] = None
             stall_state.clear()
+        if reason:
+            # A deliberately stopped child may print a closed-handle teardown
+            # complaint while flushing its session log.  The stop reason is
+            # the phase's real outcome; do not let shutdown noise masquerade
+            # as the failure (or leak "flush on a closed handle" into the job
+            # error and the run record).
+            stderr_text = _strip_shutdown_noise(stderr_text, reason)
         if reason == "timeout":
             errors.append("time limit reached")
         elif reason == "stalled":
@@ -3948,6 +4002,139 @@ _TRANSIENT_ERROR_RE = re.compile(
 _PERMANENT_ERROR_RE = re.compile(
     r"Insufficient Balance|\bQUOTA\b|HTTP\s*402|\b402 Payment|401|403|"
     r"unauthor|invalid api key|authentication|permission denied", re.IGNORECASE)
+
+# A closed log/session/stream handle is an infrastructure fault (a child
+# session or its log stream was shut down early), never a deliverable defect.
+_CLOSED_HANDLE_RE = re.compile(
+    r"flush on a closed handle|closed handle|stream[ _-]*closed|STREAM_CLOSED|"
+    r"I/O operation on closed file|ValueError: I/O operation on closed",
+    re.IGNORECASE)
+
+
+def _is_closed_handle_error(value):
+    """True when *value* describes a closed-handle/dropped-stream fault."""
+    if isinstance(value, BaseException):
+        value = "%s: %s" % (type(value).__name__, value)
+    text = value if isinstance(value, str) else str(value or "")
+    return bool(_CLOSED_HANDLE_RE.search(text))
+
+
+# A terminated dsh child can emit this one-line teardown complaint while its
+# session log is being closed.  The phase was stopped on purpose (time limit,
+# stall or cancel); surrounding text already names that reason.  Keeping the
+# line makes a clean deadline look like a stream failure and, historically,
+# let it take over the terminal status.
+_SHUTDOWN_NOISE_RE = re.compile(
+    r"(?im)^(?:dsh:\s*)?session\s+\"[^\"]*\":\s*flush on a closed handle"
+    r"[^\n]*\n?")
+_SHUTDOWN_STOP_REASONS = frozenset(
+    ("timeout", "time_limit", "stalled", "cancel", "cancelled", "canceling"))
+
+
+def _strip_shutdown_noise(text, stop_reason=None):
+    """Drop closed-handle teardown noise from a deliberately stopped phase.
+
+    Only called when a stop reason is already recorded, so a real crash that
+    happens to mention a closed handle (with no time/stall/cancel cause) keeps
+    the diagnostic.  Returns the text unchanged when there is nothing to do.
+    """
+    if not text:
+        return text
+    reason = str(stop_reason or "").strip().lower()
+    if reason not in _SHUTDOWN_STOP_REASONS:
+        return text
+    return _SHUTDOWN_NOISE_RE.sub("", text)
+
+
+_PREFLIGHT_INFRA_STOP_REASONS = frozenset(
+    ("time_limit", "timeout", "stalled", "cancel", "cancelled"))
+
+
+def _preflight_infrastructure_failure(execution):
+    """True when a reviewer preflight failed for an infrastructure reason.
+
+    A killed, stalled or timed-out READY ping says nothing about whether a
+    cross-vendor reviewer exists.  Pausing the job with "which reviewer should
+    score this?" is wrong in that case: the deliverables are already complete,
+    so the run must degrade to ``ok_unreviewed`` with the reason recorded.
+    Auth/credit/same-vendor failures still take the existing pause path.
+    """
+    if not isinstance(execution, dict):
+        return False
+    if str(execution.get("stop_reason") or "").strip().lower() in (
+            _PREFLIGHT_INFRA_STOP_REASONS):
+        return True
+    if execution.get("timed_out") or execution.get("stalled"):
+        return True
+    return _is_closed_handle_error(
+        str(execution.get("error") or "") + " " +
+        str(execution.get("stderr_tail") or ""))
+
+
+_SELECTION_INFRA_CLASSES = frozenset(("stalled", "stream dropped"))
+
+
+def _selection_infrastructure_failure(selected):
+    """True when every attempted reviewer candidate failed for infra reasons.
+
+    The selection-stage READY ping has the same failure modes as the paid
+    pre-flight.  A time limit, stall or dropped stream says nothing about
+    whether a cross-vendor reviewer exists, so it must degrade the review
+    instead of asking the operator to choose a reviewer that just timed out.
+    """
+    if not isinstance(selected, dict):
+        return False
+    attempted = []
+    for candidate in selected.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            attempts = int(candidate.get("attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        if attempts > 0:
+            attempted.append(candidate)
+    if not attempted:
+        return False
+    return all(str(item.get("class") or "").strip().lower()
+               in _SELECTION_INFRA_CLASSES for item in attempted)
+
+
+def _call_closed_handle_safe(fn):
+    """Run *fn* once, retrying once on a closed-handle/stream fault.
+
+    Returns ``(result, error)``.  The retry is a fresh call, which for a child
+    session means a new session.  A closed handle must never escape this
+    helper as a fatal phase error.
+    """
+    last_error = None
+    for _attempt in range(2):
+        try:
+            return fn(), None
+        except Exception as exc:  # infrastructure fault: degrade, never raise
+            last_error = exc
+            if not _is_closed_handle_error(exc):
+                break
+    return None, last_error
+
+
+def _apply_gate_degraded(run, gate_record):
+    """Record a gate infrastructure failure without failing the whole job."""
+    message = (gate_record.get("gate_error")
+               or "deterministic gate could not run")
+    warning = ("deterministic gate could not run (%s); the reviewer was not "
+               "called and deliverables were not independently verified."
+               % message)
+    run["status"] = "ok_unreviewed"
+    run["stop_reason"] = "gate_error"
+    run["review_status"] = "skipped"
+    run["review_passed"] = False
+    run["review_in_flight"] = False
+    run["quality_score"] = None
+    run["gate_error"] = message
+    run["gate_warning"] = warning
+    run["status_detail"] = warning
+    return warning
 
 
 def _transient_failure_reason(execution):
@@ -5219,6 +5406,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         raise RuntimeError("%s%s" % (exc, _saved_note(run, path)))
     run["authority"] = envelope.to_dict()
     run["authority_version"] = authority.AUTHORITY_VERSION
+    # Make the effective whole-job deadline legible in the run record.  An
+    # explicit 0 means unlimited; recording it as null would hide the caller's
+    # intent and made the 7200 s fallback incident hard to diagnose.
+    run["job_max_seconds"] = envelope.job_max_seconds
+    run["job_max_seconds_display"] = _job_seconds_display(
+        envelope.job_max_seconds)
     run["policy_digest"] = envelope.policy_digest
     run["reviewer_policy_source"] = (
         "reviewer_override" if envelope.reviewer_override else "forced_read_only")
@@ -7028,15 +7221,19 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 # snapshot the tree themselves for mutation detection.
                 gate_before = (builder_before if builder_before is not None
                                else safety.snapshot_workspace(workspace))
-                try:
-                    gate_record = gate_module.run_gate(
+                gate_record, gate_exc = _call_closed_handle_safe(
+                    lambda: gate_module.run_gate(
                         cfg, workspace, run, phase="pre_review",
-                        before=gate_before)
-                except Exception as exc:
+                        before=gate_before))
+                if gate_exc is not None:
                     gate_record = {
                         "verdict": "error", "checks": [],
-                        "gate_error": api.redact_secrets(str(exc))[:500],
+                        "gate_error": api.redact_secrets(
+                            str(gate_exc))[:500],
                         "blocked_review": True,
+                        "gate_error_class": (
+                            "closed_handle"
+                            if _is_closed_handle_error(gate_exc) else "gate"),
                     }
                 if not isinstance(gate_record, dict):
                     gate_record = {
@@ -7052,7 +7249,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 if verdict in ("passed", "skipped"):
                     break
                 if verdict == "error":
-                    gate_blocked = "error"
+                    # A closed-handle/stream fault in the gate's own execution
+                    # is an infrastructure failure, not a deliverable defect:
+                    # degrade to an unreviewed success instead of a job error.
+                    if (str(gate_record.get("gate_error_class")) ==
+                            "closed_handle"):
+                        gate_blocked = "degraded"
+                    else:
+                        gate_blocked = "error"
                     break
                 if gate_revision_rounds >= max_gate_revisions:
                     gate_blocked = "failed"
@@ -7136,27 +7340,46 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     trace.event("gate", "revision_start",
                                 round=gate_revision_rounds,
                                 fixes=len(fixes))
-                revision = _execute_once(
-                    cfg, workspace, revision_task,
-                    limit=job_budget.phase_limit(limit),
-                    progress_cb=progress_cb, label=rev_label,
-                    exclude_logs=used_logs, policy=revision_policy,
-                    add_dirs=run["add_dirs"],
-                    transport_name=run["transport"],
-                    cancel_check=cancel_check,
-                    live_usage_cb=rev_live_cb)
-                executions.append(revision)
-                used_logs.update(revision.get("session_logs") or [])
-                _cost_settle(run, cost_ledger, "gate-revision", revision,
-                             job_budget,
-                             operation_id=(rev_admission or {}).get(
-                                 "reservation", {}).get("id"))
-                rev_health = _health_record(
-                    health_board, "revision", revision)
-                _health_attention(run, cfg, "revision", rev_health)
+                revision = None
+                revision_attempts = 0
+                for _attempt in range(2):
+                    revision_attempts += 1
+                    revision = _execute_once(
+                        cfg, workspace, revision_task,
+                        limit=job_budget.phase_limit(limit),
+                        progress_cb=progress_cb,
+                        label=(rev_label if revision_attempts == 1
+                               else rev_label + " (retry)"),
+                        exclude_logs=used_logs, policy=revision_policy,
+                        add_dirs=run["add_dirs"],
+                        transport_name=run["transport"],
+                        cancel_check=cancel_check,
+                        live_usage_cb=rev_live_cb)
+                    executions.append(revision)
+                    used_logs.update(revision.get("session_logs") or [])
+                    _cost_settle(run, cost_ledger, "gate-revision", revision,
+                                 job_budget,
+                                 operation_id=(rev_admission or {}).get(
+                                     "reservation", {}).get("id"))
+                    rev_health = _health_record(
+                        health_board, "revision", revision)
+                    _health_attention(run, cfg, "revision", rev_health)
+                    if str(revision.get("status")) == "ok":
+                        break
+                    if _is_no_balance(revision):
+                        break
+                    if not _is_closed_handle_error(
+                            str(revision.get("error") or "") + " " +
+                            str(revision.get("stderr_tail") or "")):
+                        break
+                    if trace:
+                        trace.event("gate", "revision_retry",
+                                    round=gate_revision_rounds,
+                                    reason="closed_handle")
                 revision_entry = {
                     "round": gate_revision_rounds,
                     "label": rev_label,
+                    "attempts": revision_attempts,
                     "status": revision.get("status"),
                     "seconds": revision.get("seconds"),
                     "cost": revision.get("estimated_cost_usd"),
@@ -7196,12 +7419,25 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                     except Exception:
                         pass
                 if revision.get("status") != "ok":
+                    failure_text = api.redact_secrets(
+                        str(revision.get("error") or "unknown"))[:300]
+                    if _is_closed_handle_error(
+                            failure_text + " " +
+                            str(revision.get("stderr_tail") or "")):
+                        # One retry already happened above.  The builder's
+                        # deliverables are intact, so a still-failing session
+                        # handle must not become a fatal job error.
+                        gate_blocked = "degraded"
+                        gate_record["gate_error"] = (
+                            "gate revision %d hit a closed-handle session "
+                            "error after one retry: %s"
+                            % (gate_revision_rounds, failure_text))
+                        gate_record["gate_error_class"] = "closed_handle"
+                        break
                     gate_blocked = "error"
                     gate_record["gate_error"] = (
                         "gate revision %d failed: %s"
-                        % (gate_revision_rounds,
-                           api.redact_secrets(str(revision.get("error")
-                                               or "unknown"))[:300]))
+                        % (gate_revision_rounds, failure_text))
                     if _is_no_balance(revision):
                         run["status"] = "no_balance"
                         run["error"] = provider_error_message(
@@ -7255,6 +7491,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         "deterministic gate could not run: %s"
                         % (gate_record.get("gate_error") or "unknown error"))
                     run["status_detail"] = run["error"]
+                run["review_status"] = "skipped"
+            elif gate_blocked == "degraded":
+                _apply_gate_degraded(run, gate_record)
+                try:
+                    gate_evidence_text = str(
+                        gate_module.format_gate_evidence(gate_record) or "")
+                except Exception:
+                    gate_evidence_text = ""
                 run["review_status"] = "skipped"
             else:
                 try:
@@ -7367,6 +7611,14 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 record["tests"] = tests
                 brief_reqs = crosscheck_mod.brief_requirements(prompt)
                 record["brief_requirements"] = brief_reqs
+                kept, dropped, verification = crosscheck_mod.verify_findings(
+                    record.get("findings"), workspace)
+                record["findings"] = kept + dropped
+                record["verification"] = verification
+                record["raw_findings"] = verification.get("raw_findings")
+                record["false_alarm_filtered"] = verification.get(
+                    "false_alarm_filtered")
+                record["unverified_findings"] = verification.get("unverified")
                 evaluation = crosscheck_mod.evaluate(
                     record.get("parts"), record.get("findings"),
                     record.get("requirements"), tests,
@@ -7608,6 +7860,7 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         selected_spec = None
         reviewer_paused = False
         reviewer_declined = False
+        review_degraded = False
         reviewer_same_vendor = False
         legacy_reviewer_mode = False
         try:
@@ -7660,16 +7913,19 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                 except model_policy.BuilderModelError as exc:
                     return {"status": "error", "error": exc.code,
                             "answer": None}
+                _preflight_remaining = job_budget.remaining_seconds()
+                _preflight_cap = float(cfg.get(
+                    "review_preflight_timeout", 45.0) or 45.0)
+                if _preflight_remaining is not None:
+                    _preflight_cap = min(_preflight_cap,
+                                         float(_preflight_remaining))
                 try:
                     result = _execute_once(
                         cfg, workspace,
                         ("Reply with exactly READY and nothing else. Do not use "
                          "tools, do not read or write files, do not run commands."),
-                    limit=max(1.0, min(float(cfg.get("review_preflight_timeout",
-                                                     45.0) or 45.0),
-                                       float(job_budget.remaining_seconds()
-                                             or 45.0))),
-                    progress_cb=progress_cb,
+                        limit=max(1.0, _preflight_cap),
+                        progress_cb=progress_cb,
                     label="reviewer selection preflight",
                     exclude_logs=used_logs, policy=reviewer_policy,
                     add_dirs=run["add_dirs"],
@@ -7729,7 +7985,26 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                         run["reviewer_attention"] = pending
             legacy_reviewer_mode = not bool(cfg.get("reviewers")) and not job_model
             if not reviewer_declined and selected_reviewer is None and not reviewer_paused:
-                if vendor_unknown:
+                if job_budget.time_exceeded():
+                    # No paid READY ping is worth starting after the whole-job
+                    # deadline: the run must finish as deadline_exceeded, not
+                    # pause with a reviewer question the operator cannot act
+                    # on, and not launch another paid phase.
+                    review_degraded = True
+                    review_status = "stopped"
+                    review_error = ("whole-job deadline reached before the "
+                                    "reviewer selection pre-flight")
+                    run["status"] = "deadline_exceeded"
+                    run["stop_reason"] = "deadline"
+                    run["review_degraded_reason"] = "reviewer_deadline"
+                    run["review_status"] = "stopped"
+                    run["review_error"] = review_error
+                    run["review_in_flight"] = False
+                    run["status_detail"] = status_mod.STATUS_MEANING.get(
+                        "deadline_exceeded",
+                        "the whole-job deadline stopped the run before it "
+                        "finished.")
+                elif vendor_unknown:
                     reviewer_paused = True
                     run["reviewer_attention"] = reviewer_vendor.build_attention(
                         candidates, builder_vendors, round_no=start_round,
@@ -7782,6 +8057,22 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             selected.get("candidates") or []))
                     if selected.get("status") == "selected":
                         selected_reviewer = selected.get("candidate")
+                    elif _selection_infrastructure_failure(selected):
+                        review_degraded = True
+                        review_status = "error"
+                        review_error = (
+                            "reviewer selection pre-flight was stopped by a "
+                            "time limit, stall or dropped stream; no "
+                            "independent review ran")
+                        run["review_degraded_reason"] = (
+                            "reviewer_selection_preflight_infrastructure")
+                        run["review_status"] = "error"
+                        run["review_error"] = review_error
+                        run["review_in_flight"] = False
+                        run["status_detail"] = (
+                            "builder finished; reviewer selection was stopped "
+                            "by an infrastructure fault and no independent "
+                            "review ran; deliverables were not verified.")
                     else:
                         reviewer_paused = True
                         run["reviewer_attention"] = selected.get("attention")
@@ -7856,7 +8147,8 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
         if reviewer_paused:
             start_round = rounds + 1
         for round_no in (range(start_round, rounds + 1)
-                         if not reviewer_paused and not reviewer_declined
+                         if (not reviewer_paused and not reviewer_declined
+                             and not review_degraded)
                          else []):
             score_missing = False
             reused = prior_reviews.get(round_no) if round_no == skip_review_round else None
@@ -8367,7 +8659,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                                     str(_backup_preflight.get("error")
                                         or "backup pre-flight did not answer "
                                            "READY"))[:500]
-                    if not _answered and reviewer_backup is None and not reviewer_paused:
+                    _preflight_infra = _preflight_infrastructure_failure(
+                        preflight)
+                    if (not _answered and reviewer_backup is None
+                            and not reviewer_paused
+                            and not _preflight_infra):
                         # R5: no eligible cross-vendor reviewer passed. Pause
                         # with ONE question instead of failing silently or
                         # starting a same-vendor backup.
@@ -8482,6 +8778,22 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
                             "retry_delays": list(preflight_retry_delays),
                         }
                         run["review_error"] = _message
+                        if _preflight_infra:
+                            # Infrastructure, not "no reviewer exists": the
+                            # build is intact, so degrade to ok_unreviewed
+                            # with a precise reason instead of asking the
+                            # operator to choose a reviewer that just timed
+                            # out.
+                            run["review_degraded_reason"] = (
+                                "reviewer_preflight_%s"
+                                % (str(preflight.get("stop_reason")
+                                       or "infrastructure")))
+                            run["status_detail"] = (
+                                "builder finished; the reviewer pre-flight "
+                                "was stopped by %s and no independent review "
+                                "ran; deliverables were not verified."
+                                % (str(preflight.get("stop_reason")
+                                       or "an infrastructure fault")))
                         review_status = "error"
                         review_error = _message
                         run["review_in_flight"] = False
@@ -9697,7 +10009,11 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
     if (independent and not hard_stop and not gate_blocked
             and not crosscheck_failed and not reviewer_pending):
         in_flight = bool(run.get("review_in_flight"))
-        unrecorded = (review_status not in ("disabled", "declined")
+        # An attempted review that failed before a round could be recorded
+        # (pre-flight killed by the deadline, closed handle, stall) is a
+        # recorded reviewer failure, not an unrecorded success claim.  It
+        # degrades to ok_unreviewed below instead of forcing status=error.
+        unrecorded = (review_status not in ("disabled", "declined", "error")
                       and not review_recorded)
         if in_flight or unrecorded:
             # Never return a success-shaped status for a review that was
@@ -9745,8 +10061,12 @@ def run_harness(args, cfg, progress_cb=None, cancel_check=None):
             cancelled=bool(run.get("cancelled")) or run.get("stop_reason") == "cancelled",
             stop_reason=run.get("stop_reason"),
             review_recorded=review_recorded if independent else True,
-            gate_status=("gate_failed" if gate_blocked == "failed" else None))
+            gate_status=("gate_failed" if gate_blocked == "failed"
+                         else ("gate_error" if gate_blocked == "degraded"
+                               else None)))
         run["status_detail"] = status_detail
+        if gate_blocked == "degraded" and run.get("gate_warning"):
+            run["status_detail"] = run["gate_warning"]
         run["review_passed"] = review_passed
     if review_status == "error":
         # The builder succeeded: keep its work, but say plainly it is unverified.

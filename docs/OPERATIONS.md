@@ -1,4 +1,4 @@
-# Operations: configuration, safety, budgets, traces and retention (v3.14.2)
+# Operations: configuration, safety, budgets, traces and retention (v3.14.3)
 
 This page is the detailed reference behind the short README. Everything here
 is implemented by `deepseek_mcp/` and exercised by the test suite with fakes;
@@ -633,6 +633,29 @@ network=unrestricted`. `writes_outside` and `delete_outside` are suite claims
 (`denied`, `unverified`, `not_claimed`), never guesses. `enforcement=enforced`
 requires both `probe.ok` and `canary.ok`; `require` blocks when either fails.
 
+### Sandbox record and defaults (3.14.3)
+
+A builder with sandbox `workspace-write` gets the OS boundary whenever the
+platform can provide one, including when `os_sandbox` is unset (`auto`).
+`danger-full-access` is never derived from a default: only an explicit
+per-job request is honoured, and the record then reads
+`boundary=none(explicit danger-full-access opt-in); writes=unbounded;
+delete=unbounded; network=unrestricted` instead of the ambiguous
+`boundary=none(policy_opt_out)`.
+
+`boundary=none(policy_opt_out)` now means exactly one thing: the operator set
+`os_sandbox: "off"` (or `DSH_OS_SANDBOX=off`/`false`), or the platform key
+(`linux_sandbox` / `windows_sandbox`) to `"off"`. In that mode
+`deepseek_job_status` prepends one line:
+
+```
+WARNING: OS sandbox disabled by config os_sandbox=off; file writes are unbounded
+```
+
+and the structured status carries the same text as `sandbox_warning`. The
+recommended setting is `"os_sandbox": "auto"` (or `"require"` to fail closed);
+a per-job `sandbox: "danger-full-access"` stays an explicit, recorded opt-in.
+
 On macOS the wrapper is `sandbox-exec` with the generated Seatbelt profile. On
 Linux the launcher applies a Landlock ruleset to itself and then `exec`s `dsh`
 (ABI 3+ handles truncate; reads and network stay unrestricted). On Windows the
@@ -645,7 +668,7 @@ the suite or boundary ran (`AttributeError`, `logon_sid=None`, `admin=False`,
 `usable=false`). 3.13.3 fixed the wrong-DLL bindings; run 42648360100 then
 proved the probe (`usable=true`, `write_restricted=true` on py3.9 and py3.15)
 but the suite was red and `admin_member` could not be measured (`WinError
-1309`). 3.13.9 was green in run 42697229851; 3.14.1 needs its own green Windows run as
+1309`). 3.13.9 was green in run 42697229851; 3.14.3 needs its own green Windows run as
 the required proof of the suite and the boundary. The runner account is an Administrators member,
 but that is not the same as an elevated process token; the probe records
 `admin` (token elevation) and `admin_member` (account group) separately. This
@@ -993,7 +1016,7 @@ not a measured elevation result. Run 42648360100 proved the probe on both
 Pythons but was red in the suite, and its Administrators-membership query
 failed (`WinError 1309`), so `admin_member` is not claimed either. 3.13.9 was green on both Windows
 Pythons in run 42697229851 (suite and boundary) and records token elevation
-and group membership separately; 3.14.1 needs its own green Windows run as the
+and group membership separately; 3.14.3 needs its own green Windows run as the
 required proof for this release. Until that run is green, no
 create/modify/append/truncate denial is claimed, delete/rename outside stays
 `delete_outside=unverified`, and CI makes no no-admin claim. The standard-user
@@ -1319,3 +1342,74 @@ client answer. It is held by the work journal, is not returned by
 `final_status`, and is resolved with `resume_deepseek` plus the `option` shown
 by `deepseek_job_status`. Declining a reviewer question ends `ok_unreviewed`
 with `review_declined_by_user=true` and `quality_score=null`.
+
+## 3.14.3 reliability options
+
+### `job_max_seconds`
+
+`job_max_seconds` bounds one whole job across the builder, gate revisions,
+the independent reviewer and the rescue/finisher phase. An absent key uses the
+built-in 7200 s default; an explicit `null` or `0` means **unlimited** in every
+phase and is recorded as `job_max_seconds: 0` with
+`job_max_seconds_display: "unlimited"`; the internal 7200 s stall ceiling is
+not re-applied to a phase that has no deadline. A negative tool argument or configured
+value is rejected with a clear error.
+An operator-configured positive ceiling still caps a per-job `0`; remove the
+key (or set it to `null`) to let callers disable the deadline. Progress-gated
+stall detection (`stall_seconds`, `stall_max_seconds`) is unchanged and still
+protects against a silent child.
+
+### `depends_on_policy`
+
+Controls what a queued job does when the run named by `depends_on` ends in a
+non-success terminal state.
+
+| Value | Meaning |
+| --- | --- |
+| `success` (default) | Start only when the dependency finished successfully. A dependency error produces a message that names the dependency, its terminal status and the remedy, and the job is parked, not silently dropped. |
+| `finished` | Start once the dependency reaches any terminal state, including `error`, `no_balance`, `deadline_exceeded` and `cancelled`. |
+
+Tool argument `depends_on_policy`, config key `depends_on_policy` (an invalid
+value is rejected at submission), env aliases `DSH_DEPENDS_ON_POLICY` and
+`DEEPSEEK_DEPENDS_ON_POLICY`. Resuming an errored dependency revives the
+dependents parked on the old attempt: they are re-pointed at the resumed run
+id and re-queued, so a transient dependency failure does not leave them dead.
+
+### `git_identity` and `git_identity_exceptions`
+
+Every commit, amend or rebase the connector creates is authored and committed
+with the configured identity. Default:
+
+```json
+"git_identity": {"name": "crewforeman-mcp", "email": "noreply@example.com"}
+```
+
+The helper sets it repo-locally before touching the index and also passes
+`-c user.name` / `-c user.email`, so a global git identity cannot leak in,
+including through a rebase. Before a push, the privacy gate scans both the
+content of the pushed commits and their **metadata** - the author and
+committer name+email of every commit in `base..head` - and blocks the push
+when any identity is outside the allowlist (the configured `git_identity`
+name and address, the default `crewforeman-mcp` / `noreply@example.com`, and
+the email-shaped entries from `git_identity_exceptions`). An exception remote
+is exempt from the metadata check but its added content is still scanned.
+
+`git_identity_exceptions` lists remote names or URL substrings that keep their
+own repo-local identity, for example a personal fork such as
+`"StanyMwamba/Cypraea"`. The list is matched against the remote name and URL;
+no personal address is built in anywhere.
+
+```bash
+python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \
+    --remote origin        # exit 1 blocks the push
+```
+
+To block every push automatically, install the checked-in hook once per clone:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
+`scripts/hooks/pre-push` runs the same gate for each pushed ref, using the
+remote's advertised sha as the base (or the merge-base for a new branch). It
+scans metadata and content and exits non-zero on any violation.

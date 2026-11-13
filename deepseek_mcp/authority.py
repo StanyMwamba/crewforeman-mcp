@@ -100,6 +100,25 @@ def _seconds(value):
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _budget_seconds(value):
+    """A job time budget: None is unset, 0 is explicitly unlimited, >0 bounded.
+
+    ``_seconds`` intentionally maps 0 to None for cost ceilings and callers
+    that predate unlimited job deadlines.  Job deadlines need the third state:
+    a caller-supplied 0 must stay distinguishable from "not supplied" so it is
+    not replaced by the built-in 7200 s default.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 def _mode(value, default=_READ_ONLY):
     try:
         return safety.normalize_sandbox(value, default=default)
@@ -136,11 +155,13 @@ def _strict_int(value, field, minimum=None):
     return number
 
 
-def _strict_budget(value, field):
-    """A persisted budget is None (unbounded) or a finite positive number.
+def _strict_budget(value, field, unlimited_zero=False):
+    """A persisted budget is None (unset/unbounded) or a finite non-negative number.
 
-    Numeric strings are rejected: the old ``float()`` coercion turned malformed
-    text into a silent ``None``, which failed open into an unbounded budget.
+    ``unlimited_zero`` admits an explicit 0 for whole-job deadlines, where 0
+    means "no deadline" (not "use the default").  Numeric strings are still
+    rejected: the old ``float()`` coercion turned malformed text into a silent
+    ``None``, which failed open into an unbounded budget.
     """
     if value is None:
         return None
@@ -148,7 +169,9 @@ def _strict_budget(value, field):
             value, (int, float)):
         raise InvalidAuthority("invalid authority %s" % field)
     number = float(value)
-    if not math.isfinite(number) or number <= 0:
+    if not math.isfinite(number) or number < 0:
+        raise InvalidAuthority("invalid authority %s" % field)
+    if number == 0 and not unlimited_zero:
         raise InvalidAuthority("invalid authority %s" % field)
     return number
 
@@ -323,8 +346,30 @@ def resolve_workspace(args, cfg):
     return workspace
 
 
-def _stricter_budget(old, new, field):
-    """Budgets: None is unbounded; a positive number is strict, smaller is stricter."""
+def _stricter_budget(old, new, field, unlimited_zero=False):
+    """Budgets: None is unbounded; a positive number is strict, smaller is stricter.
+
+    With ``unlimited_zero`` an explicit 0 is a valid "unlimited" marker for a
+    whole-job deadline: it is the weakest value, so it may never widen a
+    bounded envelope, but it is preserved (instead of decaying to None) when
+    the envelope is already unlimited.
+    """
+    if unlimited_zero:
+        old_value = _budget_seconds(old)
+        new_value = _budget_seconds(new)
+        if new is not None and new_value is None:
+            raise WideningError(
+                "%s must be a finite non-negative number" % field)
+        old_bound = old_value if (old_value or 0) > 0 else None
+        new_bound = new_value if (new_value or 0) > 0 else None
+        if new_bound is None:
+            if old_bound is not None:
+                raise WideningError(
+                    "%s cannot be widened (removing the bound)" % field)
+            return 0.0 if new_value == 0 else None
+        if old_bound is not None and new_bound > old_bound:
+            raise WideningError("%s cannot be widened" % field)
+        return new_bound
     old_value = _seconds(old)
     new_value = _seconds(new)
     if new_value is None and old_value is not None:
@@ -369,7 +414,7 @@ class AuthorityEnvelope:
         self.sandbox = str(sandbox)
         self.reviewer_policy = str(reviewer_policy)
         self.workspace_root = str(workspace_root or "")
-        self.job_max_seconds = _seconds(job_max_seconds)
+        self.job_max_seconds = _budget_seconds(job_max_seconds)
         self.job_max_cost_usd = _seconds(job_max_cost_usd)
         try:
             self.max_agents = max(0, int(max_agents or 0))
@@ -469,7 +514,8 @@ class AuthorityEnvelope:
             reviewer_policy=reviewer,
             workspace_root=workspace,
             job_max_seconds=_strict_budget(
-                data.get("job_max_seconds"), "job_max_seconds"),
+                data.get("job_max_seconds"), "job_max_seconds",
+                unlimited_zero=True),
             job_max_cost_usd=_strict_budget(
                 data.get("job_max_cost_usd"), "job_max_cost_usd"),
             max_agents=_strict_int(
@@ -521,7 +567,8 @@ class AuthorityEnvelope:
             changes["reviewer_policy"] = mode
         if job_max_seconds is not None:
             changes["job_max_seconds"] = _stricter_budget(
-                self.job_max_seconds, job_max_seconds, "job_max_seconds")
+                self.job_max_seconds, job_max_seconds, "job_max_seconds",
+                unlimited_zero=True)
         if job_max_cost_usd is not None:
             changes["job_max_cost_usd"] = _stricter_budget(
                 self.job_max_cost_usd, job_max_cost_usd, "job_max_cost_usd")
@@ -606,10 +653,11 @@ class AuthorityEnvelope:
                                           effective_reviewer]
 
         def _cap(old, cfg_value, name):
-            cap = _seconds(cfg_value)
-            if cap is None:
+            cap = _budget_seconds(cfg_value)
+            if cap is None or cap <= 0:
+                # 0 is an operator-explicit "no ceiling", never a clamp.
                 return
-            if old is None or old > cap:
+            if old is None or old <= 0 or old > cap:
                 updates[name] = cap
                 changed[name] = [old, cap]
 
@@ -714,28 +762,40 @@ def direct(args, cfg, origin="harness_deepseek", now=None):
         # A caller may always narrow to read-only even when config is writing.
         reviewer_mode = _READ_ONLY
 
-    def _requested(raw, field):
+    def _requested(raw, field, allow_zero=False):
         if raw is None:
             return None
+        if isinstance(raw, bool):
+            raise InvalidAuthority("%s must be a number, not a boolean" % field)
         try:
             number = float(raw)
         except (TypeError, ValueError):
             raise InvalidAuthority("%s must be a number" % field)
         if not math.isfinite(number):
             raise InvalidAuthority("%s must be finite" % field)
+        if allow_zero:
+            if number < 0:
+                raise InvalidAuthority("%s cannot be negative" % field)
+            return number
         if number <= 0:
             return None
         return number
 
-    cfg_seconds = _seconds(_cfg(cfg, "job_max_seconds", None))
+    cfg_seconds = _budget_seconds(_cfg(cfg, "job_max_seconds", None))
     requested_seconds = _requested(args.get("job_max_seconds"),
-                                   "job_max_seconds")
+                                   "job_max_seconds", allow_zero=True)
     if requested_seconds is None:
         requested_seconds = cfg_seconds
-    elif cfg_seconds is not None and _cfg_explicit(cfg, "job_max_seconds"):
+    elif (_cfg_explicit(cfg, "job_max_seconds")
+          and cfg_seconds is not None and cfg_seconds > 0):
         # The built-in 7200 default must not clamp an explicit caller value;
-        # an operator-configured lower ceiling may.
-        requested_seconds = min(requested_seconds, cfg_seconds)
+        # an operator-configured lower ceiling may.  An operator 0 means the
+        # operator removed the ceiling, so it never clamps a caller request.
+        # An explicit caller 0 stays unlimited unless such a ceiling exists.
+        if requested_seconds == 0:
+            requested_seconds = cfg_seconds
+        else:
+            requested_seconds = min(requested_seconds, cfg_seconds)
     cfg_cost = _seconds(_cfg(cfg, "job_max_cost_usd", None))
     requested_cost = _requested(args.get("job_max_cost_usd"),
                                 "job_max_cost_usd")
@@ -882,14 +942,19 @@ def legacy_default(run, cfg, metadata=None):
     if roots and workspace and not any(inside_root(workspace, root) for root in roots):
         raise WorkspaceRootError(
             "legacy run workspace %s is outside allowed_workspace_roots" % workspace)
-    saved_seconds = _seconds(run.get("job_max_seconds"))
+    saved_seconds = _budget_seconds(run.get("job_max_seconds"))
     if saved_seconds is None:
-        saved_seconds = _seconds(spec.get("job_max_seconds"))
-    cfg_seconds = _seconds(_cfg(cfg, "job_max_seconds", None))
+        saved_seconds = _budget_seconds(spec.get("job_max_seconds"))
+    cfg_seconds = _budget_seconds(_cfg(cfg, "job_max_seconds", None))
+    cfg_explicit = _cfg_explicit(cfg, "job_max_seconds")
     if saved_seconds is None:
         seconds = cfg_seconds
-    elif cfg_seconds is None:
+    elif cfg_seconds is None or cfg_seconds <= 0:
         seconds = saved_seconds
+    elif saved_seconds <= 0:
+        # A saved explicit 0 is "unlimited" and must not be clamped by the
+        # built-in 7200 default; only an operator-configured ceiling may.
+        seconds = cfg_seconds if cfg_explicit else saved_seconds
     else:
         seconds = min(saved_seconds, cfg_seconds)
     saved_cost = _seconds(run.get("job_max_cost_usd"))

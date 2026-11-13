@@ -33,7 +33,8 @@ _TERMINAL = ("done", "failed", "cancelled", "error")
 _ERROR_STATUSES = frozenset((
     "error", "failed", "failure", "cancelled", "canceled", "no_balance",
     "deadline_exceeded", "budget_exceeded", "timeout",
-    "time_budget_exceeded", "cost_budget_exceeded", "gate_failed"))
+    "time_budget_exceeded", "cost_budget_exceeded", "gate_failed",
+    "stopped", "crosscheck_below_threshold"))
 _SUCCESS_STATUSES = frozenset((
     "done", "ok", "success", "succeeded", "complete", "completed",
     "ok_unreviewed", "ok_below_gate", "ok_rescued"))
@@ -120,6 +121,29 @@ def _default_pid_alive(pid):
     if pid <= 0:
         return False
     return platforms.pid_alive(pid)
+
+
+DEPENDENCY_POLICIES = ("success", "finished")
+
+
+def normalize_dependency_policy(value):
+    """Validate and return a ``depends_on_policy`` value.
+
+    ``success`` (default) waits for a successful dependency.  ``finished``
+    starts after any terminal state, including error or cancellation.  An
+    unknown value is a caller error and is rejected here, before any queue
+    record is mutated.
+    """
+    if value is None:
+        return "success"
+    policy = str(value).strip().lower()
+    if not policy:
+        return "success"
+    if policy not in DEPENDENCY_POLICIES:
+        raise DependencyError(
+            "Invalid depends_on_policy %r: expected one of %s." % (
+                value, ", ".join(repr(item) for item in DEPENDENCY_POLICIES)))
+    return policy
 
 
 class AdmissionStore:
@@ -393,6 +417,11 @@ class AdmissionStore:
         depends_on = record.get("depends_on") if isinstance(record, dict) else None
         if not depends_on:
             return {"state": "ready", "dependency": None, "detail": None}
+        try:
+            policy = normalize_dependency_policy(
+                record.get("depends_on_policy"))
+        except DependencyError:
+            policy = "success"
         dependency = str(depends_on)
         if (not dependency or "/" in dependency or "\\" in dependency
                 or dependency in (".", "..")):
@@ -436,13 +465,21 @@ class AdmissionStore:
             elif kind == "waiting":
                 waiting = True
         if error:
-            return {"state": "error", "dependency": dependency,
-                    "detail": detail or error}
+            payload = {"state": "error", "dependency": dependency,
+                       "detail": detail or error, "status": error}
+            if policy == "finished":
+                # The policy accepts any terminal state.  Mark the error so
+                # readiness can bypass the pipeline-install gate (an errored
+                # dependency never has an installed patch).
+                payload["state"] = "ready"
+                payload["terminal"] = "error"
+            return payload
         if held:
             return {"state": "waiting", "dependency": dependency,
                     "detail": None}
         if done:
-            return {"state": "ready", "dependency": dependency, "detail": None}
+            return {"state": "ready", "dependency": dependency,
+                    "detail": None, "terminal": "success"}
         if waiting or item or probe_seen:
             return {"state": "waiting", "dependency": dependency, "detail": None}
         return {"state": "unknown", "dependency": dependency, "detail": None}
@@ -474,7 +511,8 @@ class AdmissionStore:
                 return {"state": "ready", "dependency": None, "detail": None}
             return self._dependency_state_locked(record)
 
-    def _validate_dependency_locked(self, work_id, run_id, depends_on):
+    def _validate_dependency_locked(self, work_id, run_id, depends_on,
+                                    depends_on_policy=None):
         """Reject bad dependencies before mutating any queue state."""
         if depends_on is None:
             return
@@ -503,11 +541,18 @@ class AdmissionStore:
                 break
             current = str(item.get("depends_on"))
             chain.append(current)
-        state = self._dependency_state_locked({"depends_on": dependency})
+        state = self._dependency_state_locked({
+            "depends_on": dependency,
+            "depends_on_policy": normalize_dependency_policy(
+                depends_on_policy)})
         if state["state"] == "error":
             raise DependencyError(
-                "Dependency run_id %r finished with error: %s." % (
-                    dependency, state.get("detail") or "unknown error"))
+                "Dependency run_id %r finished with error (terminal status "
+                "%r): %s. depends_on_policy='success' requires the dependency "
+                "to succeed; use depends_on_policy='finished' to start after "
+                "any terminal state." % (
+                    dependency, state.get("status") or "error",
+                    state.get("detail") or "unknown error"))
         if state["state"] == "unknown":
             raise DependencyError(
                 "Unknown dependency run_id %r: no queue record or run "
@@ -516,11 +561,12 @@ class AdmissionStore:
     # -- public API --------------------------------------------------------
     def enqueue(self, work_id, priority=PRIORITY_BUILD, run_id=None,
                 spec_path=None, tool=None, meta=None, urgent=False,
-                depends_on=None, pipeline=None):
+                depends_on=None, depends_on_policy=None, pipeline=None):
         work_id = self._safe_id(work_id)
         urgent = bool(urgent)
         if depends_on is not None:
             depends_on = str(depends_on).strip()
+        policy = normalize_dependency_policy(depends_on_policy)
         with self._lock, self._work_lock(work_id):
             now = self._now_val()
             existing = self._load_item(work_id)
@@ -530,7 +576,8 @@ class AdmissionStore:
                 return existing
             # Validate before mutating: a rejected dependency must not leave a
             # half-updated item that the dispatcher could later claim.
-            self._validate_dependency_locked(work_id, run_id, depends_on)
+            self._validate_dependency_locked(work_id, run_id, depends_on,
+                                             policy)
             if existing:
                 record = existing
                 record["priority"] = int(priority)
@@ -540,8 +587,10 @@ class AdmissionStore:
                 record["updated"] = _now_iso(now)
                 if depends_on:
                     record["depends_on"] = depends_on
+                    record["depends_on_policy"] = policy
                 else:
                     record.pop("depends_on", None)
+                    record.pop("depends_on_policy", None)
             else:
                 record = {
                     "work_id": work_id,
@@ -556,6 +605,7 @@ class AdmissionStore:
                 }
                 if depends_on:
                     record["depends_on"] = depends_on
+                    record["depends_on_policy"] = policy
             if run_id is not None:
                 record["run_id"] = run_id
             if spec_path is not None:
@@ -620,6 +670,84 @@ class AdmissionStore:
                     str(rec.get("work_id")))
         records.sort(key=sort_key)
         return records
+
+    def revive_dependents(self, resumed_run_id, source_run_id=None):
+        """Requeue dependents parked by a dependency error after a resume.
+
+        A dependent failed by ``_reject_bad_dependency_locked`` carries
+        ``parked_on_dependency`` and the failed dependency run id.  When that
+        run is resumed under a new run id, the dependent follows the live
+        attempt instead of staying dead.  Returns revived work ids.
+        """
+        resumed = str(resumed_run_id or "").strip()
+        source = str(source_run_id or "").strip()
+        if not resumed:
+            # Without the new run id a revived dependent would be detached
+            # from every dependency; refuse rather than corrupt its record.
+            return []
+        targets = {item for item in (resumed, source) if item}
+        revived = []
+        with self.queue_lock():
+            self._ensure_dirs()
+            if source:
+                previous = self._find_item_locked(source)
+                if previous:
+                    targets.update(self._identities(previous))
+            try:
+                names = sorted(os.listdir(self.items_dir))
+            except OSError:
+                return []
+            for name in names:
+                if not name.endswith(".json") or name.startswith("."):
+                    continue
+                try:
+                    record = self._read_json(
+                        os.path.join(self.items_dir, name))
+                except AdmissionError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                dependency = str(record.get("depends_on") or "")
+                if dependency not in targets:
+                    continue
+                if str(record.get("work_id") or "") in targets:
+                    continue
+                parked = bool(record.get("parked_on_dependency"))
+                if not parked:
+                    parked = (record.get("status") in _ERROR_STATUSES
+                              and "depend" in str(
+                                  record.get("error") or "").lower())
+                if not parked or record.get("status") not in _ERROR_STATUSES:
+                    continue
+                work_id = record.get("work_id")
+                if not work_id:
+                    continue
+                with self._work_lock(work_id):
+                    current = self._load_item(work_id) or dict(record)
+                    current["status"] = "queued"
+                    for key in ("error", "parked_on_dependency",
+                                "dependency_status", "dependency_failed_run_id",
+                                "released"):
+                        current.pop(key, None)
+                    current["depends_on"] = resumed
+                    try:
+                        current["depends_on_policy"] = (
+                            normalize_dependency_policy(
+                                current.get("depends_on_policy")))
+                    except DependencyError:
+                        current["depends_on_policy"] = "success"
+                    current["revived_from"] = dependency
+                    current["revived_at"] = _now_iso(self._now_val())
+                    self._save_item(work_id, current)
+                revived.append(str(work_id))
+                try:
+                    self.record_event("admission_dependency_revived", {
+                        "work_id": work_id, "depends_on": resumed,
+                        "revived_from": dependency,
+                        "reason": "dependency_resumed"})
+                except Exception:
+                    pass
+        return revived
 
     def pending(self):
         with self._lock:
@@ -769,7 +897,7 @@ class AdmissionStore:
             self._remove_lease(work_id)
             return item
 
-    def fail(self, work_id, message, status="failed"):
+    def fail(self, work_id, message, status="failed", extra=None):
         """Mark a queue record failed with a caller-visible error message."""
         work_id = self._safe_id(work_id)
         with self._lock, self._work_lock(work_id):
@@ -779,6 +907,8 @@ class AdmissionStore:
                 raise AdmissionError("unknown work id: %s" % work_id)
             item["status"] = str(status or "failed")
             item["error"] = str(message)
+            if isinstance(extra, dict):
+                item.update(extra)
             item["updated"] = _now_iso(now)
             item["released"] = _now_iso(now)
             self._save_item(work_id, item)
@@ -936,6 +1066,7 @@ class AdmissionStore:
                                              bool(item.get("urgent"))),
             "urgent": bool(item.get("urgent")),
             "depends_on": depends_on,
+            "depends_on_policy": item.get("depends_on_policy") or "success",
             "waiting_on": waiting_on,
             "dependency_status": dependency.get("state"),
             "dependency_error": dependency_error,
@@ -1338,8 +1469,13 @@ class AdmissionController:
         if not record.get("depends_on"):
             return True
         try:
-            if self.store.dependency_state(record).get("state") != "ready":
+            state = self.store.dependency_state(record)
+            if state.get("state") != "ready":
                 return False
+            if state.get("terminal") == "error":
+                # policy="finished": an errored dependency never installs a
+                # pipeline patch, so the install gate cannot block this job.
+                return True
         except Exception:
             return False
         return self._dependency_install_ready(record)
@@ -1355,16 +1491,33 @@ class AdmissionController:
         kind = state.get("state")
         if kind not in ("unknown", "error"):
             return False
+        try:
+            policy = normalize_dependency_policy(
+                record.get("depends_on_policy"))
+        except DependencyError:
+            policy = "success"
+        if kind == "error" and policy == "finished":
+            return False
         dependency = state.get("dependency") or record.get("depends_on")
         if kind == "unknown":
             message = ("Dependency run_id %r is unknown: no queue record or "
                        "run metadata was found." % (dependency,))
         else:
-            message = ("Dependency run_id %r finished with error: %s" %
-                       (dependency, state.get("detail") or "unknown error"))
+            message = (
+                "Dependency run_id %r finished with error (terminal status "
+                "%r): %s. depends_on_policy='success' requires the dependency "
+                "to succeed; use depends_on_policy='finished' to start after "
+                "any terminal state." % (
+                    dependency, state.get("status") or kind,
+                    state.get("detail") or "unknown error"))
         work_id = record.get("work_id")
         try:
-            self.store.fail(work_id, message)
+            self.store.fail(work_id, message, extra={
+                "parked_on_dependency": True,
+                "dependency_status": kind,
+                "dependency_failed_run_id": dependency,
+                "depends_on_policy": policy,
+            })
         except Exception:
             return False
         payload = {"work_id": work_id, "run_id": record.get("run_id"),
@@ -1385,6 +1538,11 @@ class AdmissionController:
             except Exception:
                 pass
         return True
+
+    def revive_dependents(self, resumed_run_id, source_run_id=None):
+        """Requeue dependents parked by a dependency error after a resume."""
+        return self.store.revive_dependents(
+            resumed_run_id, source_run_id=source_run_id)
 
     def _parallel_decision(self, record, active):
         try:
@@ -1471,7 +1629,7 @@ class AdmissionController:
 
     def submit(self, work_id, priority=PRIORITY_BUILD, run_id=None,
                spec_path=None, tool=None, spawn=None, urgent=False,
-               depends_on=None, pipeline=None):
+               depends_on=None, depends_on_policy=None, pipeline=None):
         spawn_fn = spawn or self._spawn
         # The capacity check and the claim must be one critical section across
         # every controller sharing this queue root, not just this instance.
@@ -1479,7 +1637,8 @@ class AdmissionController:
             record = self.store.enqueue(
                 work_id, priority=priority, run_id=run_id,
                 spec_path=spec_path, tool=tool, urgent=urgent,
-                depends_on=depends_on, pipeline=pipeline)
+                depends_on=depends_on,
+                depends_on_policy=depends_on_policy, pipeline=pipeline)
             fields = self.store.status_fields(work_id)
             if record.get("status") == "queued":
                 self._reject_bad_dependency_locked(record)

@@ -1,4 +1,4 @@
-"""Regression tests for v3.14.2 bug A: regexing serialised JSON corrupted run records."""
+"""Regression tests for v3.14.3 bug A: regexing serialised JSON corrupted run records."""
 
 import json
 import tempfile

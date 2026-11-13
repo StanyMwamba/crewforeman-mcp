@@ -1936,11 +1936,11 @@ def install_pending(cfg, canonical_workspace, run_id):
 
         rc, _out, err = _git(["add", "-A"], temp)
         if rc == 0:
-            rc, _out, err = _git(
-                ["-c", "user.name=CrewForeman",
-                 "-c", "user.email=crewforeman@localhost",
-                 "commit", "-m", "pipeline install " + _safe_id(run_id or "queue")],
-                temp,
+            from .git_identity import commit_with_identity
+
+            rc, _out, err = commit_with_identity(
+                cfg, temp,
+                "pipeline install " + _safe_id(run_id or "queue"),
             )
         if rc != 0:
             result.update(_install_conflict(pending[0], "install_commit_failed", err))

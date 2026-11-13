@@ -1,4 +1,4 @@
-"""3.14.2 release contract: version, schema, docs and README constraints."""
+"""3.14.3 release contract: version, schema, docs and README constraints."""
 
 import json
 import os
@@ -21,19 +21,19 @@ def _read(relative):
 
 class VersionTests(unittest.TestCase):
     def test_package_versions(self):
-        self.assertEqual(deepseek_mcp.__version__, "3.14.2")
-        self.assertEqual(config.SERVER_VERSION, "3.14.2")
-        self.assertEqual(observability.SERVICE_VERSION, "3.14.2")
+        self.assertEqual(deepseek_mcp.__version__, "3.14.3")
+        self.assertEqual(config.SERVER_VERSION, "3.14.3")
+        self.assertEqual(observability.SERVICE_VERSION, "3.14.3")
 
     def test_pyproject_version(self):
         text = _read("pyproject.toml")
         match = re.search(r'^version = "([^"]+)"$', text, re.MULTILINE)
-        self.assertEqual(match.group(1), "3.14.2")
+        self.assertEqual(match.group(1), "3.14.3")
 
     def test_changelog_top_section(self):
         text = _read("CHANGELOG.md")
         self.assertEqual(re.search(r"^## (\d+\.\d+\.\d+)", text, re.MULTILINE).group(1),
-                         "3.14.2")
+                         "3.14.3")
         self.assertIn("crosscheck", text.lower())
         self.assertIn("audit", text.lower())
 

@@ -1,4 +1,4 @@
-# Automatic parallel jobs (3.14.2)
+# Automatic parallel jobs (3.14.3)
 
 Parallelism is automatic, not declared. When a Harness job is submitted
 without `write_set`, the connector infers one from the brief, `PLAN.json` and
