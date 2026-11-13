@@ -1397,13 +1397,12 @@ is exempt from the metadata check but its added content is still scanned.
 
 `git_identity_exceptions` lists remotes that keep their own repo-local
 identity, for example a personal fork such as `"StanyMwamba/Cypraea"`.
-Matching is **exact**, not a substring: an entry may be the remote name
-(`origin`), `owner/repo`, or a full URL (with or without `.git`). A substring
-match would let an entry such as `owner/repo` exempt an unrelated
-`evil.example/fork-of-owner/repo` push target. Prefer `owner/repo` or a full
-URL over a bare remote name: an entry of `origin` exempts every push to that
-remote's identity metadata (its content is still secret-scanned). No personal
-address is built in anywhere.
+Matching is **exact**, not a substring: an entry must be `owner/repo` or a
+full URL (with or without `.git`). A substring match would let an entry such
+as `owner/repo` exempt an unrelated `evil.example/fork-of-owner/repo` push
+target, and a bare remote name is a local label that can be re-pointed at
+another URL, so bare names such as `origin` are ignored. No personal address
+is built in anywhere.
 
 ```bash
 python -m deepseek_mcp.git_identity --repo . --base origin/main --head HEAD \
@@ -1424,7 +1423,10 @@ git config core.hooksPath scripts/hooks
 
 Connector-controlled release tooling calls
 `git_identity.push_with_gate(cfg, repo, remote, refspec, base=...)`: it runs
-the same gate and returns before `git push` on any violation.
+the same gate and returns before `git push` on any violation. That helper is
+the hard gate; the Git hook is cooperative and, like every Git hook, can be
+skipped with `git push --no-verify`, so release/publish tooling must call
+`push_with_gate` rather than a bare `git push`.
 `scripts/hooks/pre-push` runs the same gate for each pushed ref, using the
 remote's advertised sha as the base (or the merge-base for a new branch). It
 scans metadata and content and exits non-zero on any violation.

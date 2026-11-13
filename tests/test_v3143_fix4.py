@@ -224,20 +224,31 @@ class GitIdentityTest(unittest.TestCase):
                                          head="HEAD", remote="evil")
         self.assertFalse(report["ok"], report)
 
-    def test_exception_matches_full_url_and_remote_name(self):
+    def test_exception_matches_full_url_and_owner_repo(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")
         self.git("remote", "add", "upstream",
                  "https://github.com/example-org/Cypraea.git")
         for entry in ("https://github.com/example-org/Cypraea",
                       "https://github.com/example-org/Cypraea.git",
-                      "upstream"):
+                      "example-org/Cypraea"):
             cfg = {"git_identity": dict(CFG["git_identity"]),
                    "git_identity_exceptions": [entry]}
             report = git_identity.check_push(
                 cfg, repo=str(self.repo), base=base, head="HEAD",
                 remote="upstream")
             self.assertTrue(report["ok"], (entry, report["messages"]))
+
+    def test_bare_remote_name_is_not_an_exception(self):
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign")
+        self.git("remote", "add", "origin",
+                 "https://evil.example/attacker/repo.git")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["origin"]}
+        report = git_identity.check_push(cfg, repo=str(self.repo), base=base,
+                                         head="HEAD", remote="origin")
+        self.assertFalse(report["ok"], "a local label must not exempt a URL")
 
     def test_connector_installs_the_pre_push_hook(self):
         self.commit("first")
@@ -364,6 +375,18 @@ class GitIdentityTest(unittest.TestCase):
         with mock.patch.dict(os.environ, leak, clear=False):
             rc, _out, err = git_identity.commit_with_identity(
                 CFG, self.repo, "config injection")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.ident(),
+                         ["crewforeman-mcp", "noreply@example.com",
+                          "crewforeman-mcp", "noreply@example.com"])
+
+    def test_git_config_parameters_cannot_inject_an_identity(self):
+        self.write("params.txt", "x")
+        self.git("add", "-A")
+        leak = {"GIT_CONFIG_PARAMETERS": "'user.email'='injected@example.org'"}
+        with mock.patch.dict(os.environ, leak, clear=False):
+            rc, _out, err = git_identity.commit_with_identity(
+                CFG, self.repo, "config parameters injection")
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.ident(),
                          ["crewforeman-mcp", "noreply@example.com",

@@ -6,6 +6,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -138,6 +139,31 @@ class StopDrainIntegrationTest(unittest.TestCase):
         self.assertEqual(result["answer"], "drain complete")
         self.assertGreaterEqual(result["events"], 3,
                                 "events written after the stop were lost")
+        self.assertNotIn("flush on a closed handle", result["error"] or "")
+
+    def test_a_child_that_outlives_the_drain_window_is_killed(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        dsh = write_fake_dsh(root / "dsh")
+        env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
+        cfg = load_config(config_path=root / "config.json", env=env)
+        child_env = dict(env)
+        child_env.update({
+            "FAKE_DSH_MODE": "drain",
+            "FAKE_DSH_DRAIN_SECONDS": "10",
+        })
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, child_env, clear=False):
+            result = harness._execute_once_impl(
+                cfg, workspace, "drain forever", limit=0.3,
+                policy=safety.resolve({}, cfg), dsh_bin=str(dsh))
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["stop_reason"], "time_limit")
+        self.assertLess(elapsed, 6.0,
+                        "a child that ignores SIGTERM must be killed")
         self.assertNotIn("flush on a closed handle", result["error"] or "")
 
 

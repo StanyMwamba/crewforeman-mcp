@@ -46,8 +46,9 @@ that stops crosscheck false alarms from being counted.
   file contents. Any identity outside the allowlist blocks the push.
   `git_identity_exceptions` lists remotes that keep their own identity (for
   example a personal fork such as `StanyMwamba/Cypraea`); matching is exact
-  on the remote name, `owner/repo` or full URL, so a lookalike remote cannot
-  borrow the exception, and no personal address is hardcoded. The connector
+  on `owner/repo` or the full URL (a bare remote name is ignored), so a
+  lookalike remote or a re-pointed label cannot borrow the exception, and no
+  personal address is hardcoded. The connector
   installs the `pre-push` hook on the first commit/rebase it creates (an
   operator's own hook is preserved as `pre-push.local` and runs first) and
   exposes

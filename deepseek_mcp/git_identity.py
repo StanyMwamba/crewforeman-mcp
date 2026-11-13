@@ -81,7 +81,9 @@ def _git(repo, args, timeout=120):
     # ``GIT_CONFIG_COUNT``/``KEY_n``/``VALUE_n`` can inject a competing
     # user.email or core.hooksPath without touching any config file.
     for name in list(env):
-        if (name == "GIT_CONFIG_COUNT"
+        if (name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+                     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+                     "GIT_INDEX_FILE")
                 or name.startswith("GIT_CONFIG_KEY_")
                 or name.startswith("GIT_CONFIG_VALUE_")):
             env.pop(name, None)
@@ -383,9 +385,14 @@ def rebase_continue_with_identity(cfg, repo):
 
 
 def _remote_candidates(repo, remote):
+    """Return the resolved URLs for *remote* (never the user-local name).
+
+    A remote name is a local label: `git remote add origin <new-url>` would
+    let a bare ``origin`` exception exempt an arbitrary destination.  Exact
+    URL/owner-repo matching is the safe unit.
+    """
     values = []
     if remote:
-        values.append(str(remote))
         rc, out, _err = _git(repo, ["remote", "get-url", str(remote)])
         if rc == 0 and out.strip():
             values.append(out.strip())
@@ -418,17 +425,16 @@ def _remote_path(url):
 def exception_for_remote(cfg, repo, remote):
     """Return the exception entry matching this remote, or ``""``.
 
-    Matching is EXACT, not a substring: an entry may be the remote name
-    (``origin``), ``owner/repo``, or a full URL.  A substring match would let
-    an entry such as ``owner/repo`` exempt ``evil.example/fork-of-owner/repo``
-    and silence the identity gate for an unrelated push target.
+    Matching is EXACT, not a substring: an entry must be ``owner/repo`` or a
+    full URL.  A bare remote name is not accepted because it is a local label
+    that can be re-pointed at another URL; a lookalike path cannot borrow an
+    exception either.
     """
 
     entries = exceptions_from_config(cfg)
     if not entries or not remote:
         return ""
-    name = str(remote).strip().lower()
-    candidates = {name}
+    candidates = set()
     for value in _remote_candidates(repo, remote):
         raw = str(value or "").strip()
         if not raw:
