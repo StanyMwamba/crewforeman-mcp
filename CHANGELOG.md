@@ -104,6 +104,13 @@ that stops crosscheck false alarms from being counted.
   prove that `mode`, `crosscheck_*`, `audit_*`, `auto_parallel*` and
   `depends_on_policy` are advertised by the installed server, not only
   present in the source tree.
+- **Pipe EOF wakes the reader immediately.** The stdout pump used to report
+  EOF only when the waiting reader's poll expired, adding up to one
+  `STALL_POLL_SECONDS` interval to every child phase. The pump now posts a
+  sticky queue sentinel at real EOF, so the phase ends as soon as the writer
+  closes the pipe. Functionally identical output, but the 2205-test suite no
+  longer overruns the connector's 300 s deterministic gate; regression tests
+  in `tests/test_v3134_windows.py` fail on the old poll-bounded behaviour.
 
 ## 3.14.2
 

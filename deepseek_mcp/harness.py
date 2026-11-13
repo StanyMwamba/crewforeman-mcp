@@ -102,6 +102,10 @@ USE_STDOUT_PUMP = True
 # positive per-process request.  This sentinel means "not provided"; direct
 # callers keep using their per-process ``limit`` for the old fallback.
 _WHOLE_JOB_LIMIT_UNSET = object()
+# Queue sentinel posted by the pump at a real EOF.  Without it a blocked
+# ``read`` cannot see ``_eof`` until its poll timeout expires, which added one
+# full poll interval to every child phase (and to the deterministic gate).
+_STDOUT_EOF = object()
 
 
 class _StdoutPump:
@@ -150,6 +154,14 @@ class _StdoutPump:
             # close the read end under a still-running process group.
             if saw_eof:
                 self._real_eof.set()
+                # Wake a blocked reader immediately instead of making it
+                # discover the EOF at the end of its poll timeout.  If the
+                # bounded queue is full the reader already has data to drain
+                # and falls back to the ``_eof`` check on the next read.
+                try:
+                    self._queue.put_nowait(_STDOUT_EOF)
+                except queue.Full:
+                    pass
                 try:
                     self._stream.close()
                 except Exception:
@@ -158,9 +170,17 @@ class _StdoutPump:
     def read(self, timeout):
         """Return bytes, ``b""`` at EOF, or ``None`` when idle."""
         try:
-            return self._queue.get(timeout=timeout)
+            item = self._queue.get(timeout=timeout)
         except queue.Empty:
             return b"" if self._eof.is_set() else None
+        if item is _STDOUT_EOF:
+            # Keep EOF sticky: every later read must return ``b""`` too.
+            try:
+                self._queue.put_nowait(_STDOUT_EOF)
+            except queue.Full:
+                pass
+            return b""
+        return item
 
     def close(self):
         # Do not close the stream here: only the pump thread may close it,

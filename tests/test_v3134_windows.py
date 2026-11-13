@@ -11,6 +11,8 @@ failing on POSIX beforehand.
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -237,6 +239,56 @@ class StdoutPumpTests(unittest.TestCase):
             pump.close()
             stream.close()
         self.assertEqual(b"".join(chunks), b'{"type":"final","text":"ok"}\n')
+
+    def test_eof_wakes_a_blocked_read_before_the_timeout(self):
+        # Every child phase used to sit in ``read(timeout)`` for the full
+        # poll interval after the writer had already closed the pipe, because
+        # EOF only set an Event and never woke the queue.  The wait is what
+        # pushed the 2200-test suite past the connector's 300 s gate.
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+        pump = harness._StdoutPump(stream)
+        outcome = {}
+
+        def reader():
+            started = time.monotonic()
+            outcome["chunk"] = pump.read(2.0)
+            outcome["seconds"] = time.monotonic() - started
+
+        thread = threading.Thread(target=reader)
+        try:
+            thread.start()
+            time.sleep(0.05)
+            os.close(write_fd)
+            write_fd = None
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive(),
+                             "EOF did not wake the blocked pump reader")
+            self.assertEqual(outcome.get("chunk"), b"")
+            self.assertLess(
+                outcome.get("seconds", 2.0), 0.5,
+                "EOF was reported only after the poll timeout")
+        finally:
+            if write_fd is not None:
+                os.close(write_fd)
+            pump.close()
+            stream.close()
+
+    def test_eof_is_sticky_for_later_reads(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+        pump = harness._StdoutPump(stream)
+        try:
+            deadline = time.monotonic() + 1.0
+            first = pump.read(0.5)
+            while first is None and time.monotonic() < deadline:
+                first = pump.read(0.05)
+            self.assertEqual(first, b"")
+            self.assertEqual(pump.read(0.01), b"")
+        finally:
+            pump.close()
+            stream.close()
 
     def test_idle_pipe_returns_none(self):
         read_fd, write_fd = os.pipe()
