@@ -1506,13 +1506,18 @@ them every job keeps the 3.14.3 behaviour byte-for-byte.
 | `crosscheck_crew_provider` | empty | Checker-crew provider; `DSH_CROSSCHECK_CREW_PROVIDER` |
 | `crosscheck_crew_model` | empty | Checker-crew model; `DSH_CROSSCHECK_CREW_MODEL` |
 
-### Permissions: the per-run `mimocode.jsonc`
+### Permissions: `MIMOCODE_CONFIG_CONTENT`
 
 CrewForeman never passes the skip-permissions flag (and never the yolo
-alias) by default. Each MiMo child runs under a per-run `mimocode.jsonc`
-written into its workspace - never the user's global
-`~/.config/mimocode/mimocode.jsonc` - with `permission` globs mapped from
-the sandbox presets:
+alias) by default. Each MiMo child receives its `permission` globs -
+mapped from the sandbox presets below - through the
+`MIMOCODE_CONFIG_CONTENT` environment variable. The real CLI merges that
+content and it wins over any project `mimocode.jsonc`; CrewForeman writes
+nothing into the workspace and never touches the user's global
+`~/.config/mimocode/mimocode.jsonc`. (`mimo_permissions.write_run_config`
+remains available as an explicit, documented debug opt-in that writes the
+same content to `<workspace>/mimocode.jsonc`; `execute` exposes it as
+`write_config_file=True`.)
 
 - **`read-only`** (reviewers, audits, probes): `read`/`glob`/`grep`/`list`
   allowed, `edit` denied, `bash` a deny-map that allows only non-mutating
@@ -1532,6 +1537,12 @@ the sandbox presets:
 `--dangerously-skip-permissions` (env `DSH_MIMO_SKIP_PERMISSIONS` /
 `DEEPSEEK_MIMO_SKIP_PERMISSIONS`), and it is dangerous: it disables MiMo's
 permission checks entirely. Leave it `false` unless you accept that risk.
+
+In **attach mode** (`mimo serve` + `mimo run --attach`) the tools run
+inside the server process, so the same `MIMOCODE_CONFIG_CONTENT` is set on
+the **server** environment and the server is bound to that one preset: a
+read-only reviewer can never be attached to a workspace-write server -
+CrewForeman refuses a mismatched attach with a clear error.
 
 ### Concurrency detection and limit backoff
 

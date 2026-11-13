@@ -126,10 +126,13 @@ red, or a claim has not been run yet, the claim is narrowed, never widened.
   Attached runs speak the same JSONL event stream as a direct run
   (verified).
 - **`mimocode.jsonc` is MiMo's permission system, not an OS sandbox.** The
-  per-run file scopes what the MiMo worker may do inside its own rules; the
-  OS file-write boundary (Seatbelt / Landlock / restricted token) is a
-  separate layer described under Platform boundaries. The skip-permissions
-  opt-in disables even the MiMo-side checks and is dangerous.
+  permission map - delivered via `MIMOCODE_CONFIG_CONTENT` in the child (or
+  server) environment, never written into the workspace - scopes what the
+  MiMo worker may do inside its own rules; the OS file-write boundary
+  (Seatbelt / Landlock / restricted token) is a separate layer described
+  under Platform boundaries. The skip-permissions opt-in disables even the
+  MiMo-side checks and is dangerous. In attach mode one server is bound to
+  one preset; a mismatched attach is refused.
 - **Unknown MiMo prices stay unknown.** A model with no `mimo_prices` row
   and no built-in price records `cost_known=false` and a `null` cost; it is
   never zero-filled.
