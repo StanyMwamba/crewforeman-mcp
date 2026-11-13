@@ -5,6 +5,7 @@ Windows-compatible: pure file reads plus ``re``, no shell, no git.
 
 import json
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -107,8 +108,16 @@ class DocsTests(unittest.TestCase):
             encoding="utf-8"))
         self.assertEqual(data.get("phase_absolute_cap_seconds"),
                          config.DEFAULTS["phase_absolute_cap_seconds"])
-        cfg = config.load_config(config_path=ROOT / "config.example.json",
-                                 env={})
+        # Explicit env hides the suite's isolation overlay from load_config;
+        # pin every write root inside a temp dir.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        cfg = config.load_config(
+            config_path=ROOT / "config.example.json",
+            env={"DSH_STATE_DIR": str(root / "state"),
+                 "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                 "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs")})
         self.assertIsNone(
             harness._stall_hard_max_for_limit(cfg, 0, 1800.0),
             "config.example.json re-imposed an absolute cap on an "

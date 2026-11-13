@@ -20,6 +20,16 @@ README = REPO_ROOT / "README.md"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
 
+def _isolated_env(root):
+    # Explicit env hides the suite's isolation overlay from load_config;
+    # pin every write root inside the test's temp directory.
+    return {
+        "DSH_STATE_DIR": str(Path(root) / "state"),
+        "DEEPSEEK_MCP_LOG_DIR": str(Path(root) / "runs"),
+        "DEEPSEEK_MCP_JOBS_DIR": str(Path(root) / "jobs"),
+    }
+
+
 class StallConfigTests(unittest.TestCase):
     """R5: stall_seconds loading, precedence and config.example.json."""
 
@@ -32,7 +42,9 @@ class StallConfigTests(unittest.TestCase):
         path = self.root / name
         if file_data is not None:
             path.write_text(json.dumps(file_data), encoding="utf-8")
-        return load_config(config_path=path, env=env or {})
+        merged = _isolated_env(self.root)
+        merged.update(env or {})
+        return load_config(config_path=path, env=merged)
 
     def test_stall_seconds_default_is_480(self):
         cfg = self._load(env={})
@@ -68,7 +80,8 @@ class StallConfigTests(unittest.TestCase):
         self.assertIn("stall_seconds", data)
         self.assertEqual(data["stall_seconds"], 480)
 
-        cfg = load_config(config_path=CONFIG_EXAMPLE, env={})
+        cfg = load_config(config_path=CONFIG_EXAMPLE,
+                          env=_isolated_env(self.root))
         self.assertEqual(cfg.stall_seconds, 480.0)
 
 
@@ -84,7 +97,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(__version__, "3.15.0")
         self.assertEqual(config.SERVER_VERSION, "3.15.0")
 
-        cfg = load_config(config_path=self.root / "missing.json", env={})
+        cfg = load_config(config_path=self.root / "missing.json",
+                          env=_isolated_env(self.root))
         response = server.dispatch(
             "initialize", {"protocolVersion": "2025-06-18"}, cfg=cfg)
         self.assertNotIn("error", response)

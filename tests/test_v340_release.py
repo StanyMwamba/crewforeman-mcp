@@ -18,7 +18,14 @@ class ReleaseMetadataTests(unittest.TestCase):
     def cfg(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        return load_config(config_path=Path(tmp.name) / "missing.json", env={})
+        root = Path(tmp.name)
+        # Explicit env hides the suite's isolation overlay; pin the write
+        # roots so nothing resolves the real home state directory.
+        return load_config(config_path=root / "missing.json", env={
+            "DSH_STATE_DIR": str(root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+        })
 
     def test_version_is_current_everywhere(self):
         self.assertEqual(__version__, "3.15.0")
@@ -80,7 +87,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertTrue(data["render_probe"])
         self.assertTrue(data["transient_retry"])
         self.assertIn("chrome_bin", data)
-        cfg = load_config(config_path=CONFIG_EXAMPLE, env={})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        cfg = load_config(config_path=CONFIG_EXAMPLE, env={
+            "DSH_STATE_DIR": str(root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+        })
         self.assertTrue(cfg.child_progress)
         self.assertTrue(cfg.render_probe)
         self.assertEqual(cfg.render_probe_timeout, 12.0)

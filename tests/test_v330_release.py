@@ -23,12 +23,23 @@ CONTRIBUTORS_LABEL = re.compile(
     r"(?i)copyright\s*\(c\)[^\n]{0,80}\bcontributors?\b")
 
 
+def _isolated_env(root):
+    # Explicit env hides the suite's isolation overlay from load_config;
+    # pin every write root inside the test's temp directory.
+    return {
+        "DSH_STATE_DIR": str(Path(root) / "state"),
+        "DEEPSEEK_MCP_LOG_DIR": str(Path(root) / "runs"),
+        "DEEPSEEK_MCP_JOBS_DIR": str(Path(root) / "jobs"),
+    }
+
+
 class ReleaseMetadataTests(unittest.TestCase):
     def test_version_is_current_everywhere(self):
         self.assertEqual(__version__, "3.15.0")
         self.assertEqual(config.SERVER_VERSION, "3.15.0")
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(config_path=Path(tmp) / "missing.json", env={})
+            cfg = load_config(config_path=Path(tmp) / "missing.json",
+                              env=_isolated_env(tmp))
             response = server.dispatch(
                 "initialize", {"protocolVersion": "2025-06-18"}, cfg=cfg)
         self.assertNotIn("error", response)
@@ -37,7 +48,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertTrue(instructions.startswith(f"crewforeman-mcp {config.SERVER_VERSION}:"))
         self.assertNotIn("v3.1", instructions)
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = load_config(config_path=Path(tmp) / "missing.json", env={})
+            cfg = load_config(config_path=Path(tmp) / "missing.json",
+                              env=_isolated_env(tmp))
             tools = server.dispatch("tools/list", cfg=cfg)["result"]["tools"]
         harness_tool = {tool["name"]: tool for tool in tools}["harness_deepseek"]
         description = harness_tool["description"]
@@ -83,7 +95,9 @@ class ReleaseMetadataTests(unittest.TestCase):
         data = json.loads(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
         self.assertEqual(data["default_subagents"], 16)
         self.assertEqual(data["subagent_soft_cap"], 32)
-        cfg = load_config(config_path=CONFIG_EXAMPLE, env={})
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(config_path=CONFIG_EXAMPLE,
+                              env=_isolated_env(tmp))
         self.assertEqual(cfg.default_subagents, 16)
 
     def test_finisher_process_cap_matches_the_8_minute_task_text(self):

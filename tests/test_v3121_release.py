@@ -46,8 +46,14 @@ class ServerInfoTests(unittest.TestCase):
     def cfg(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        # Explicit env hides the suite's isolation overlay from load_config;
+        # pin every write root inside the temp dir.
         return config.load_config(
-            config_path=Path(tmp.name) / "missing.json", env={})
+            config_path=root / "missing.json",
+            env={"DSH_STATE_DIR": str(root / "state"),
+                 "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+                 "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs")})
 
     def test_initialize_server_info_matches_config(self):
         response = server.dispatch(

@@ -57,7 +57,14 @@ class ReleaseMetadataTests(unittest.TestCase):
     def cfg(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        return load_config(config_path=Path(tmp.name) / "missing.json", env={})
+        root = Path(tmp.name)
+        # Explicit env hides the suite's isolation overlay; pin the write
+        # roots so nothing resolves the real home state directory.
+        return load_config(config_path=root / "missing.json", env={
+            "DSH_STATE_DIR": str(root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+        })
 
     def test_version_and_instructions_are_360(self):
         self.assertEqual(__version__, "3.15.0")
@@ -101,7 +108,14 @@ class ReleaseMetadataTests(unittest.TestCase):
         for key in V350_KEYS:
             self.assertIn(key, example_data, "config.example missing %s" % key)
             self.assertIn(key, DEFAULTS, "unknown config key %s" % key)
-        cfg = load_config(config_path=CONFIG_EXAMPLE, env={})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        cfg = load_config(config_path=CONFIG_EXAMPLE, env={
+            "DSH_STATE_DIR": str(root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(root / "jobs"),
+        })
         self.assertEqual(cfg.sandbox, "workspace-write")
         self.assertEqual(cfg.reviewer_sandbox, "read-only")
         self.assertEqual(cfg.dsh_transport, "headless")

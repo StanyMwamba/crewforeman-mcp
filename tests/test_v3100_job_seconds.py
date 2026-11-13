@@ -23,8 +23,19 @@ class JobMaxSecondsTests(unittest.TestCase):
         self.workspace.mkdir()
         self.config_path = self.root / "config.json"
 
+    def _env(self, **extra):
+        # Explicit env hides the suite's isolation overlay from
+        # load_config, so pin every write root inside the temp dir.
+        env = {
+            "DSH_STATE_DIR": str(self.root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(self.root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(self.root / "jobs"),
+        }
+        env.update(extra)
+        return env
+
     def cfg(self):
-        return load_config(config_path=self.config_path, env={})
+        return load_config(config_path=self.config_path, env=self._env())
 
     def direct(self, cfg, **args):
         args.setdefault("workspace", str(self.workspace))
@@ -45,7 +56,7 @@ class JobMaxSecondsTests(unittest.TestCase):
 
     def test_environment_marks_job_max_seconds_explicit(self):
         cfg = load_config(config_path=self.config_path,
-                          env={"DSH_JOB_MAX_SECONDS": "1800"})
+                          env=self._env(DSH_JOB_MAX_SECONDS="1800"))
         self.assertTrue(cfg.is_explicit("job_max_seconds"))
         self.assertEqual(cfg.job_max_seconds, 1800.0)
 
@@ -111,11 +122,10 @@ class JobMaxSecondsTests(unittest.TestCase):
                          ("bin", "backup-dsh"))
         self.assertTrue(cfg.is_explicit("backup_dsh_bin"))
 
-        cfg = load_config(config_path=self.config_path, env={
-            "DEEPSEEK_BACKUP_BIN": "~/bin/other-dsh",
-            "DEEPSEEK_BACKUP_REVIEWER_VENDOR": "examplevendor",
-            "DSH_BACKUP_REVIEWER_MODEL": "examplevendor-large",
-        })
+        cfg = load_config(config_path=self.config_path, env=self._env(
+            DEEPSEEK_BACKUP_BIN="~/bin/other-dsh",
+            DEEPSEEK_BACKUP_REVIEWER_VENDOR="examplevendor",
+            DSH_BACKUP_REVIEWER_MODEL="examplevendor-large"))
         self.assertEqual(Path(cfg.backup_dsh_bin).parts[-2:],
                          ("bin", "other-dsh"))
         self.assertEqual(cfg.backup_reviewer_vendor, "examplevendor")

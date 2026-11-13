@@ -2,7 +2,9 @@
 
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from deepseek_mcp import builder_practices as bp
 from deepseek_mcp.config import SERVER_VERSION, load_config
@@ -114,18 +116,31 @@ class RecordTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        # Explicit env dicts hide the suite's isolation overlay from
+        # load_config; pin every write root inside a temp dir so no config
+        # load can resolve the real home state root.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.env = {
+            "DSH_STATE_DIR": str(self.root / "state"),
+            "DEEPSEEK_MCP_LOG_DIR": str(self.root / "runs"),
+            "DEEPSEEK_MCP_JOBS_DIR": str(self.root / "jobs"),
+        }
+
     def test_server_version(self):
         self.assertEqual(SERVER_VERSION, "3.15.0")
 
     def test_builder_practices_default_true(self):
-        cfg = load_config(env={}, include_file=False)
+        cfg = load_config(env=dict(self.env), include_file=False)
         self.assertIs(cfg.builder_practices, True)
 
     def test_builder_practices_env_off_on(self):
-        off = load_config(env={"DSH_BUILDER_PRACTICES": "off"},
+        off = load_config(env=dict(self.env, DSH_BUILDER_PRACTICES="off"),
                           include_file=False)
         self.assertIs(off.builder_practices, False)
-        on = load_config(env={"DSH_BUILDER_PRACTICES": "on"},
+        on = load_config(env=dict(self.env, DSH_BUILDER_PRACTICES="on"),
                          include_file=False)
         self.assertIs(on.builder_practices, True)
 
