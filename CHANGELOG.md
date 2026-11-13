@@ -70,8 +70,7 @@ that stops crosscheck false alarms from being counted.
   each repro once before the finding counts, in a disposable workspace copy
   with a fresh HOME/desktop profile (common secret files are not copied;
   a copy that is too large or unreadable fails closed instead of running in
-  place; the repro uses the host's OS boundary when it can be nested), and
-  requires at least four characters of claimed output; findings that do not reproduce are dropped and counted as
+  place), and requires at least four characters of claimed output; findings that do not reproduce are dropped and counted as
   `false_alarm_filtered`. Records report
   `raw_findings`, `unique`, `real`, `false_alarm`, `false_alarm_filtered`,
   `unverified` and breaker/spec counts.

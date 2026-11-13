@@ -187,12 +187,9 @@ profile stores are not exposed. A copy that is too large (over 256 MiB) or
 cannot be read fails closed: the affected findings are unverified and no
 command runs in the operator's tree. This is **not** a security sandbox: a
 repro that names an absolute path outside the copy can still read it, and the
-command runs with the operator's network access. Where the host provides an
-enforced OS boundary, the repro is wrapped in the same best-effort
-workspace-write policy as a builder; a host that cannot nest the boundary
-(e.g. the macOS test sandbox) runs the scrubbed subprocess instead. Treat
-crosscheck findings as input from your own crews and run the job in a
-workspace that does not hold secrets. The copy is removed afterwards so a repro cannot mutate the
+command runs with the operator's network access. Treat crosscheck findings as
+input from your own crews and run the job in a workspace that does not hold
+secrets. The copy is removed afterwards so a repro cannot mutate the
 operator's tree. The observed output must contain the claimed output (at
 least four characters, so `1` or `x` cannot match by accident);
 an explicit `exit_code` pins the status when the finder cares about it. A

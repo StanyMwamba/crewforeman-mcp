@@ -767,16 +767,6 @@ def _repro_run(command, cwd, timeout):
     store even when it uses an absolute path below ``~``.
     """
     argv = _repro_argv(command)
-    # Best-effort: reuse the connector's OS boundary when this host can
-    # provide one. Nested/dev hosts fall back to the scrubbed subprocess.
-    try:
-        from . import safety as safety_mod
-        policy = safety_mod.resolve({"sandbox": "workspace-write"}, {})
-        wrapped, meta = safety_mod.wrap_command(argv, policy, str(cwd))
-        if wrapped and meta.get("wrapped") and not meta.get("blocked"):
-            argv = wrapped
-    except Exception:  # noqa: BLE001 - the scrub/timeout still applies
-        pass
     kwargs = {}
     if os.name == "posix":
         kwargs["start_new_session"] = True
