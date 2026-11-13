@@ -168,6 +168,25 @@ class GitIdentityTest(unittest.TestCase):
                              ["crewforeman-mcp", "noreply@example.com",
                               "crewforeman-mcp", "noreply@example.com"])
 
+    def test_linked_worktree_commit_uses_identity_and_gate(self):
+        self.commit("base", "base.txt")
+        worktree = self.root / "linked"
+        self.git("worktree", "add", "-q", "-b", "topic", str(worktree))
+        (worktree / "work.txt").write_text("work\n", encoding="utf-8")
+        self.assertEqual(_run(["add", "-A"], worktree).returncode, 0)
+        rc, _out, err = git_identity.commit_with_identity(
+            CFG, worktree, "worktree commit")
+        self.assertEqual(rc, 0, err)
+        ident = _run(["log", "-1", "--format=%an|%ae|%cn|%ce"], worktree)
+        self.assertEqual(ident.stdout.strip(),
+                         "crewforeman-mcp|noreply@example.com|"
+                         "crewforeman-mcp|noreply@example.com")
+        hooks = _run(["rev-parse", "--git-path", "hooks"], worktree).stdout.strip()
+        hook_path = Path(hooks)
+        if not hook_path.is_absolute():
+            hook_path = worktree / hook_path
+        self.assertTrue((hook_path / "pre-push").is_file())
+
     def test_metadata_gate_blocks_foreign_author_email(self):
         base = self.commit("base", "base.txt")
         self.foreign_commit("foreign")
@@ -238,6 +257,17 @@ class GitIdentityTest(unittest.TestCase):
                 cfg, repo=str(self.repo), base=base, head="HEAD",
                 remote="upstream")
             self.assertTrue(report["ok"], (entry, report["messages"]))
+
+    def test_exception_matches_a_direct_url_push(self):
+        base = self.commit("base", "base.txt")
+        self.foreign_commit("foreign")
+        cfg = {"git_identity": dict(CFG["git_identity"]),
+               "git_identity_exceptions": ["example-org/Cypraea"]}
+        report = git_identity.check_push(
+            cfg, repo=str(self.repo), base=base, head="HEAD",
+            remote="https://github.com/example-org/Cypraea.git")
+        self.assertTrue(report["ok"], report["messages"])
+        self.assertEqual(report["exception"], "example-org/Cypraea")
 
     def test_bare_remote_name_is_not_an_exception(self):
         base = self.commit("base", "base.txt")

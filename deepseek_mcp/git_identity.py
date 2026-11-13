@@ -434,8 +434,13 @@ def exception_for_remote(cfg, repo, remote):
     entries = exceptions_from_config(cfg)
     if not entries or not remote:
         return ""
+    values = list(_remote_candidates(repo, remote))
+    if "://" in str(remote) or "@" in str(remote):
+        # A direct-URL push passes the URL instead of a configured name; the
+        # URL is still an exact, non-spoofable match target.
+        values.append(str(remote))
     candidates = set()
-    for value in _remote_candidates(repo, remote):
+    for value in values:
         raw = str(value or "").strip()
         if not raw:
             continue

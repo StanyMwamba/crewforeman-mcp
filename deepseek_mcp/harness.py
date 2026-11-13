@@ -3681,8 +3681,10 @@ def _execute_once_impl(cfg, workspace, task, limit=None, progress_cb=None, label
         "stall_elapsed": stall_elapsed,
         "stall_seconds": stall_limit,
         "stall_max_seconds": stall_cap,
-        "stall_cap_hard_max_seconds": (_stall_cap_hard_max(cfg)
-                                       if stall_cap is not None else None),
+        # The effective ceiling, not the configured one: an unlimited job
+        # with no phase deadline must record None instead of the built-in
+        # 7200 s cap the caller disabled.
+        "stall_cap_hard_max_seconds": stall_hard_cap,
         "stall_cap_hit": bool(stall_state.get("cap_hit")),
         "stall_cap_extensions": int(watch.cap_extensions()),
         "stall_cap_grace_seconds": _cap_grace(cfg),

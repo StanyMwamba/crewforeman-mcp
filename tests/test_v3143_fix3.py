@@ -18,6 +18,8 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from deepseek_mcp import authority, budget, harness  # noqa: E402
+from deepseek_mcp.config import load_config  # noqa: E402
+from tests.fakes import base_env, write_fake_dsh  # noqa: E402
 
 
 class FakeCfg(dict):
@@ -187,6 +189,33 @@ class ZeroJobDeadlineStallCapTest(unittest.TestCase):
         self.assertEqual(harness._job_seconds_display(0.0), "unlimited")
         self.assertIsNone(harness._job_seconds_display(None))
         self.assertEqual(harness._job_seconds_display(7200.0), "7200s")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class UnlimitedRunRecordTest(unittest.TestCase):
+    """The run record must not re-introduce the 7200 s cap it disabled."""
+
+    def test_zero_job_records_no_hard_stall_cap(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        dsh = write_fake_dsh(root / "dsh")
+        env = base_env(root, fake_dsh=dsh, sessions=root / "sessions")
+        cfg = load_config(config_path=root / "config.json", env=env)
+        _text, run, _path = harness.run_harness({
+            "prompt": "small task", "subagents": 0, "quality": False,
+            "workspace": str(workspace), "job_max_seconds": 0,
+        }, cfg)
+        self.assertEqual(run["job_max_seconds"], 0)
+        self.assertEqual(run["job_max_seconds_display"], "unlimited")
+        self.assertIsNone(
+            run["builder"]["stall_cap_hard_max_seconds"],
+            "an unlimited job must not record or apply the 7200 s hard cap")
 
 
 if __name__ == "__main__":
