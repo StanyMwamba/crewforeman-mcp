@@ -305,7 +305,8 @@ return {maxActive, started, failures};
 """ % int(n)
     return (
         "This is a one-off Harness concurrency probe. Do not create deliverables and do not "
-        "modify existing files. Use the workflow tool ONCE with exactly this JavaScript body "
+        "modify existing files; the only file you may write is `concurrency-probe.json` "
+        "described below. Use the workflow tool ONCE with exactly this JavaScript body "
         "(meta name: concurrency-probe):\n\n"
         "```javascript\n%s```\n\n"
         "The workflow must launch %d trivial agents at the same time. Each agent prompt is just "
