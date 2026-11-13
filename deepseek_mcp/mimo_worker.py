@@ -49,6 +49,14 @@ text part is returned unchanged).  Usage sums every ``step_finish`` and
 CLI-reported ``part.cost`` sum (``cost_source: "vendor"``), else the price
 table (``cost_source: "price_table"``), else unknown (``cost_known``
 False, ``estimated_cost_usd`` None -- never 0.0 with known True).
+
+Permission config is delivered through the ``MIMOCODE_CONFIG_CONTENT`` env
+var (a JSON string the real CLI merges over the project's own
+``mimocode.jsonc``); :func:`execute` never writes the config into the
+workspace unless ``write_config_file=True`` (debugging opt-in).  With
+``--attach`` the tools run inside the ``mimo serve`` process, so the config
+belongs in the server env: :class:`MimoServer` is bound to ONE normalized
+preset and :func:`execute` refuses a missing or mismatched ``attach_server``.
 """
 
 import base64
@@ -398,6 +406,10 @@ def classify_error(message, status_code=None):
 
 def _noise_output(rel):
     low = str(rel).replace("\\", "/").lower()
+    if ".mimocode" in low.split("/"):
+        # Everything under MiMo's own ``.mimocode/`` state dir (.cron-lock,
+        # .gitignore, ...) is output noise: never reported, never deleted.
+        return True
     base = low.rsplit("/", 1)[-1]
     if base in ("mimocode.jsonc", ".ds_store"):
         return True
@@ -531,9 +543,9 @@ def _popen_kwargs():
     return kwargs
 
 
-def _fallback_write_run_config(preset, workspace, path=None):
+def _fallback_render_config(preset, workspace):
+    """Standalone-mode config JSON (no ``mimo_permissions`` packaged)."""
     root = Path(workspace)
-    target = Path(path) if path else root / "mimocode.jsonc"
     allow = {"read": "allow", "glob": "allow", "grep": "allow", "list": "allow",
              "task": "allow", "actor": "allow", "skill": "allow",
              "webfetch": "allow"}
@@ -544,18 +556,47 @@ def _fallback_write_run_config(preset, workspace, path=None):
     else:
         permission = dict(allow, edit="allow", bash="allow")
     permission["external_directory"] = {"*": "deny", str(root) + "/**": "allow"}
+    return json.dumps({"permission": permission}, indent=2)
+
+
+def _fallback_write_run_config(preset, workspace, path=None):
+    root = Path(workspace)
+    target = Path(path) if path else root / "mimocode.jsonc"
     try:
-        target.write_text(json.dumps({"permission": permission}, indent=2),
+        target.write_text(_fallback_render_config(preset, workspace),
                           encoding="utf-8")
     except Exception:
         pass
     return target
 
 
+def _render_config(preset, workspace):
+    """Render one run's permission config as JSON text.
+
+    This text is the ``MIMOCODE_CONFIG_CONTENT`` env value handed to the
+    child; nothing is written to disk here.
+    """
+    if mimo_permissions is not None:
+        return mimo_permissions.render_mimocode_jsonc(preset, workspace)
+    return _fallback_render_config(preset, workspace)
+
+
 def _write_run_config(preset, workspace):
+    """Debugging opt-in only: persist the config as ``mimocode.jsonc``."""
     if mimo_permissions is not None:
         return mimo_permissions.write_run_config(preset, workspace)
     return _fallback_write_run_config(preset, workspace)
+
+
+def _normalize_preset(value):
+    """Canonical preset name (aliases included); ValueError on garbage."""
+    if mimo_permissions is not None:
+        return mimo_permissions.normalize_preset(value)
+    text = str(value or "").strip().lower().replace(" ", "-")
+    if text in PRESETS:
+        return text
+    raise ValueError("invalid sandbox preset; expected read-only, "
+                     "workspace-write or danger-full-access")
 
 
 def _skip_permissions_args(cfg):
@@ -583,8 +624,12 @@ def _preset_for_role(role, cfg=None):
 
 def _resolve_preset(cfg, sandbox, label):
     for candidate in (sandbox, _cfg_get(cfg, "mimo_sandbox", None)):
-        if isinstance(candidate, str) and candidate in PRESETS:
-            return candidate
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        try:
+            return _normalize_preset(candidate)
+        except ValueError:
+            continue
     return _preset_for_role(label, cfg)
 
 
@@ -637,36 +682,65 @@ def _estimate_cost(entry, tokens_in, cache_read, tokens_out):
 
 def execute(cfg, workspace, task, *, model=None, variant=None, session_id=None,
             label="builder", progress_cb=None, sandbox="workspace-write",
-            attach_url=None, cancel_check=None, timeout=None,
-            mimo_bin=None, live_usage_cb=None, server_password=None):
+            attach_url=None, attach_server=None, cancel_check=None, timeout=None,
+            mimo_bin=None, live_usage_cb=None, server_password=None,
+            write_config_file=False):
     """Run one ``mimo run`` job and return a harness-compatible result dict.
 
     Streams JSONL events off stdout, accumulates step usage, scans the
     workspace for changed files, classifies vendor errors and honours
     ``timeout`` / ``cancel_check``.  Temp files honour TMPDIR.
 
+    The permission map is delivered to the child as the
+    ``MIMOCODE_CONFIG_CONTENT`` env var (a JSON string the real CLI merges
+    over the project's own ``mimocode.jsonc``) -- nothing is written into
+    the workspace.  ``write_config_file=True`` is a documented DEBUGGING
+    opt-in that also writes ``<workspace>/mimocode.jsonc`` via
+    ``mimo_permissions.write_run_config``.
+
     ``server_password`` reaches the child only through the
     ``MIMOCODE_SERVER_PASSWORD`` env var (never argv) so attach runs can
     authenticate to ``mimo serve``.  The password is scrubbed out of every
     string this function returns and is never recorded anywhere.
+
+    With ``attach_url`` the tools run inside the ``mimo serve`` process, so
+    the permission config lives in the SERVER env: ``attach_server`` (the
+    :class:`MimoServer` instance) is REQUIRED and must be bound to the same
+    normalized preset this execution resolves -- a mismatch raises
+    ``RuntimeError`` before the child is invoked.
     """
     started = time.time()
     workspace = Path(workspace)
     secret = str(server_password) if server_password else ""
-    child_env = None
+    preset = _resolve_preset(cfg, sandbox, label)
+    if attach_url:
+        if attach_server is None:
+            raise RuntimeError(
+                "attach_url is set without attach_server: with --attach the "
+                "tools run inside the mimo serve process, so the permission "
+                "config must come from the server env; pass the MimoServer "
+                "instance (bound to one preset) as attach_server")
+        server_preset = getattr(attach_server, "preset", None)
+        if server_preset != preset:
+            raise RuntimeError(
+                "attach preset mismatch: server is bound to '%s', execution "
+                "requested '%s'" % (server_preset, preset))
+    child_env = os.environ.copy()
+    child_env["MIMOCODE_CONFIG_CONTENT"] = _render_config(preset, workspace)
     if secret:
-        child_env = os.environ.copy()
         child_env["MIMOCODE_SERVER_PASSWORD"] = secret
     model = (model or _cfg_get(cfg, "mimo_default_model") or DEFAULT_MODEL)
     variant = variant or _cfg_get(cfg, "mimo_variant") or None
     if not variant:
         variant = None
     binary = mimo_bin or _cfg_get(cfg, "mimo_bin") or DEFAULT_MIMO_BIN
-    preset = _resolve_preset(cfg, sandbox, label)
-    try:
-        _write_run_config(preset, workspace)
-    except Exception:
-        pass
+    if write_config_file:
+        # Debugging opt-in only: the config normally reaches the child
+        # through MIMOCODE_CONFIG_CONTENT and is never written to disk.
+        try:
+            _write_run_config(preset, workspace)
+        except Exception:
+            pass
     skip_args = _skip_permissions_args(cfg)
     argv = build_argv(task, workspace, model, variant=variant,
                       session_id=session_id, attach_url=attach_url,
@@ -979,16 +1053,29 @@ class MimoServer:
     handed to the child only through the ``MIMOCODE_SERVER_PASSWORD`` env
     var (never argv) and exposed as :attr:`password` so attach runs can
     authenticate.  The password is never logged or included in error text.
+
+    A server is bound to ONE sandbox preset: ``sandbox`` (aliases accepted)
+    is normalized into :attr:`preset` at construction and ``workspace`` is
+    kept as :attr:`workspace`.  Because ``mimo run --attach`` tools execute
+    inside this process, :meth:`start` renders the permission map from
+    (preset, workspace) and delivers it through the ``MIMOCODE_CONFIG_CONTENT``
+    env var of the serve child -- that map is the only permission config an
+    attached execution gets.  :func:`execute` refuses to attach a run whose
+    preset differs from this one (and refuses ``attach_url`` without the
+    server object).
     """
 
     def __init__(self, cfg, *, mimo_bin=None, host="127.0.0.1", port=0,
-                 ready_timeout=20.0):
+                 ready_timeout=20.0, workspace=None,
+                 sandbox="workspace-write"):
         self.cfg = cfg
         self.mimo_bin = (mimo_bin or _cfg_get(cfg, "mimo_bin")
                          or DEFAULT_MIMO_BIN)
         self.host = str(host or "127.0.0.1")
         self.port = int(port or 0)
         self.ready_timeout = float(ready_timeout)
+        self.workspace = workspace
+        self.preset = _normalize_preset(sandbox)
         self.password = None
         self._proc = None
         self._url = None
@@ -1004,6 +1091,11 @@ class MimoServer:
                 "--port", str(self.port)]
         env = os.environ.copy()
         env["MIMOCODE_SERVER_PASSWORD"] = self.password
+        if self.workspace:
+            # Attach-mode tools run inside this process: the bound preset's
+            # permission map must live in the SERVER env.
+            env["MIMOCODE_CONFIG_CONTENT"] = _render_config(
+                self.preset, self.workspace)
         self._stderr_path = _stderr_path()
         stderr_handle = open(self._stderr_path, "w", encoding="utf-8")
         try:

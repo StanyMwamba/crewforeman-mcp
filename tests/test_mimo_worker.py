@@ -26,6 +26,7 @@ import urllib.request
 from pathlib import Path
 
 from deepseek_mcp import mimo_worker
+from deepseek_mcp import mimo_permissions
 
 try:
     from tests import fakes as _fakes
@@ -58,13 +59,24 @@ if capture:
         pass
 
 # Record password-env PRESENCE only -- never the value: the password must
-# not land in any capture that gets serialised.
+# not land in any capture that gets serialised.  MIMOCODE_CONFIG_CONTENT is
+# captured as presence plus its resolved edit/bash rules (self-contained
+# inline convention; never the whole document).
 state_path = os.environ.get("FAKE_MIMO_STATE")
 if state_path:
     try:
         state = {}
         if os.environ.get("MIMOCODE_SERVER_PASSWORD"):
             state["password_env"] = True
+        config_env = os.environ.get("MIMOCODE_CONFIG_CONTENT")
+        if config_env:
+            state["mimocode_config_env"] = True
+            try:
+                permission = json.loads(config_env).get("permission") or {}
+                state["mimocode_config_edit"] = permission.get("edit")
+                state["mimocode_config_bash"] = permission.get("bash")
+            except Exception:
+                pass
         Path(state_path).write_text(json.dumps(state), encoding="utf-8")
     except Exception:
         pass
@@ -312,6 +324,12 @@ emit_step_finish({"total": 50, "input": 20, "output": 15, "reasoning": 5,
 try:
     (workspace / "out.txt").write_text("done\n", encoding="utf-8")
     (workspace / ".fake-mimo-state.json").write_text("{}", encoding="utf-8")
+    if mode == "noise":
+        # MiMo's own state dir: must never surface in output_files.
+        noise_dir = workspace / ".mimocode"
+        noise_dir.mkdir(parents=True, exist_ok=True)
+        (noise_dir / ".cron-lock").write_text("lock\n", encoding="utf-8")
+        (noise_dir / ".gitignore").write_text("*\n", encoding="utf-8")
 except Exception:
     pass
 emit_text(forced_text if forced_text is not None else "final answer")
@@ -754,24 +772,108 @@ class MimoWorkerCase(unittest.TestCase):
         self.addCleanup(setattr, mimo_worker, "mimo_permissions", saved)
         result = mimo_worker.execute(
             self.cfg(mimo_skip_permissions=True), self.workspace, "fallback",
-            timeout=15)
+            write_config_file=True, timeout=15)
         self.assertEqual(result["status"], "ok")
+        # write_config_file=True is the documented debugging opt-in that
+        # persists the config; the env channel still carries it standalone.
         self.assertTrue((self.workspace / "mimocode.jsonc").is_file())
+        self.assertTrue(self.captured_state().get("mimocode_config_env"))
         self.assertIn("--dangerously-skip-permissions", self.captured_argv())
         self.assert_cost_invariant(result)
+        (self.workspace / "mimocode.jsonc").unlink()
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "fallback without the opt-in",
+            timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse((self.workspace / "mimocode.jsonc").exists())
+
+    # -- config via env, never the workspace -----------------------------
+
+    def test_execute_never_writes_config_into_workspace(self):
+        # (a) regression: execute must not create or touch mimocode.jsonc
+        # anywhere in the workspace -- a pre-existing project config stays
+        # byte-identical and no new config file appears.
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "clean run", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(sorted(self.workspace.rglob("mimocode.jsonc")), [])
+        original = b'{\n  "permission": {"edit": "allow"}\n}\n'
+        config = self.workspace / "mimocode.jsonc"
+        config.write_bytes(original)
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "respect my config", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(sorted(self.workspace.rglob("mimocode.jsonc")),
+                         [config])
+        self.assertNotIn("mimocode.jsonc", result["output_files"])
+
+    def test_execute_config_env_carries_permission_map(self):
+        # (b) the child env carries MIMOCODE_CONFIG_CONTENT; the inline fake
+        # records its presence plus the resolved edit/bash rules.
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "read only run", sandbox="read-only",
+            timeout=15)
+        self.assertEqual(result["status"], "ok")
+        state = self.captured_state()
+        self.assertIs(state.get("mimocode_config_env"), True)
+        self.assertEqual(state.get("mimocode_config_edit"), "deny")
+        self.assertEqual((state.get("mimocode_config_bash") or {}).get("*"),
+                         "deny")
+        self.assertFalse((self.workspace / "mimocode.jsonc").exists())
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "builder run", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        state = self.captured_state()
+        self.assertIs(state.get("mimocode_config_env"), True)
+        self.assertEqual(state.get("mimocode_config_edit"), "allow")
+        self.assertEqual((state.get("mimocode_config_bash") or {}).get("*"),
+                         "allow")
+
+    def test_execute_write_config_file_debug_opt_in(self):
+        # (c) write_config_file=True writes the file and its content matches
+        # the rendered config (the same text delivered via the env var).
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "debug config", write_config_file=True,
+            timeout=15)
+        self.assertEqual(result["status"], "ok")
+        config = self.workspace / "mimocode.jsonc"
+        self.assertTrue(config.is_file())
+        expected = mimo_permissions.render_mimocode_jsonc(
+            "workspace-write", self.workspace)
+        self.assertEqual(config.read_text(encoding="utf-8"), expected)
+        self.assertTrue(self.captured_state().get("mimocode_config_env"))
+
+    def test_mimocode_state_dir_never_reported_as_output(self):
+        # (f) MiMo's own .mimocode/ state files are noise: on disk, not
+        # deleted, never in output_files -- while a real output still is.
+        self.setenv(FAKE_MIMO_MODE="noise")
+        result = mimo_worker.execute(
+            self.cfg(), self.workspace, "noise run", timeout=15)
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("out.txt", result["output_files"])
+        self.assertNotIn(".mimocode/.cron-lock", result["output_files"])
+        self.assertNotIn(".mimocode/.gitignore", result["output_files"])
+        self.assertFalse([name for name in result["output_files"]
+                          if name.replace("\\", "/").startswith(".mimocode/")
+                          or name == ".mimocode"])
+        self.assertTrue((self.workspace / ".mimocode" / ".cron-lock").is_file())
+        self.assertTrue((self.workspace / ".mimocode" / ".gitignore").is_file())
 
     # -- MimoServer ------------------------------------------------------
 
     def test_mimo_server_lifecycle_serve_attach_stop_cleanup(self):
         cfg = self.cfg()
         server = mimo_worker.MimoServer(
-            cfg, host="127.0.0.1", port=0, ready_timeout=15.0)
+            cfg, host="127.0.0.1", port=0, ready_timeout=15.0,
+            workspace=self.workspace)
         try:
             url = server.start()
             self.assertTrue(url.startswith("http://127.0.0.1:"))
             self.assertTrue(server.ready())
             result = mimo_worker.execute(
                 cfg, self.workspace, "attach task", attach_url=url,
+                attach_server=server,
                 server_password=server.password, timeout=15)
             self.assertEqual(result["status"], "ok")
             captured = self.captured_argv()
@@ -854,11 +956,72 @@ class MimoWorkerCase(unittest.TestCase):
             self.assertTrue(mimo_worker._health_request(url, server.password))
             result = mimo_worker.execute(
                 self.cfg(), self.workspace, "attach task", attach_url=url,
+                attach_server=server,
                 server_password=server.password, timeout=15)
             self.assertEqual(result["status"], "ok")
             captured = self.captured_argv()
             self.assertIn("--attach", captured)
             self.assertEqual(captured[captured.index("--attach") + 1], url)
+        finally:
+            server.cleanup()
+
+    def test_mimo_server_binds_normalized_preset_and_config_env(self):
+        # (d) a read-only server delivers the read-only map through
+        # MIMOCODE_CONFIG_CONTENT in the serve child env and exposes the
+        # normalized preset for attach-time enforcement.
+        server = mimo_worker.MimoServer(
+            self.cfg(), workspace=self.workspace, sandbox="read-only",
+            host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            server.start()
+            self.assertEqual(server.preset, "read-only")
+            self.assertEqual(server.workspace, self.workspace)
+            state = self.captured_state()
+            self.assertIs(state.get("mimocode_config_env"), True)
+            self.assertEqual(state.get("mimocode_config_edit"), "deny")
+            self.assertEqual((state.get("mimocode_config_bash") or {}).get("*"),
+                             "deny")
+        finally:
+            server.cleanup()
+        self.assertEqual(
+            mimo_worker.MimoServer(self.cfg(), sandbox="ro").preset,
+            "read-only")
+        self.assertEqual(mimo_worker.MimoServer(self.cfg()).preset,
+                         "workspace-write")
+
+    def test_attach_server_preset_binding_enforced(self):
+        # (e) a matching attach_server runs; a mismatched preset is refused
+        # before the fake mimo is ever invoked; attach_url without
+        # attach_server is refused just as clearly.
+        server = mimo_worker.MimoServer(
+            self.cfg(), workspace=self.workspace, sandbox="workspace-write",
+            host="127.0.0.1", port=0, ready_timeout=15.0)
+        try:
+            url = server.start()
+            result = mimo_worker.execute(
+                self.cfg(), self.workspace, "attach ok", attach_url=url,
+                attach_server=server,
+                server_password=server.password, timeout=15)
+            self.assertEqual(result["status"], "ok")
+            self.assertIn("--attach", self.captured_argv())
+            self.argv_capture.unlink()
+            with self.assertRaises(RuntimeError) as caught:
+                mimo_worker.execute(
+                    self.cfg(), self.workspace, "attach mismatch",
+                    attach_url=url, attach_server=server, sandbox="read-only",
+                    server_password=server.password, timeout=15)
+            message = str(caught.exception)
+            self.assertIn("attach preset mismatch", message)
+            self.assertIn("'workspace-write'", message)
+            self.assertIn("'read-only'", message)
+            self.assertFalse(self.argv_capture.exists())  # fake never ran
+            with self.assertRaises(RuntimeError) as caught:
+                mimo_worker.execute(
+                    self.cfg(), self.workspace, "attach without server",
+                    attach_url=url, server_password=server.password,
+                    timeout=15)
+            self.assertIn("attach_server", str(caught.exception))
+            self.assertFalse(self.argv_capture.exists())  # fake never ran
         finally:
             server.cleanup()
 
