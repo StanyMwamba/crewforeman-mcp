@@ -263,7 +263,9 @@ class GitIdentityTest(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", base)
         self.foreign_commit("foreign")
         old_pythonpath = os.environ.get("PYTHONPATH")
+        old_cf_python = os.environ.get("CF_PYTHON")
         os.environ["PYTHONPATH"] = str(REPO_ROOT)
+        os.environ["CF_PYTHON"] = sys.executable
         try:
             rc, _out, err = git_identity.push_with_gate(
                 CFG, self.repo, "origin", "main:refs/heads/main", base=base)
@@ -286,6 +288,10 @@ class GitIdentityTest(unittest.TestCase):
                 os.environ.pop("PYTHONPATH", None)
             else:
                 os.environ["PYTHONPATH"] = old_pythonpath
+            if old_cf_python is None:
+                os.environ.pop("CF_PYTHON", None)
+            else:
+                os.environ["CF_PYTHON"] = old_cf_python
 
     def test_content_scan_still_catches_secret(self):
         base = self.commit("base", "base.txt")
