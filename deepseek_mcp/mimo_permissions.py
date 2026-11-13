@@ -1,7 +1,17 @@
 """Per-run ``mimocode.jsonc`` permission maps for MiMo Code workers.
 
-MiMo Code picks up a ``mimocode.jsonc`` from its ``--dir`` workspace.  This
-module renders that file from CrewForeman's sandbox presets so a run is
+The PRIMARY delivery channel is the ``MIMOCODE_CONFIG_CONTENT`` env var: the
+rendered JSON text is placed in the worker child's (or the ``mimo serve``
+child's) environment, where the real CLI merges it and it WINS over the
+project's own ``mimocode.jsonc`` (verified on mimo 0.1.17 via ``mimo debug
+config``).  Nothing is ever written into the user's workspace on the normal
+path.
+
+:func:`write_run_config` (the on-disk ``<workspace>/mimocode.jsonc``) is an
+EXPLICIT debugging opt-in only -- ``mimo_worker.execute(...,
+write_config_file=True)`` -- never the default.
+
+This module renders that map from CrewForeman's sandbox presets so a run is
 sandboxed by construction and never needs ``--dangerously-skip-permissions``.
 
 Presets (``PRESETS``), with the same alias normalization as
@@ -193,6 +203,10 @@ def _permission_map(preset, root, extra):
 def render_mimocode_jsonc(preset, workspace, *, extra_deny=None) -> str:
     """Return the ``mimocode.jsonc`` text for one run.
 
+    This text is the value handed to the child as ``MIMOCODE_CONFIG_CONTENT``
+    (the primary delivery channel); ``write_run_config`` persists the same
+    text only as a debugging opt-in.
+
     ``extra_deny`` is an optional string (or sequence of strings) of bash globs
     appended as deny entries -- honoured for every preset, including
     ``danger-full-access``, so an explicit caller constraint always lands.
@@ -209,6 +223,11 @@ def render_mimocode_jsonc(preset, workspace, *, extra_deny=None) -> str:
 
 def write_run_config(preset, workspace, *, path=None) -> Path:
     """Atomically write the rendered config and return its absolute path.
+
+    Debugging opt-in only -- the normal delivery channel is the
+    ``MIMOCODE_CONFIG_CONTENT`` env var (see the module docstring); callers
+    such as ``mimo_worker.execute`` only write this file when explicitly
+    asked (``write_config_file=True``).
 
     Writes ``<workspace>/mimocode.jsonc`` (or ``path``) and creates missing
     parent directories.  ``path`` must stay inside ``workspace`` -- the user's
