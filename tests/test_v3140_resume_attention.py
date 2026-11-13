@@ -55,10 +55,13 @@ class ResumeAttentionTests(unittest.TestCase):
             "DEEPSEEK_API_KEY": "test-key-not-real",
         }
         self.cfg = load_config(config_path=self.root / "config.json", env=env)
-        # load_config prefers the ambient environment; pin the temp state so
-        # the test never reads the operator's real run history.
+        # load_config prefers the ambient environment; pin every write root so
+        # the test never reads the operator's real run history and never falls
+        # back to ``<repo>/runs`` (a non-ignored tree mutation that the
+        # connector's deterministic gate would flag as tree_changed).
         self.cfg._values["state_dir"] = str(self.state)
-        self.cfg._values["runs_dir"] = str(self.root / "runs")
+        self.cfg._values["log_dir"] = str(self.root / "runs")
+        self.cfg._values["jobs_dir"] = str(self.root / "jobs")
         self.cfg._values["reviewers"] = [{
             "name": "main", "vendor": "DeepSeek",
             "dsh_bin": str(self.dsh),
@@ -136,7 +139,10 @@ class ResumeAttentionTests(unittest.TestCase):
         }
         with mock.patch.object(harness, "_execute_once",
                                side_effect=fake_execute):
-            _text, run, _path = harness.run_harness(args, self.cfg)
+            _text, run, path = harness.run_harness(args, self.cfg)
+        self.assertTrue(
+            path and str(path).startswith(str(self.root) + os.sep),
+            "the run record escaped the test root: %r" % (path,))
         return run, calls
 
     def test_run_harness_selects_chosen_candidate_and_labels_it(self):

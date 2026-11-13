@@ -83,7 +83,15 @@ def _alarm_handler(_signum, _frame):
     "uses signal.SIGALRM/setitimer, SIGKILL and a shebang fake dsh, "
     "none of which exist on Windows")
 class NormalExitPipeTests(unittest.TestCase):
+    # A shorter, test-only drain bound still exercises the same bounded path;
+    # the production default is asserted in setUp so this cannot mask a
+    # regression that removes the bound itself.
+    TEST_GROUP_DRAIN_SECONDS = 1.5
+
     def setUp(self):
+        self.assertGreaterEqual(
+            harness.EXIT_GROUP_DRAIN_SECONDS, 2.0,
+            "the production post-exit drain bound must stay in place")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -122,7 +130,9 @@ class NormalExitPipeTests(unittest.TestCase):
             with mock.patch.dict(
                     os.environ,
                     {"PIPE_TEST_PIDFILE": str(self.pidfile)},
-                    clear=False):
+                    clear=False), mock.patch.object(
+                        harness, "EXIT_GROUP_DRAIN_SECONDS",
+                        self.TEST_GROUP_DRAIN_SECONDS):
                 _text, run, _path = harness.run_harness({
                     "prompt": "Do a small task with an inherited stdout grandchild",
                     "subagents": 0,
