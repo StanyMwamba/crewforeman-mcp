@@ -4,8 +4,23 @@ The module is deliberately pure: callers pass execution dictionaries and get a
 JSON-ready aggregate back.  No session logs are read here and no state is
 written.  Cost is only claimed when every contributing model is priced; an
 unpriced model never receives a zero, a proxy price or a token-share split.
+
+3.15.0 (MiMo) pricing: executions are priced from their event tokens
+(uncached input, cache read/hit, output, reasoning) against the ``mimo_prices``
+config table (a dict, or a JSON string as delivered from ``DSH_MIMO_PRICES``)
+or the builtin ``api.MIMO_PRICES`` table.  A configured row overrides the
+builtin per model, and ``cache_hit`` falls back to the input rate when the row
+omits it.  Reasoning tokens are kept in their own bucket and, when no explicit
+reasoning rate is configured, counted into the output cost (billed at the
+output rate) because the MiMo event stream reports them separately from
+output.  An unknown model stays unpriced (``cost_known`` false, cost ``None``)
+— never zero.  The finished aggregate carries a ``by_vendor`` rollup
+(vendor → tokens/cost/models) for the per-vendor split surfaced in run records,
+job status and the spend/waste reports.
 """
 
+import json
+import os
 import re
 
 try:  # pragma: no cover - api is present in supported builds
@@ -22,6 +37,18 @@ _PROVIDER_HINTS = (
     ("o3", "openai"),
     ("gemini", "google"),
     ("qwen", "alibaba"),
+    ("mimo", "mimo"),
+    ("xiaomi", "mimo"),
+)
+# Vendor display names for the per-vendor rollup.  Aliases are matched
+# case-insensitively as substrings of the ``provider/model`` label.
+_VENDOR_ALIASES = (
+    ("Xiaomi (MiMo)", ("mimo", "xiaomi")),
+    ("Kimi (Moonshot)", ("moonshot", "kimi")),
+    ("DeepSeek", ("deepseek",)),
+    ("Anthropic", ("anthropic", "claude", "sonnet", "opus")),
+    ("OpenAI", ("openai", "gpt")),
+    ("Google", ("google", "gemini")),
 )
 _SOURCE_RANK = {"candidate": 0, "slice": 1, "quality": 2, "reviewer": 3,
                 "self": 4}
@@ -67,7 +94,12 @@ def _num(source, names, default=0):
 
 
 def _tokens(source, fallback=None):
-    """Read one token bucket, accepting the SDK/session aliases."""
+    """Read one token bucket, accepting the SDK/session aliases.
+
+    Returns ``(input, cache_read, output, reasoning, total)``.  Reasoning
+    tokens are tracked separately (they are billed at the output rate unless
+    a price row says otherwise) and are included in the derived total.
+    """
     if not isinstance(source, dict):
         source = {}
     fallback = fallback if isinstance(fallback, dict) else {}
@@ -83,26 +115,62 @@ def _tokens(source, fallback=None):
                         "completion_tokens"),
                _num(fallback, ("tokens_out", "output_tokens", "output",
                                "completion_tokens")))
+    reasoning = _num(source, ("reasoning_tokens", "reasoning"),
+                     _num(fallback, ("reasoning_tokens", "reasoning")))
     total = _num(source, ("total_tokens", "total"),
                  _num(fallback, ("total_tokens", "total"),
-                      tokens_in + cache + out))
+                      tokens_in + cache + out + reasoning))
     if total <= 0:
-        total = tokens_in + cache + out
-    return int(round(tokens_in)), int(round(cache)), int(round(out)), int(round(total))
+        total = tokens_in + cache + out + reasoning
+    return (int(round(tokens_in)), int(round(cache)), int(round(out)),
+            int(round(reasoning)), int(round(total)))
 
 
-def _norm_prices(entry):
+def _norm_prices(entry, cache_default_to_input=False):
+    """Normalise one price row to miss/hit/out (USD per 1M tokens).
+
+    Key spellings are interchangeable: ``input``/``miss``, ``cache_read``/
+    ``hit``/``cache_hit``, ``output``/``out``.  MiMo rows may omit the cache
+    rate: with ``cache_default_to_input`` the cache-hit rate falls back to the
+    input rate.  An optional ``reasoning``/``reasoning_out`` rate prices
+    reasoning tokens; when absent they are billed at the output rate (see the
+    module docstring).
+    """
     if not isinstance(entry, dict):
         return None
     miss = entry.get("input", entry.get("miss"))
-    hit = entry.get("cache_read", entry.get("hit"))
+    hit = entry.get("cache_read", entry.get("hit", entry.get("cache_hit")))
     out = entry.get("output", entry.get("out"))
-    if miss is None or hit is None or out is None:
+    reasoning = entry.get("reasoning", entry.get("reasoning_out"))
+    if miss is None or out is None:
         return None
+    if hit is None:
+        if not cache_default_to_input:
+            return None
+        hit = miss
     try:
-        return {"miss": float(miss), "hit": float(hit), "out": float(out)}
+        prices = {"miss": float(miss), "hit": float(hit), "out": float(out)}
+        if reasoning is not None:
+            prices["reasoning"] = float(reasoning)
     except (TypeError, ValueError):
         return None
+    return prices
+
+
+def _price_table(value):
+    """Return a price table dict from a dict or a JSON string (DSH_MIMO_PRICES)."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _price_key_match(name, key, prefix=False):
@@ -120,24 +188,61 @@ def _price_key_match(name, key, prefix=False):
             or (bool(name_bare) and name_bare == key_bare))
 
 
-def _lookup_prices(table, *names, prefix=False):
+_MIMO_VENDOR = "Xiaomi (MiMo)"
+
+
+def _vendor_for(label):
+    """Map a ``provider/model`` label to its canonical vendor name.
+
+    Aliases are matched case-insensitively as substrings; anything that
+    matches none of them is attributed to ``"unknown"``.
+    """
+    text = str(label or "").lower()
+    if not text.strip():
+        return "unknown"
+    for vendor, aliases in _VENDOR_ALIASES:
+        for alias in aliases:
+            if alias in text:
+                return vendor
+    return "unknown"
+
+
+def _lookup_prices(table, *names, prefix=False, cache_default_to_input=False):
     if not isinstance(table, dict):
         return None
     for name in names:
         for key, entry in table.items():
             if _price_key_match(name, key, prefix=prefix):
-                found = _norm_prices(entry)
+                found = _norm_prices(
+                    entry, cache_default_to_input=cache_default_to_input)
                 if found is not None:
                     return found
     return None
 
 
-def _prices_for(model, bare, table, fallback=None):
+def _prices_for(model, bare, table, fallback=None, mimo_table=None):
+    """Resolve price rows: mimo config, then the role tables, then builtins.
+
+    Exact keys win over prefixes and a partial/invalid row is skipped so the
+    lookup falls through instead of fabricating a price.  The dedicated
+    ``mimo_table`` (config ``mimo_prices``, dict or JSON string) and the
+    builtin ``api.MIMO_PRICES`` rows accept the ``cache_hit`` spelling and let
+    a missing cache rate fall back to the input rate.
+    """
     for prefix in (False, True):
-        for candidate in (table, fallback):
-            found = _lookup_prices(candidate, model, bare, prefix=prefix)
+        for candidate in (mimo_table, table, fallback):
+            found = _lookup_prices(
+                candidate, model, bare, prefix=prefix,
+                cache_default_to_input=(mimo_table is not None
+                                        and candidate is mimo_table))
             if found is not None:
                 return found
+    builtin_mimo = getattr(api, "MIMO_PRICES", {}) if api is not None else {}
+    for prefix in (False, True):
+        found = _lookup_prices(builtin_mimo, model, bare, prefix=prefix,
+                               cache_default_to_input=True)
+        if found is not None:
+            return found
     builtin = getattr(api, "HARNESS_PRICES", {}) if api is not None else {}
     for prefix in (False, True):
         found = _lookup_prices(builtin, bare, model, prefix=prefix)
@@ -179,6 +284,8 @@ def label_for(model, execution=None, role_map=None):
 
 def _model_names(execution):
     raw = execution.get("models")
+    if raw is None and isinstance(execution.get("usage"), dict):
+        raw = execution["usage"].get("models")
     if isinstance(raw, str):
         return [raw] if raw.strip() else []
     if isinstance(raw, dict):
@@ -201,6 +308,11 @@ def _entry_for(execution, name):
     raw = execution.get("models")
     if isinstance(raw, dict):
         for key, value in raw.items():
+            if str(key) == name and isinstance(value, dict):
+                return value
+    usage = execution.get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("models"), dict):
+        for key, value in usage["models"].items():
             if str(key) == name and isinstance(value, dict):
                 return value
     return {}
@@ -227,24 +339,31 @@ def _successful(execution):
 
 def _cost_source(execution):
     value = execution.get("cost_source")
-    if value in ("session_logs", "sdk_usage", "unknown"):
+    if value in ("session_logs", "sdk_usage", "mimo_events", "unknown"):
         return value
     return "unknown"
 
 
 class ModelUsage:
-    """Accumulate executions, then materialise a bounded aggregate on finish."""
+    """Accumulate executions, then materialise a bounded aggregate on finish.
 
-    def __init__(self, max_models=8, prices=None, reviewer_prices=None):
+    ``mimo_prices`` overrides the builtin ``api.MIMO_PRICES`` per model; it is
+    a dict or a JSON string (as delivered from env ``DSH_MIMO_PRICES``).
+    """
+
+    def __init__(self, max_models=8, prices=None, reviewer_prices=None,
+                 mimo_prices=None):
         self.max_models = max(0, _int(max_models, 8))
         self.prices = prices if isinstance(prices, dict) else {}
         self.reviewer_prices = (reviewer_prices
                                 if isinstance(reviewer_prices, dict) else {})
+        self.mimo_prices = _price_table(mimo_prices)
         self._rows = {}
         self._scores = []
         self._unattributed = 0
         self._other = {"tokens_in": 0, "cache_read_tokens": 0,
-                       "tokens_out": 0, "total_tokens": 0,
+                       "tokens_out": 0, "reasoning_tokens": 0,
+                       "total_tokens": 0,
                        "cost": 0.0, "cost_known": True}
         self._unpriced = set()
         self._wins = {}
@@ -254,11 +373,18 @@ class ModelUsage:
         row = self._rows.get(label)
         if row is None:
             provider, _sep, model = label.partition("/")
+            vendor = provider
+            if _vendor_for(label) == _MIMO_VENDOR:
+                # MiMo executions attribute provider 'mimo' and the canonical
+                # 'Xiaomi (MiMo)' vendor, whichever spelling the model id used.
+                provider = "mimo"
+                vendor = _MIMO_VENDOR
             row = {
                 "provider": provider, "model": model or label,
-                "vendor": provider, "roles": [], "executions": 0,
+                "vendor": vendor, "roles": [], "executions": 0,
                 "tokens_in": 0, "cache_read_tokens": 0, "tokens_out": 0,
-                "total_tokens": 0, "cost": 0.0, "cost_known": True,
+                "reasoning_tokens": 0, "total_tokens": 0,
+                "cost": 0.0, "cost_known": True,
                 "cost_sources": [], "scores": [],
             }
             self._rows[label] = row
@@ -290,7 +416,8 @@ class ModelUsage:
         self._other["tokens_in"] += tokens[0]
         self._other["cache_read_tokens"] += tokens[1]
         self._other["tokens_out"] += tokens[2]
-        self._other["total_tokens"] += tokens[3]
+        self._other["reasoning_tokens"] += tokens[3]
+        self._other["total_tokens"] += tokens[4]
         if not cost_known or cost is None:
             self._other["cost_known"] = False
         else:
@@ -343,13 +470,14 @@ class ModelUsage:
             elif len(labels) == 1:
                 model_tokens = tokens
             else:
-                model_tokens = (0, 0, 0, 0)
+                model_tokens = (0, 0, 0, 0, 0)
             row = self._row(label)
             row["executions"] += 1
             row["tokens_in"] += model_tokens[0]
             row["cache_read_tokens"] += model_tokens[1]
             row["tokens_out"] += model_tokens[2]
-            row["total_tokens"] += model_tokens[3]
+            row["reasoning_tokens"] += model_tokens[3]
+            row["total_tokens"] += model_tokens[4]
             if role not in row["roles"]:
                 row["roles"].append(role)
             source = _cost_source(execution)
@@ -357,16 +485,26 @@ class ModelUsage:
                 row["cost_sources"].append(source)
             bare = label.split("/", 1)[1] if "/" in label else label
             resolved = _prices_for(
-                label, bare, table, self.prices if reviewer else None)
+                label, bare, table, self.prices if reviewer else None,
+                mimo_table=self.mimo_prices)
             supplied = (entry.get("estimated_cost_usd")
                         if entry.get("estimated_cost_usd") is not None
                         else execution.get("estimated_cost_usd"))
             supplied_known = bool(entry.get("cost_known", execution.get("cost_known")))
+            # MiMo executions are priced from their event tokens only: a
+            # supplied estimate is never a proxy for a missing price row.
+            if source == "mimo_events":
+                supplied = None
+                supplied_known = False
             if resolved is not None:
+                # Reasoning tokens bill at the output rate unless the price
+                # row carries an explicit reasoning rate.
+                reasoning_rate = resolved.get("reasoning", resolved["out"])
                 cost = (model_tokens[0] * resolved["miss"]
                         + model_tokens[1] * resolved["hit"]
-                        + model_tokens[2] * resolved["out"]) / 1000000.0
-                if model_tokens[3] == 0 and supplied_known and supplied is not None:
+                        + model_tokens[2] * resolved["out"]
+                        + model_tokens[3] * reasoning_rate) / 1000000.0
+                if model_tokens[4] == 0 and supplied_known and supplied is not None:
                     cost = _float(supplied)
                 row["cost"] += cost
             elif supplied_known and supplied is not None:
@@ -401,6 +539,64 @@ class ModelUsage:
                  "last": round(vals[-1], 2), "source": source},
                 wins, losses)
 
+    def _by_vendor_rollup(self):
+        """Aggregate every tracked row (and unattributed tokens) per vendor.
+
+        Buckets use the canonical vendor names (``Xiaomi (MiMo)``,
+        ``DeepSeek``, ``Kimi (Moonshot)``, ``unknown``, ...) and carry
+        ``cost``/``cost_known`` where cost is claimed only when every
+        contributing model is priced.
+        """
+        buckets = {}
+
+        def bucket(vendor):
+            entry = buckets.get(vendor)
+            if entry is None:
+                entry = {
+                    "input_tokens": 0, "cache_read_tokens": 0,
+                    "output_tokens": 0, "reasoning_tokens": 0,
+                    "total_tokens": 0,
+                    "cost": 0.0, "cost_known": True,
+                    "models": [],
+                }
+                buckets[vendor] = entry
+            return entry
+
+        for label, row in self._rows.items():
+            entry = bucket(_vendor_for(label))
+            entry["input_tokens"] += row["tokens_in"]
+            entry["cache_read_tokens"] += row["cache_read_tokens"]
+            entry["output_tokens"] += row["tokens_out"]
+            entry["reasoning_tokens"] += row["reasoning_tokens"]
+            entry["total_tokens"] += row["total_tokens"]
+            entry["models"].append(label)
+            if row["cost_known"]:
+                entry["cost"] += row["cost"]
+            else:
+                entry["cost_known"] = False
+        other = self._other
+        if (other["tokens_in"] or other["cache_read_tokens"]
+                or other["tokens_out"] or other["reasoning_tokens"]
+                or other["total_tokens"]):
+            entry = bucket("unknown")
+            entry["input_tokens"] += other["tokens_in"]
+            entry["cache_read_tokens"] += other["cache_read_tokens"]
+            entry["output_tokens"] += other["tokens_out"]
+            entry["reasoning_tokens"] += other["reasoning_tokens"]
+            entry["total_tokens"] += other["total_tokens"]
+            if other["cost_known"]:
+                entry["cost"] += other["cost"]
+            else:
+                entry["cost_known"] = False
+        rollup = {}
+        for vendor in sorted(buckets):
+            entry = buckets[vendor]
+            entry["models"] = sorted(entry["models"])
+            entry["cost"] = (round(entry["cost"], 6)
+                             if entry["cost_known"] else None)
+            rollup[vendor] = entry
+        return rollup
+
     def finish(self):
         """Return the version-1 aggregate.  Calling it twice is identical."""
         raw = {}
@@ -409,7 +605,7 @@ class ModelUsage:
             item = {key: row[key] for key in (
                 "provider", "model", "vendor", "roles", "executions",
                 "tokens_in", "cache_read_tokens", "tokens_out",
-                "total_tokens")}
+                "reasoning_tokens", "total_tokens")}
             item["estimated_cost_usd"] = (
                 round(row["cost"], 6) if row["cost_known"] else None)
             item["cost_known"] = bool(row["cost_known"])
@@ -454,6 +650,7 @@ class ModelUsage:
             "version": 1,
             "max_models": self.max_models,
             "models": models,
+            "by_vendor": self._by_vendor_rollup(),
             "__other__": other,
             "unpriced_models": sorted(self._unpriced),
             "unattributed_scores": self._unattributed,
@@ -465,6 +662,15 @@ class ModelUsage:
         }
 
 
+def by_vendor_of(model_usage_dict):
+    """Return the ``by_vendor`` rollup from a model_usage aggregate (or {})."""
+    if isinstance(model_usage_dict, dict):
+        rollup = model_usage_dict.get("by_vendor")
+        if isinstance(rollup, dict):
+            return rollup
+    return {}
+
+
 def build_model_usage(executions, cfg=None, role_map=None):
     """Build a :class:`ModelUsage` aggregate from execution dicts."""
     max_models = _int(_cfg(cfg, "model_usage_max_models", 8), 8)
@@ -474,7 +680,8 @@ def build_model_usage(executions, cfg=None, role_map=None):
                        prices=prices if isinstance(prices, dict) else {},
                        reviewer_prices=(reviewer_prices
                                         if isinstance(reviewer_prices, dict)
-                                        else {}))
+                                        else {}),
+                       mimo_prices=_cfg(cfg, "mimo_prices", {}))
     if isinstance(executions, dict):
         executions = executions.get("executions") or []
     for execution in executions or []:

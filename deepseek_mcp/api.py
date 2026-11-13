@@ -26,6 +26,14 @@ HARNESS_PRICES = {
     "deepseek-v4-pro": {"hit": 0.022, "miss": 0.66, "out": 1.98},
 }
 
+# MiMo Code (Xiaomi) pay-as-you-go prices, USD per 1M tokens.  ``cache_hit``
+# falls back to the input rate when a row omits it.  A model absent from this
+# table is never priced from it: its cost stays unknown, never zero.
+MIMO_PRICES = {
+    "mimo-v2.6-pro":  {"input": 0.435, "cache_hit": 0.0036, "output": 0.87},
+    "mimo-v2.6-flash": {"input": 0.14, "cache_hit": 0.0036, "output": 0.28},
+}
+
 PERSONAS = [
     "You are a careful domain expert. Give the most accurate, well-reasoned answer.",
     "You are a skeptic. Look for traps, edge cases and wrong assumptions before answering.",
