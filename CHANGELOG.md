@@ -67,7 +67,13 @@ writes run records into the real `~/DeepSeek-MCP/runs`.
   successful detection, so one transient failure pinned `source: fallback`
   for every later job and the probe never re-ran. A probe failure is no
   longer cached as a success; the record carries the probe error and the
-  next job re-probes.
+  next job re-probes. The answer parser was also too narrow to see real
+  results: it accepted only `type: final` events with a top-level `text`
+  and missed probe JSON escaped inside a JSONL string value, so the raw
+  stdout fallback was dead in `--json` mode. The parser now mirrors the
+  harness event contract (`final`/`result`/`done`/`completion`/`completed`
+  with text under `text`/`answer`/`content`/`result`/`data.*`) and scans
+  unescaped embedded JSON.
 - **Per-vendor usage and cost accounting.** Every phase records input,
   cache-read, output and reasoning tokens plus estimated USD per vendor
   and model. Built-in MiMo prices (USD per 1M tokens) are `mimo-v2.6-pro`
