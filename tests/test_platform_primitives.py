@@ -162,8 +162,19 @@ class FileLockConcurrencyTests(unittest.TestCase):
             guard = threading.Lock()
             state = {"active": 0, "max": 0, "opens": 0}
             real_open = os.open
+            lock_path = str(path)
 
             def observed_open(file, flags, mode=0o777, *args, **kwargs):
+                # os.open is process-global: an unrelated open from any other
+                # live thread (or a retry of this very lock) must not be
+                # counted as a lock acquisition.  Only the exact lock path is
+                # observed, so the assertion below is about this lock only.
+                try:
+                    is_lock_open = os.fspath(file) == lock_path
+                except TypeError:
+                    is_lock_open = False
+                if not is_lock_open:
+                    return real_open(file, flags, mode, *args, **kwargs)
                 with guard:
                     state["active"] += 1
                     state["opens"] += 1
