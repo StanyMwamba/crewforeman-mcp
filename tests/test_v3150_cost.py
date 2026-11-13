@@ -25,15 +25,18 @@ def _cfg(**overrides):
 
 
 def _exec(model, tokens_in=0, cache=0, out=0, reasoning=0, total=None,
-          **extra):
+          cache_write=0, **extra):
     if total is None:
-        total = tokens_in + cache + out + reasoning
-    return {
+        total = tokens_in + cache + cache_write + out + reasoning
+    payload = {
         "role": "builder", "models": [model], "success": True,
         "tokens_in": tokens_in, "cache_read_tokens": cache,
+        "cache_write_tokens": cache_write,
         "tokens_out": out, "reasoning_tokens": reasoning,
         "total_tokens": total, "cost_source": "mimo_events",
     }
+    payload.update(extra)
+    return payload
 
 
 def _run(execs, cfg=None):
@@ -162,6 +165,141 @@ class UnknownModelTests(unittest.TestCase):
         row = out["models"][label_for("mimo-v9-custom")]
         self.assertFalse(row["cost_known"])
         self.assertIsNone(row["estimated_cost_usd"])
+
+    def test_unpriced_model_stays_unknown_even_with_tokens_present(self):
+        # Tokens alone never price a model: no price row and no usable
+        # supplied cost means cost_known stays False.
+        execution = _exec("acme/widget-9000", tokens_in=1000, cache=500,
+                          out=200, cost_source="unknown")
+        out = _run([execution])
+        row = out["models"][label_for("acme/widget-9000")]
+        self.assertFalse(row["cost_known"])
+        self.assertIsNone(row["estimated_cost_usd"])
+        self.assertEqual(row["total_tokens"], 1700)
+        self.assertIn("acme/widget-9000", out["unpriced_models"])
+
+    def test_price_table_source_without_cost_stays_unknown(self):
+        # price_table with no supplied cost and no price row proves nothing.
+        execution = _exec("mimo-v9-unknown", tokens_in=10,
+                          cost_source="price_table")
+        out = _run([execution])
+        row = out["models"][label_for("mimo-v9-unknown")]
+        self.assertFalse(row["cost_known"])
+        self.assertIsNone(row["estimated_cost_usd"])
+
+
+class CostSourceProvenanceTests(unittest.TestCase):
+    """The cost_source whitelist: vendor/price_table/mimo_events kept, the
+    rest collapsed to "unknown"."""
+
+    def test_whitelist_accepts_vendor_price_table_and_mimo_events(self):
+        for source in ("vendor", "price_table", "mimo_events"):
+            out = _run([_exec("xiaomi/mimo-v2.6-pro", tokens_in=10,
+                              cost_source=source)])
+            row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+            self.assertEqual(row["cost_source"], source)
+
+    def test_unknown_and_bogus_sources_map_to_unknown(self):
+        for source in ("unknown", "bogus-source", None):
+            execution = _exec("xiaomi/mimo-v2.6-pro", tokens_in=10)
+            if source is not None:
+                execution["cost_source"] = source
+            else:
+                execution.pop("cost_source", None)
+            out = _run([execution])
+            row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+            self.assertEqual(row["cost_source"], "unknown")
+
+
+class SuppliedCostTests(unittest.TestCase):
+    """vendor/price_table supplied costs are used as-is, never re-priced."""
+
+    def test_supplied_vendor_cost_is_honored_as_is(self):
+        # The CLI's own part.cost sum wins over any token-based recomputation.
+        supplied_cost = 0.008813859
+        execution = _exec("xiaomi/mimo-v2.6-pro", tokens_in=1000, cache=500,
+                          out=200, cost_source="vendor",
+                          estimated_cost_usd=supplied_cost, cost_known=True)
+        out = _run([execution])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+        self.assertEqual(row["cost_source"], "vendor")
+        self.assertTrue(row["cost_known"])
+        self.assertEqual(row["estimated_cost_usd"], round(supplied_cost, 6))
+        token_price = (1000 * 0.435 + 500 * 0.0036 + 200 * 0.87) / 1e6
+        self.assertNotAlmostEqual(row["estimated_cost_usd"], token_price,
+                                  places=9)
+        self.assertEqual(out["totals"]["estimated_cost_usd"],
+                         round(supplied_cost, 6))
+
+    def test_supplied_price_table_cost_is_not_double_priced(self):
+        # The adapter already priced these tokens; do not run them through
+        # the price table a second time.
+        execution = _exec("xiaomi/mimo-v2.6-pro", tokens_in=1000, cache=500,
+                          out=200, cost_source="price_table",
+                          estimated_cost_usd=0.002, cost_known=True)
+        out = _run([execution])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+        self.assertEqual(row["cost_source"], "price_table")
+        self.assertTrue(row["cost_known"])
+        self.assertEqual(row["estimated_cost_usd"], 0.002)
+
+    def test_vendor_cost_wins_even_for_an_unpriced_model(self):
+        # The CLI cost is ground truth: no price row is required to claim it.
+        execution = _exec("mimo-v9-unknown", tokens_in=10,
+                          cost_source="vendor", estimated_cost_usd=0.5,
+                          cost_known=True)
+        out = _run([execution])
+        row = out["models"][label_for("mimo-v9-unknown")]
+        self.assertTrue(row["cost_known"])
+        self.assertEqual(row["estimated_cost_usd"], 0.5)
+        self.assertNotIn("mimo-v9-unknown", out["unpriced_models"])
+
+    def test_vendor_without_supplied_cost_falls_back_to_price_table(self):
+        execution = _exec("xiaomi/mimo-v2.6-pro", tokens_in=1000,
+                          cost_source="vendor")
+        out = _run([execution])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+        self.assertTrue(row["cost_known"])
+        self.assertAlmostEqual(row["estimated_cost_usd"], 0.435 / 1e3,
+                               places=9)
+
+
+class CacheWriteTokenTests(unittest.TestCase):
+    """cache_write_tokens flows into rows and the by_vendor rollup."""
+
+    def test_rows_and_by_vendor_carry_cache_write_tokens(self):
+        out = _run([_exec("xiaomi/mimo-v2.6-pro", tokens_in=100, cache=50,
+                          cache_write=25, out=10)])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+        self.assertEqual(row["cache_write_tokens"], 25)
+        self.assertEqual(row["cache_read_tokens"], 50)
+        bucket = out["by_vendor"]["Xiaomi (MiMo)"]
+        self.assertEqual(bucket["cache_write_tokens"], 25)
+        self.assertEqual(bucket["cache_read_tokens"], 50)
+
+    def test_cache_write_tokens_accumulate_across_executions(self):
+        out = _run([
+            _exec("xiaomi/mimo-v2.6-pro", tokens_in=1, cache_write=5),
+            _exec("xiaomi/mimo-v2.6-pro", tokens_in=1, cache_write=7),
+        ])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-pro")]
+        self.assertEqual(row["cache_write_tokens"], 12)
+        bucket = out["by_vendor"]["Xiaomi (MiMo)"]
+        self.assertEqual(bucket["cache_write_tokens"], 12)
+
+    def test_cache_write_tokens_default_to_zero_and_keep_old_keys(self):
+        out = _run([_exec("xiaomi/mimo-v2.6-flash", tokens_in=10)])
+        row = out["models"][label_for("xiaomi/mimo-v2.6-flash")]
+        self.assertEqual(row["cache_write_tokens"], 0)
+        self.assertEqual(row["tokens_in"], 10)
+        self.assertEqual(row["total_tokens"], 10)
+        bucket = out["by_vendor"]["Xiaomi (MiMo)"]
+        self.assertEqual(bucket["cache_write_tokens"], 0)
+        self.assertEqual(bucket["input_tokens"], 10)
+        for key in ("input_tokens", "cache_read_tokens", "output_tokens",
+                    "reasoning_tokens", "total_tokens", "cost", "cost_known",
+                    "models"):
+            self.assertIn(key, bucket)
 
 
 class ReasoningTokenTests(unittest.TestCase):

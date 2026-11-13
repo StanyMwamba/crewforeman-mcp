@@ -14,9 +14,14 @@ omits it.  Reasoning tokens are kept in their own bucket and, when no explicit
 reasoning rate is configured, counted into the output cost (billed at the
 output rate) because the MiMo event stream reports them separately from
 output.  An unknown model stays unpriced (``cost_known`` false, cost ``None``)
-— never zero.  The finished aggregate carries a ``by_vendor`` rollup
-(vendor → tokens/cost/models) for the per-vendor split surfaced in run records,
-job status and the spend/waste reports.
+— never zero.  Cost provenance decides whose number wins: ``cost_source``
+``vendor`` (the CLI's own ``part.cost`` sum) and ``price_table`` (priced
+upstream by the worker adapter) are used as-is and never re-priced here, while
+the legacy ``mimo_events`` rows are priced from their event tokens only (a
+supplied estimate is never a proxy for a missing price row).  The finished
+aggregate carries a ``by_vendor`` rollup (vendor → tokens/cost/models) for the
+per-vendor split surfaced in run records, job status and the spend/waste
+reports.
 """
 
 import json
@@ -96,9 +101,11 @@ def _num(source, names, default=0):
 def _tokens(source, fallback=None):
     """Read one token bucket, accepting the SDK/session aliases.
 
-    Returns ``(input, cache_read, output, reasoning, total)``.  Reasoning
-    tokens are tracked separately (they are billed at the output rate unless
-    a price row says otherwise) and are included in the derived total.
+    Returns ``(input, cache_read, output, reasoning, total, cache_write)``.
+    Reasoning tokens are tracked separately (they are billed at the output
+    rate unless a price row says otherwise) and are included in the derived
+    total, as are cache-write tokens: the MiMo event stream reports each
+    bucket disjointly and ``total`` is their sum.
     """
     if not isinstance(source, dict):
         source = {}
@@ -111,6 +118,8 @@ def _tokens(source, fallback=None):
                           "prompt_cache_hit_tokens"),
                  _num(fallback, ("cache_read_tokens", "cache_read",
                                  "cache_hit_tokens", "prompt_cache_hit_tokens")))
+    cache_write = _num(source, ("cache_write_tokens", "cache_write"),
+                       _num(fallback, ("cache_write_tokens", "cache_write")))
     out = _num(source, ("tokens_out", "output_tokens", "output",
                         "completion_tokens"),
                _num(fallback, ("tokens_out", "output_tokens", "output",
@@ -119,11 +128,12 @@ def _tokens(source, fallback=None):
                      _num(fallback, ("reasoning_tokens", "reasoning")))
     total = _num(source, ("total_tokens", "total"),
                  _num(fallback, ("total_tokens", "total"),
-                      tokens_in + cache + out + reasoning))
+                      tokens_in + cache + cache_write + out + reasoning))
     if total <= 0:
-        total = tokens_in + cache + out + reasoning
+        total = tokens_in + cache + cache_write + out + reasoning
     return (int(round(tokens_in)), int(round(cache)), int(round(out)),
-            int(round(reasoning)), int(round(total)))
+            int(round(reasoning)), int(round(total)),
+            int(round(cache_write)))
 
 
 def _norm_prices(entry, cache_default_to_input=False):
@@ -339,7 +349,8 @@ def _successful(execution):
 
 def _cost_source(execution):
     value = execution.get("cost_source")
-    if value in ("session_logs", "sdk_usage", "mimo_events", "unknown"):
+    if value in ("session_logs", "sdk_usage", "mimo_events", "vendor",
+                 "price_table", "unknown"):
         return value
     return "unknown"
 
@@ -362,6 +373,7 @@ class ModelUsage:
         self._scores = []
         self._unattributed = 0
         self._other = {"tokens_in": 0, "cache_read_tokens": 0,
+                       "cache_write_tokens": 0,
                        "tokens_out": 0, "reasoning_tokens": 0,
                        "total_tokens": 0,
                        "cost": 0.0, "cost_known": True}
@@ -382,7 +394,8 @@ class ModelUsage:
             row = {
                 "provider": provider, "model": model or label,
                 "vendor": vendor, "roles": [], "executions": 0,
-                "tokens_in": 0, "cache_read_tokens": 0, "tokens_out": 0,
+                "tokens_in": 0, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "tokens_out": 0,
                 "reasoning_tokens": 0, "total_tokens": 0,
                 "cost": 0.0, "cost_known": True,
                 "cost_sources": [], "scores": [],
@@ -415,6 +428,7 @@ class ModelUsage:
     def _add_other(self, tokens, cost, cost_known):
         self._other["tokens_in"] += tokens[0]
         self._other["cache_read_tokens"] += tokens[1]
+        self._other["cache_write_tokens"] += tokens[5]
         self._other["tokens_out"] += tokens[2]
         self._other["reasoning_tokens"] += tokens[3]
         self._other["total_tokens"] += tokens[4]
@@ -470,11 +484,12 @@ class ModelUsage:
             elif len(labels) == 1:
                 model_tokens = tokens
             else:
-                model_tokens = (0, 0, 0, 0, 0)
+                model_tokens = (0, 0, 0, 0, 0, 0)
             row = self._row(label)
             row["executions"] += 1
             row["tokens_in"] += model_tokens[0]
             row["cache_read_tokens"] += model_tokens[1]
+            row["cache_write_tokens"] += model_tokens[5]
             row["tokens_out"] += model_tokens[2]
             row["reasoning_tokens"] += model_tokens[3]
             row["total_tokens"] += model_tokens[4]
@@ -491,12 +506,19 @@ class ModelUsage:
                         if entry.get("estimated_cost_usd") is not None
                         else execution.get("estimated_cost_usd"))
             supplied_known = bool(entry.get("cost_known", execution.get("cost_known")))
-            # MiMo executions are priced from their event tokens only: a
-            # supplied estimate is never a proxy for a missing price row.
             if source == "mimo_events":
+                # Legacy event-derived rows are priced from their event
+                # tokens only: a supplied estimate is never a proxy for a
+                # missing price row.
                 supplied = None
                 supplied_known = False
-            if resolved is not None:
+            if (source in ("vendor", "price_table")
+                    and supplied_known and supplied is not None):
+                # The CLI (vendor) or the adapter's own price pass
+                # (price_table) already computed this cost -- use it as-is,
+                # never re-priced from the token buckets.
+                row["cost"] += _float(supplied)
+            elif resolved is not None:
                 # Reasoning tokens bill at the output rate unless the price
                 # row carries an explicit reasoning rate.
                 reasoning_rate = resolved.get("reasoning", resolved["out"])
@@ -554,6 +576,7 @@ class ModelUsage:
             if entry is None:
                 entry = {
                     "input_tokens": 0, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
                     "output_tokens": 0, "reasoning_tokens": 0,
                     "total_tokens": 0,
                     "cost": 0.0, "cost_known": True,
@@ -566,6 +589,7 @@ class ModelUsage:
             entry = bucket(_vendor_for(label))
             entry["input_tokens"] += row["tokens_in"]
             entry["cache_read_tokens"] += row["cache_read_tokens"]
+            entry["cache_write_tokens"] += row["cache_write_tokens"]
             entry["output_tokens"] += row["tokens_out"]
             entry["reasoning_tokens"] += row["reasoning_tokens"]
             entry["total_tokens"] += row["total_tokens"]
@@ -576,11 +600,13 @@ class ModelUsage:
                 entry["cost_known"] = False
         other = self._other
         if (other["tokens_in"] or other["cache_read_tokens"]
-                or other["tokens_out"] or other["reasoning_tokens"]
+                or other["cache_write_tokens"] or other["tokens_out"]
+                or other["reasoning_tokens"]
                 or other["total_tokens"]):
             entry = bucket("unknown")
             entry["input_tokens"] += other["tokens_in"]
             entry["cache_read_tokens"] += other["cache_read_tokens"]
+            entry["cache_write_tokens"] += other["cache_write_tokens"]
             entry["output_tokens"] += other["tokens_out"]
             entry["reasoning_tokens"] += other["reasoning_tokens"]
             entry["total_tokens"] += other["total_tokens"]
@@ -604,8 +630,8 @@ class ModelUsage:
             scores, wins, losses = self._score_summary(label)
             item = {key: row[key] for key in (
                 "provider", "model", "vendor", "roles", "executions",
-                "tokens_in", "cache_read_tokens", "tokens_out",
-                "reasoning_tokens", "total_tokens")}
+                "tokens_in", "cache_read_tokens", "cache_write_tokens",
+                "tokens_out", "reasoning_tokens", "total_tokens")}
             item["estimated_cost_usd"] = (
                 round(row["cost"], 6) if row["cost_known"] else None)
             item["cost_known"] = bool(row["cost_known"])
